@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="toolbar">
+  <h1>Discovery</h1>
+  <div class="source-actions">
+    {% for source in enabled_sources %}
+      <form method="post" action="/poll/{{ source }}">{{ csrf_input()|safe }}
+        <button>Poll {{ source_labels.get(source, source) }}</button>
+      </form>
+    {% endfor %}
+    <form method="post" action="/poll-all">{{ csrf_input()|safe }}
+      <button>Poll all enabled</button>
+    </form>
+  </div>
+</section>
+
+{% if health %}
+<section class="health-row">
+  {% for item in health %}
+    <div class="health">
+      <strong>{{ item.source }}</strong>
+      <span class="{{ 'status-ok' if item.enabled else 'status-bad' }}">{{ "enabled" if item.enabled else "disabled" }} · {{ item.last_poll_at or "never" }}</span>
+      {% if item.last_error %}<em>{{ item.last_error }}</em>{% endif %}
+      {% if item.source in enabled_sources %}
+        {% if item.enabled %}
+          <form method="post" action="/sources/{{ item.source }}/disable">{{ csrf_input()|safe }}
+            <button type="submit" class="secondary">Disable</button>
+          </form>
+        {% else %}
+          <form method="post" action="/sources/{{ item.source }}/enable">{{ csrf_input()|safe }}
+            <button type="submit" class="secondary">Re-enable</button>
+          </form>
+        {% endif %}
+      {% endif %}
+    </div>
+  {% endfor %}
+</section>
+{% endif %}
+
+{% if pending %}
+  {% if pending == "poll-all" %}
+    <p class="notice">Poll complete: {{ request.query_params.get("ok", "0") }} of {{ request.query_params.get("total", "0") }} sources succeeded.</p>
+  {% else %}
+    <p class="notice">Import queued. Kavita links will appear after download and scan complete.</p>
+  {% endif %}
+{% endif %}
+
+<section class="update-grid">
+  {% for row in discovery_items %}
+    {% set item = row.series %}
+    <article class="update-card">
+      <a class="update-main" href="/series/{{ item.id }}/open">
+        <div class="cover">
+          {% if item.cover_path %}
+            <img src="/covers/{{ item.cover_path.split('/')[-1] }}" alt="">
+          {% elif item.cover_url %}
+            <img src="{{ item.cover_url }}" alt="">
+          {% else %}
+            <span>No cover</span>
+          {% endif %}
+        </div>
+        <div class="update-summary">
+          <h2 title="{{ item.title }}">{{ item.title }}</h2>
+          <div class="sources">
+            {% for source in item.sources %}
+              <span>{{ source.source }} · {{ source.source|priority }}</span>
+            {% endfor %}
+          </div>
+        </div>
+      </a>
+      <div class="update-chapters">
+        {% for chapter in row.chapters %}
+          <a class="chapter-row" href="/chapters/{{ chapter.id }}/open">
+            <span>Ch. {{ chapter.number }}{% if chapter.title %} · {{ chapter.title }}{% endif %}</span>
+            <span>{{ chapter.source }} · {{ chapter.published_at|relative_time }}</span>
+          </a>
+        {% else %}
+          <span class="chapter-row muted">No chapters collected yet</span>
+        {% endfor %}
+      </div>
+      <form class="actions compact" method="post" action="/series/{{ item.id }}/status">{{ csrf_input()|safe }}
+        <button name="status" value="reading">Reading</button>
+        <button name="status" value="interested">Interested</button>
+        <button name="status" value="ignored">Ignore</button>
+        {% if row.kavita_url %}
+          <a class="button-link" href="{{ row.kavita_url }}">Open in Kavita</a>
+        {% endif %}
+      </form>
+    </article>
+  {% else %}
+    <p class="empty">No discovered manga yet. Poll a source to populate this list.</p>
+  {% endfor %}
+</section>
+{% endblock %}

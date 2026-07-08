@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Manga Manager</title>
+    <link rel="stylesheet" href="{{ url_for('static', path='/styles.css') }}">
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/">Manga Manager</a>
+      <nav>
+        <a class="{{ 'active' if active == 'discovery' else '' }}" href="/">Discovery</a>
+        <a class="{{ 'active' if active == 'library' else '' }}" href="/library">Library</a>
+        <a class="{{ 'active' if active == 'matches' else '' }}" href="/matches">Matches</a>
+        <a class="{{ 'active' if active == 'activity' else '' }}" href="/activity">Activity</a>
+      </nav>
+      <form method="post" action="/poll-all">{{ csrf_input()|safe }}
+        <button type="submit">Poll all</button>
+      </form>
+    </header>
+    <main>
+      {% block content %}{% endblock %}
+    </main>
+  </body>
+</html>

@@ -1,0 +1,34 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="toolbar">
+  <h1>Potential Matches</h1>
+</section>
+{% if request.query_params.get("notice") == "bulk-matches" %}
+  <p class="notice">Updated {{ request.query_params.get("count", "0") }} match candidates.</p>
+{% endif %}
+<section class="table">
+  <form id="bulk-match-form" method="post" action="/matches/bulk" class="source-actions bulk-actions">{{ csrf_input()|safe }}
+    <button name="action" value="merge">Merge selected</button>
+    <button name="action" value="separate" class="secondary">Keep selected separate</button>
+  </form>
+  {% for candidate in candidates %}
+    <article class="match-row">
+      <label><input form="bulk-match-form" type="checkbox" name="candidate_ids" value="{{ candidate.id }}"> Select</label>
+      <div>
+        <strong>{{ candidate.confidence|round(2) }}</strong>
+        <span>{{ candidate.reason }}</span>
+      </div>
+      <div>
+        <p>{{ candidate.source_series.source }}: {{ candidate.source_series.title }}</p>
+        <p>Possible match: {{ candidate.candidate_series.title }}</p>
+      </div>
+      <div class="source-actions">
+        <form method="post" action="/matches/{{ candidate.id }}/merge">{{ csrf_input()|safe }}<button>Merge</button></form>
+        <form method="post" action="/matches/{{ candidate.id }}/separate">{{ csrf_input()|safe }}<button>Keep separate</button></form>
+      </div>
+    </article>
+  {% else %}
+    <p class="empty">No uncertain matches need review.</p>
+  {% endfor %}
+</section>
+{% endblock %}

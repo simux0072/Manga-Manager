@@ -1,0 +1,248 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="toolbar">
+  <h1>Library</h1>
+  <div class="source-actions">
+    <form method="post" action="/queue-downloads">{{ csrf_input()|safe }}<button>Queue downloads</button></form>
+    <form method="post" action="/run-download">{{ csrf_input()|safe }}<button>Run next download</button></form>
+    <form method="post" action="/drain-downloads">{{ csrf_input()|safe }}<button>Run download drain</button></form>
+    <form method="post" action="/run-kavita-sync">{{ csrf_input()|safe }}<button>Run Kavita sync</button></form>
+    <form method="post" action="/drain-kavita-sync">{{ csrf_input()|safe }}<button>Run Kavita drain</button></form>
+    <form method="post" action="/kavita/want-to-read/sync">{{ csrf_input()|safe }}<button>Sync Want to Read</button></form>
+    <form method="post" action="/maintenance/cleanup-retention">{{ csrf_input()|safe }}<button>Cleanup retention</button></form>
+    <form method="post" action="/retry-failed">{{ csrf_input()|safe }}<button>Retry failed jobs</button></form>
+  </div>
+</section>
+
+{% if notice.message %}
+  <p class="notice">{{ notice.message }}</p>
+{% endif %}
+
+<section class="operations">
+  <h2>Today</h2>
+  <div class="ops-grid">
+    <div class="ops-panel">
+      <h3>Reading</h3>
+      <p class="metric">{{ highlights.reading }}</p>
+      <span class="muted">active local series</span>
+    </div>
+    <div class="ops-panel">
+      <h3>Unread ready</h3>
+      <p class="metric">{{ highlights.unread_ready }}</p>
+      <span class="muted">Kavita chapters</span>
+    </div>
+    <div class="ops-panel">
+      <h3>Pending sync</h3>
+      <p class="metric">{{ highlights.pending_sync }}</p>
+      <span class="muted">series awaiting Kavita</span>
+    </div>
+    <div class="ops-panel">
+      <h3>Ready</h3>
+      <p class="metric">{{ highlights.mapped_series }}</p>
+      <span class="muted">Kavita-mapped series</span>
+    </div>
+    <div class="ops-panel">
+      <h3>Downloaded</h3>
+      <p class="metric">{{ highlights.downloaded_chapters }}</p>
+      <span class="muted">chapters on disk</span>
+    </div>
+    <div class="ops-panel">
+      <h3>New this week</h3>
+      <p class="metric">{{ highlights.new_this_week }}</p>
+      <span class="muted">tracked chapters</span>
+    </div>
+    <div class="ops-panel">
+      <h3>Needs attention</h3>
+      <p class="{{ 'status-bad metric' if highlights.failed_jobs else 'status-ok metric' }}">{{ highlights.failed_jobs }}</p>
+      <span class="muted">failed jobs</span>
+    </div>
+    {% if highlights.random_mapped_series %}
+      <div class="ops-panel">
+        <h3>Pick something</h3>
+        <a class="button-link" href="/series/{{ highlights.random_mapped_series.id }}/open">{{ highlights.random_mapped_series.title }}</a>
+      </div>
+    {% else %}
+      <div class="ops-panel">
+        <h3>Pick something</h3>
+        {% if highlights.downloaded_chapters %}
+          <span class="muted">Downloaded, awaiting Kavita sync</span>
+        {% else %}
+          <span class="muted">Nothing ready yet</span>
+        {% endif %}
+      </div>
+    {% endif %}
+  </div>
+</section>
+
+<section class="operations">
+  <h2>Operations</h2>
+  <div class="ops-grid">
+    <div class="ops-panel">
+      <h3>Scheduler</h3>
+      <p class="{{ 'status-ok' if operations.ok else 'status-bad' }}">
+        {{ "healthy" if operations.ok else "needs attention" }}
+      </p>
+      <dl>
+        <dt>Configured</dt><dd>{{ "yes" if operations.scheduler.configured else "no" }}</dd>
+        <dt>Running</dt><dd>{{ "yes" if operations.scheduler.running else "no" }}</dd>
+        <dt>Start scheduled</dt><dd>{{ "yes" if operations.scheduler.start_scheduled else "no" }}</dd>
+        <dt>Jobs</dt><dd>{{ operations.scheduler.jobs }}</dd>
+      </dl>
+      {% if operations.scheduler.create_error %}<p class="error">{{ operations.scheduler.create_error }}</p>{% endif %}
+      {% if operations.scheduler.start_error %}<p class="error">{{ operations.scheduler.start_error }}</p>{% endif %}
+      {% if operations.scheduler.jobs_error %}<p class="error">{{ operations.scheduler.jobs_error }}</p>{% endif %}
+    </div>
+    <div class="ops-panel">
+      <h3>Queues</h3>
+      <dl>
+        {% for status, count in operations.download_jobs.items() %}
+          <dt>Downloads {{ status }}</dt><dd>{{ count }}</dd>
+        {% else %}
+          <dt>Downloads</dt><dd>0</dd>
+        {% endfor %}
+        {% for status, count in operations.kavita_sync_jobs.items() %}
+          <dt>Kavita {{ status }}</dt><dd>{{ count }}</dd>
+        {% else %}
+          <dt>Kavita jobs</dt><dd>0</dd>
+        {% endfor %}
+      </dl>
+    </div>
+    <div class="ops-panel">
+      <h3>Kavita</h3>
+      <dl>
+        <dt>Configured</dt><dd>{{ "yes" if operations.kavita.configured else "no" }}</dd>
+        <dt>Pending series</dt><dd>{{ operations.kavita.pending_sync_series }}</dd>
+      </dl>
+    </div>
+  </div>
+  <table class="ops-table">
+    <thead>
+      <tr>
+        <th>Source</th>
+        <th>State</th>
+        <th>Failures</th>
+        <th>Last poll</th>
+        <th>Last error</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for source in operations.sources %}
+        <tr>
+          <td>{{ source.source }}</td>
+          <td class="{{ 'status-ok' if source.enabled else 'status-bad' }}">{{ "enabled" if source.enabled else "disabled" }}</td>
+          <td>{{ source.consecutive_failures }}</td>
+          <td>{{ source.last_poll_at or "never" }}</td>
+          <td>{{ source.last_error or "" }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</section>
+
+<section class="toolbar library-filters">
+  <div class="source-actions">
+    {% for value, label in [
+      ("all", "All"),
+      ("ready", "Ready"),
+      ("pending-sync", "Pending sync"),
+      ("failed", "Failed"),
+      ("unread", "Unread"),
+      ("reading", "Reading"),
+      ("caught-up", "Caught up")
+    ] %}
+      <a class="{{ 'button-link' if filter == value else 'filter-link' }}" href="/library?filter={{ value }}&view={{ view }}">{{ label }}</a>
+    {% endfor %}
+  </div>
+  <div class="source-actions">
+    <a class="{{ 'button-link' if view == 'list' else 'filter-link' }}" href="/library?filter={{ filter }}&view=list">List</a>
+    <a class="{{ 'button-link' if view == 'cover' else 'filter-link' }}" href="/library?filter={{ filter }}&view=cover">Cover wall</a>
+  </div>
+</section>
+
+<section class="library-list">
+  {% for item in series %}
+    <article class="{{ 'library-item cover-card' if view == 'cover' else 'library-item' }}">
+      <div class="cover small">
+        {% if item.cover_path %}<img src="/covers/{{ item.cover_path.split('/')[-1] }}" alt="">
+        {% elif item.cover_url %}<img src="{{ item.cover_url }}" alt="">
+        {% else %}<span>No cover</span>{% endif %}
+      </div>
+      <div>
+        <h2>{{ item.title }}</h2>
+        <p>Status: {{ item.status }}</p>
+        <p>Progress: {{ item.progress.status if item.progress else "unread" }}</p>
+        <p>{{ item.chapters|length }} chapters known</p>
+        <form method="post" action="/series/{{ item.id }}/status">{{ csrf_input()|safe }}
+          <button name="status" value="new">Back to discovery</button>
+          <button name="status" value="ignored">Ignore</button>
+        </form>
+        <form method="post" action="/series/{{ item.id }}/progress" class="actions compact">{{ csrf_input()|safe }}
+          <button name="status" value="interested" class="secondary">Interested</button>
+          <button name="status" value="reading" class="secondary">Reading</button>
+          <button name="status" value="paused" class="secondary">Paused</button>
+        </form>
+        <form method="post" action="/series/{{ item.id }}/caught-up" class="actions compact">{{ csrf_input()|safe }}
+          <button class="secondary">Caught up</button>
+        </form>
+        <div class="actions compact">
+          {% for source in item.sources %}
+            <form method="post" action="/source-series/{{ source.id }}/rescan">{{ csrf_input()|safe }}
+              <button class="secondary">Rescan {{ source.source }} chapters</button>
+            </form>
+          {% endfor %}
+        </div>
+      </div>
+      <div class="chapter-list">
+        {% for chapter in item.chapters[:8] %}
+          <div class="chapter-progress-row">
+            <span>Ch. {{ chapter.number }} · {{ chapter.progress.status if chapter.progress else "unread" }} · best {{ chapter.best_source or "unknown" }} · downloaded {{ chapter.downloaded_source or "no" }}</span>
+            <form method="post" action="/chapters/{{ chapter.id }}/progress" class="actions compact">{{ csrf_input()|safe }}
+              <button name="status" value="reading" class="secondary">Reading</button>
+              <button name="status" value="read" class="secondary">Read</button>
+              <button name="status" value="unread" class="secondary">Unread</button>
+            </form>
+          </div>
+        {% endfor %}
+      </div>
+    </article>
+  {% else %}
+    <p class="empty">No tracked manga yet.</p>
+  {% endfor %}
+</section>
+
+<section class="jobs">
+  <h2>Recent jobs</h2>
+  {% for job in jobs %}
+    <div class="job">
+      <span>#{{ job.id }}</span>
+      <span>{{ job.status }}</span>
+      <span>attempts {{ job.attempts }}</span>
+      {% if job.retry_after %}<span>retry {{ job.retry_after }}</span>{% endif %}
+      <span>{{ job.error }}</span>
+      {% if job.status == "failed" %}
+        <form method="post" action="/download-jobs/{{ job.id }}/retry">{{ csrf_input()|safe }}<button class="secondary">Retry</button></form>
+      {% endif %}
+    </div>
+  {% else %}
+    <p class="empty">No download jobs yet.</p>
+  {% endfor %}
+</section>
+
+<section class="jobs">
+  <h2>Kavita sync jobs</h2>
+  {% for job in kavita_jobs %}
+    <div class="job">
+      <span>#{{ job.id }}</span>
+      <span>{{ job.status }}</span>
+      <span>attempts {{ job.attempts }}</span>
+      {% if job.retry_after %}<span>retry {{ job.retry_after }}</span>{% endif %}
+      <span>{{ job.error }}</span>
+      {% if job.status in ["failed", "skipped"] %}
+        <form method="post" action="/kavita-sync-jobs/{{ job.id }}/retry">{{ csrf_input()|safe }}<button class="secondary">Retry</button></form>
+      {% endif %}
+    </div>
+  {% else %}
+    <p class="empty">No Kavita sync jobs yet.</p>
+  {% endfor %}
+</section>
+{% endblock %}

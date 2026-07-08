@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="toolbar">
+  <h1>Activity</h1>
+  <div class="source-actions">
+    <a class="{{ 'button-link' if not kind and not status else 'filter-link' }}" href="/activity">All</a>
+    <a class="{{ 'button-link' if status == 'error' else 'filter-link' }}" href="/activity?status=error">Errors</a>
+    <a class="{{ 'button-link' if kind == 'download' else 'filter-link' }}" href="/activity?kind=download">Downloads</a>
+    <a class="{{ 'button-link' if kind == 'source_poll' else 'filter-link' }}" href="/activity?kind=source_poll">Polls</a>
+    <a class="{{ 'button-link' if kind == 'kavita_sync' else 'filter-link' }}" href="/activity?kind=kavita_sync">Kavita</a>
+  </div>
+</section>
+
+<section class="table">
+  {% for event in events %}
+    <article class="activity-row">
+      <div>
+        <strong>{{ event.kind }}</strong>
+        <span class="{{ 'status-bad' if event.status == 'error' else 'status-ok' if event.status == 'success' else '' }}">{{ event.status }}</span>
+      </div>
+      <p>{{ event.message }}</p>
+      <span class="muted">{{ event.created_at|relative_time }}</span>
+    </article>
+  {% else %}
+    <p class="empty">No activity recorded yet.</p>
+  {% endfor %}
+</section>
+{% endblock %}
