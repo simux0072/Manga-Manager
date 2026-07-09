@@ -4,6 +4,7 @@ from bs4 import BeautifulSoup
 
 from app.adapters.asura import AsuraAdapter
 from app.adapters.http import HttpSourceClient
+from app.adapters.base import SourceRateLimited
 from app.adapters.kingofshojo import KingOfShojoAdapter
 from app.adapters.mangafire import MangaFireAdapter
 from app.adapters.parsing import extract_image_urls
@@ -82,6 +83,26 @@ def test_asura_uses_parent_card_cover():
     recent = AsuraAdapter().parse_recent_series(soup)
 
     assert recent[0].cover_url == "https://asurascans.com/covers/parent.webp"
+
+
+def test_asura_uses_chapter_url_when_label_has_no_number():
+    soup = BeautifulSoup(
+        """
+        <a href="/comics/example/chapter/1">first chapter</a>
+        <a href="/comics/example/chapter/128">latest chapter</a>
+        """,
+        "html.parser",
+    )
+    source = SeriesItem(
+        source="asura",
+        source_id="comics/example",
+        title="Example",
+        url="https://asurascans.com/comics/example",
+    )
+
+    chapters = AsuraAdapter().parse_chapters(soup, source)
+
+    assert [chapter.number for chapter in chapters] == ["1", "128"]
 
 
 def test_kingofshojo_filters_template_chapters_and_non_reader_images():
@@ -299,6 +320,7 @@ def test_mangafire_parses_detail_metadata():
                 "altTitles": ["Gun Clover"],
                 "genres": [{"name": "Action"}, {"name": "School Life"}],
                 "follows": 999,
+                "rating": 8.7,
                 "malId": "39281",
                 "anilistId": "69281",
             }
@@ -310,6 +332,8 @@ def test_mangafire_parses_detail_metadata():
     assert item.genres == ("Action", "School Life")
     assert item.popularity == 999
     assert item.external_ids == {"mal": "39281", "anilist": "69281"}
+    assert item.metadata["follows"] == 999
+    assert item.metadata["rating"] == 8.7
 
 
 def test_mangafire_defaults_to_new_latest_updates_mode(monkeypatch):
@@ -350,3 +374,24 @@ async def test_http_client_rejects_oversized_page(monkeypatch):
             await client.get_bytes("https://example.com/page.jpg")
     finally:
         await client.client.aclose()
+
+
+async def test_http_client_raises_rate_limit_with_retry_after():
+    async def handler(request):
+        return httpx.Response(
+            429,
+            headers={"retry-after": "120"},
+            request=request,
+        )
+
+    client = HttpSourceClient(
+        "https://example.com",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(SourceRateLimited) as exc_info:
+            await client.get_soup("/")
+    finally:
+        await client.client.aclose()
+
+    assert exc_info.value.retry_after is not None

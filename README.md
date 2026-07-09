@@ -119,6 +119,12 @@ queues that exact chapter first. The scheduler or manual `Run download drain` ac
 downloads, and `Run Kavita drain` performs scan/map work.
 Use `Run next download` or `Run Kavita sync` when you only want to process one job.
 
+The `New` page lists unread downloaded chapters for tracked series, newest first. When Kavita has
+mapped a chapter, the row includes a Kavita reader link; otherwise it still links to the local open
+route and will map after the next successful Kavita scan. Cover images are used as series/CBZ
+metadata only; Manga Manager does not create fake chapter archives from covers when page extraction
+fails.
+
 Optional Kavita settings:
 
 - `KAVITA_SYNC_WANT_TO_READ`: enables scheduler-oriented Want to Read intent sync when wired into
@@ -134,8 +140,21 @@ The Library page includes operational controls and local reading state:
 - Filters for ready, pending sync, failed, unread, reading, and caught-up series.
 - List and cover-wall views.
 - Per-series and per-chapter progress controls that work without Kavita.
-- Manual queue drains, retry controls, source rescans, Want to Read sync, and retention cleanup.
+- Manual queue drains, retry controls, source rescans, Want to Read sync, repair, and retention cleanup.
 - Activity history at `/activity` and an RSS feed at `/notifications/rss.xml`.
+
+`Repair known manga` rescans known source series, prioritizing tracked manga, removes legacy bad
+placeholder chapter rows that have no downloaded files, and refreshes missing covers. Use it after
+parser fixes or after importing data created by an older version.
+
+The job drawer is intentionally compact and only shows recent grouped work. The Info page is the
+authoritative operations view: it shows true queued/running/delayed/failed/completed counts and a
+representative page of jobs for large queues.
+
+Source cooldowns appear in Info when a website or CDN rate-limits downloads. Rate-limited jobs are
+delayed until `Retry-After` when the source provides it, or until the configured fallback cooldown
+expires. During cooldown, Manga Manager can temporarily download the same chapter from a lower
+priority source and later replace it with the higher-priority source.
 
 Retention cleanup is disabled by default. Set `RETENTION_REPLACED_DAYS` or
 `RETENTION_REPLACED_MAX_PER_CHAPTER` to remove inactive replaced files during manual cleanup.
@@ -149,14 +168,36 @@ external notification calls bounded.
 ## Discovery
 
 The Discovery page is a two-column update list on desktop and one column on mobile. Each item shows
-cover art, a truncated title, source badges, and the newest 2-3 known chapter releases with relative
-ages. The cover/title area opens the series; chapter rows open the specific chapter.
+cover art, a truncated title, source badges, source metadata when available, a short description,
+aliases/genres, and the newest 2-3 known chapter releases with relative ages. The cover/title area
+opens the series; chapter rows open the specific chapter.
+
+The `Visible websites` checkboxes hide source badges, chapter rows, and any Discovery or Library
+card with no remaining visible source rows.
 
 Manual source refresh actions are labeled `Pull`. Pulls run in the background and the top bar shows
 pull progress. Discovery is paginated with a `Load more` control using `DISCOVERY_PAGE_SIZE`.
 
 MangaFire defaults to the latest/new updates feed via `MANGAFIRE_DISCOVERY_MODE=new`. Set
 `MANGAFIRE_DISCOVERY_MODE=hot` only if you explicitly want MangaFire's hot feed.
+
+MangaFire is treated as English-only. MangaFire series with no English chapters are skipped during
+Discovery so they do not appear as broken cards.
+
+## Rate Limits And Retries
+
+Source adapters respect per-source request intervals. Asura defaults to a conservative request
+interval because its CDN may return `429 Too Many Requests` during bursts. Relevant settings:
+
+- `ASURA_REQUEST_INTERVAL_SECONDS`: delay between Asura HTTP requests.
+- `RATE_LIMIT_COOLDOWN_MINUTES`: default cooldown when a non-Asura source is rate-limited without a
+  `Retry-After` header.
+- `ASURA_RATE_LIMIT_COOLDOWN_MINUTES`: default Asura cooldown when no `Retry-After` header exists.
+- `JOB_STATUS_GROUP_LIMIT`: number of grouped jobs shown per status slice in the live jobs API.
+
+Rate-limit errors do not consume normal download attempts. Content errors such as invalid image
+bytes, too few page images, or missing chapters still use the configured retry/backoff behavior and
+may fall back to another source after `MAX_DOWNLOAD_ATTEMPTS`.
 
 ## Local Testing
 

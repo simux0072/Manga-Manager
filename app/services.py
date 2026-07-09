@@ -24,7 +24,7 @@ from sqlalchemy.exc import IntegrityError, OperationalError, PendingRollbackErro
 from sqlalchemy.orm import Session
 
 from app.adapters import adapter_for_source, enabled_source_names
-from app.adapters.base import ChapterTemporarilyUnavailable, SourceAdapter
+from app.adapters.base import ChapterTemporarilyUnavailable, SourceAdapter, SourceRateLimited
 from app.domain import (
     ChapterItem,
     SOURCE_PRIORITY,
@@ -180,6 +180,8 @@ def merge_series_item(session: Session, item: SeriesItem) -> SourceSeries:
         source_series.aliases = merge_delimited(source_series.aliases, item.aliases, "|")
         source_series.popularity = max(source_series.popularity, item.popularity)
         source_series.external_ids = merge_external_ids(source_series.external_ids, item.external_ids)
+        if item.metadata:
+            source_series.metadata_json = encode_metadata(item.metadata)
         refresh_series_metadata(source_series.series, item)
         source_series.last_checked_at = utcnow()
         return source_series
@@ -215,6 +217,7 @@ def merge_series_item(session: Session, item: SeriesItem) -> SourceSeries:
         genres=",".join(item.genres),
         popularity=item.popularity,
         external_ids=external_ids,
+        metadata_json=encode_metadata(item.metadata),
         last_checked_at=utcnow(),
     )
     session.add(source_series)
@@ -234,6 +237,20 @@ def refresh_series_metadata(series: Series, item: SeriesItem) -> None:
     series.popularity = max(series.popularity, item.popularity)
     series.external_ids = merge_external_ids(series.external_ids, item.external_ids)
     series.updated_at = utcnow()
+
+
+def encode_metadata(value: dict[str, object] | None) -> str:
+    return json.dumps(value or {}, sort_keys=True) if value else ""
+
+
+def decode_metadata(value: str) -> dict[str, object]:
+    if not value:
+        return {}
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError:
+        return {}
+    return payload if isinstance(payload, dict) else {}
 
 
 def find_matching_series(session: Session, item: SeriesItem) -> tuple[Series | None, float, str]:
@@ -621,6 +638,47 @@ def record_source_failure(health: SourceHealth, error: str) -> None:
         health.enabled = False
 
 
+def source_download_cooldown(session: Session, source: str) -> datetime | None:
+    health = session.get(SourceHealth, source)
+    if health is None:
+        return None
+    cooldown = ensure_aware(health.download_cooldown_until)
+    if cooldown and cooldown <= datetime.now(timezone.utc):
+        health.download_cooldown_until = None
+        health.download_cooldown_reason = ""
+        return None
+    return cooldown
+
+
+def source_is_download_ready(session: Session, source: str, now: datetime | None = None) -> bool:
+    health = session.get(SourceHealth, source)
+    if health is None:
+        return True
+    cooldown = ensure_aware(health.download_cooldown_until)
+    return cooldown is None or cooldown <= (now or datetime.now(timezone.utc))
+
+
+def set_source_download_cooldown(
+    session: Session,
+    source: str,
+    retry_after: datetime | None,
+    reason: str,
+) -> datetime:
+    if retry_after is None:
+        minutes = (
+            settings.asura_rate_limit_cooldown_minutes
+            if source == "asura"
+            else settings.rate_limit_cooldown_minutes
+        )
+        retry_after = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+    retry_after = ensure_aware(retry_after) or datetime.now(timezone.utc)
+    health = session.get(SourceHealth, source) or SourceHealth(source=source, enabled=True)
+    health.download_cooldown_until = retry_after
+    health.download_cooldown_reason = reason
+    session.add(health)
+    return retry_after
+
+
 async def poll_all_sources(session: Session) -> dict[str, dict[str, object]]:
     results: dict[str, dict[str, object]] = {}
     for source in enabled_source_names():
@@ -663,6 +721,8 @@ def queue_downloads(session: Session) -> int:
             continue
         existing = session.scalar(select(DownloadJob).where(DownloadJob.chapter_release_id == release.id))
         if existing:
+            if existing.status == "delayed" and ensure_aware(existing.retry_after) and ensure_aware(existing.retry_after) > now:
+                continue
             if existing.status in {"delayed", "failed", "skipped"}:
                 existing.status = "queued"
                 existing.error = ""
@@ -693,6 +753,8 @@ def selected_release_for_chapter(
     releases = sorted(releases, key=lambda release: SOURCE_PRIORITY.get(release.source, 0), reverse=True)
     for release in releases:
         job = session.scalar(select(DownloadJob).where(DownloadJob.chapter_release_id == release.id))
+        if not source_is_download_ready(session, release.source, now):
+            continue
         if job and job.status == "failed" and job.attempts >= settings.max_download_attempts:
             continue
         downloadable_after = ensure_aware(release.downloadable_after)
@@ -735,6 +797,8 @@ def next_release_for_chapter(
         key=lambda item: SOURCE_PRIORITY.get(item.source, 0),
         reverse=True,
     ):
+        if not source_is_download_ready(session, release.source, now):
+            continue
         downloadable_after = ensure_aware(release.downloadable_after)
         if downloadable_after and downloadable_after > now:
             continue
@@ -772,6 +836,9 @@ def queue_release(
 ) -> bool:
     existing = session.scalar(select(DownloadJob).where(DownloadJob.chapter_release_id == release.id))
     if existing:
+        retry_after = ensure_aware(existing.retry_after)
+        if existing.status == "delayed" and retry_after and retry_after > datetime.now(timezone.utc):
+            return False
         if existing.status in {"failed", "skipped", "delayed"}:
             existing.status = "queued"
             existing.error = ""
@@ -875,10 +942,9 @@ async def run_next_download(session: Session) -> bool:
 
     release = session.get(ChapterRelease, job.chapter_release_id)
     if release is None or release.chapter is None:
-        job.status = "failed"
-        job.error = "release or chapter missing"
+        session.delete(job)
         commit_with_retry(session)
-        logger.error("download job failed job_id=%s reason=%s", job.id, job.error)
+        logger.warning("removed orphaned download job job_id=%s release_id=%s", job.id, job.chapter_release_id)
         return True
 
     logger.info(
@@ -1008,6 +1074,45 @@ async def run_next_download(session: Session) -> bool:
             retry_after,
             exc,
         )
+    except SourceRateLimited as exc:
+        retry_after = set_source_download_cooldown(
+            session,
+            release.source,
+            ensure_aware(exc.retry_after),
+            str(exc),
+        )
+        job.attempts = max(job.attempts - 1, 0)
+        job.status = "delayed"
+        job.error = str(exc)
+        job.retry_after = retry_after
+        job.updated_at = utcnow()
+        queued_fallback = queue_next_chapter_download(
+            session,
+            release.chapter,
+            exclude_release_id=release.id,
+            priority=job.priority + 1,
+            job_type=job.job_type,
+        )
+        record_activity(
+            session,
+            "download",
+            "warning",
+            f"{release.source} rate limited; retry after {retry_after.isoformat()}",
+            source=release.source,
+            series_id=release.chapter.series_id,
+            chapter_id=release.chapter.id,
+            download_job_id=job.id,
+            metadata={"fallback_queued": queued_fallback},
+        )
+        commit_with_retry(session)
+        logger.warning(
+            "download job delayed by rate limit job_id=%s source=%s chapter_id=%s retry_after=%s fallback=%s",
+            job.id,
+            release.source,
+            release.chapter.id,
+            retry_after,
+            queued_fallback,
+        )
     except Exception as exc:
         if staging_path is not None:
             staging_path.unlink(missing_ok=True)
@@ -1065,6 +1170,14 @@ async def run_next_download(session: Session) -> bool:
 def delay_job_if_not_due(session: Session, job: DownloadJob, release: ChapterRelease) -> bool:
     downloadable_after = ensure_aware(release.downloadable_after)
     now = datetime.now(timezone.utc)
+    source_cooldown = source_download_cooldown(session, release.source)
+    if source_cooldown and source_cooldown > now:
+        job.status = "delayed"
+        job.error = f"{release.source} rate limited"
+        job.retry_after = source_cooldown
+        job.updated_at = utcnow()
+        commit_with_retry(session)
+        return True
     if downloadable_after is None or downloadable_after <= now:
         return False
     job.status = "delayed"
@@ -1324,8 +1437,17 @@ def claim_next_download_job(session: Session) -> DownloadJob | None:
     ready_filter = or_(DownloadJob.retry_after.is_(None), DownloadJob.retry_after <= now)
     job_id = session.scalar(
         select(DownloadJob.id)
-        .where(DownloadJob.status == "queued")
+        .join(ChapterRelease, ChapterRelease.id == DownloadJob.chapter_release_id)
+        .join(SourceSeries, SourceSeries.id == ChapterRelease.source_series_id)
+        .outerjoin(SourceHealth, SourceHealth.source == SourceSeries.source)
+        .where(DownloadJob.status.in_(["queued", "delayed"]))
         .where(ready_filter)
+        .where(
+            or_(
+                SourceHealth.download_cooldown_until.is_(None),
+                SourceHealth.download_cooldown_until <= now,
+            )
+        )
         .order_by(DownloadJob.priority.asc(), DownloadJob.created_at.asc())
         .limit(1)
     )
@@ -1335,7 +1457,7 @@ def claim_next_download_job(session: Session) -> DownloadJob | None:
     result = session.execute(
         update(DownloadJob)
         .where(DownloadJob.id == job_id)
-        .where(DownloadJob.status == "queued")
+        .where(DownloadJob.status.in_(["queued", "delayed"]))
         .where(ready_filter)
         .values(
             status="running",
@@ -1801,6 +1923,12 @@ def merge_match_candidate(session: Session, candidate_id: int) -> bool:
         return False
     old_series_id = source_series.series_id
     old_series = session.get(Series, old_series_id)
+    moving_source_ids = [
+        row[0]
+        for row in session.execute(
+            select(SourceSeries.id).where(SourceSeries.series_id == old_series_id)
+        )
+    ]
     for source_row in session.scalars(
         select(SourceSeries).where(SourceSeries.series_id == old_series_id)
     ):
@@ -1818,6 +1946,22 @@ def merge_match_candidate(session: Session, candidate_id: int) -> bool:
         else:
             chapter.series_id = target.id
             recompute_chapter_best_source(chapter)
+    for related in session.scalars(
+        select(MatchCandidate).where(
+            or_(
+                MatchCandidate.candidate_series_id == old_series_id,
+                MatchCandidate.source_series_id.in_(moving_source_ids),
+            )
+        )
+    ):
+        if related.id == candidate.id:
+            related.status = "merged"
+        else:
+            session.delete(related)
+    for rule in session.scalars(
+        select(ManualMatchRule).where(ManualMatchRule.target_series_id == old_series_id)
+    ):
+        rule.target_series_id = target.id
     session.add(
         ManualMatchRule(
             source_series_id=source_series.id,
@@ -2072,6 +2216,86 @@ def cleanup_bad_discovery_rows(session: Session) -> dict[str, int]:
     return {"chapters": removed_chapters, "series": removed_series}
 
 
+def is_legacy_bad_chapter(chapter: Chapter) -> bool:
+    values = [chapter.number or "", chapter.title or ""]
+    joined = " ".join(values).lower()
+    if "{{" in joined or "chapter {{number}}" in joined:
+        return True
+    if (chapter.number or "").strip().lower() in {"first chapter", "latest chapter", "chapter"}:
+        return True
+    try:
+        Decimal(chapter.number)
+    except InvalidOperation:
+        return not bool(chapter.downloaded_source or chapter.cbz_path)
+    return False
+
+
+def remove_legacy_bad_chapters(session: Session) -> int:
+    removed = 0
+    for chapter in session.scalars(select(Chapter)).all():
+        if not is_legacy_bad_chapter(chapter):
+            continue
+        has_files = session.scalar(select(DownloadedFile.id).where(DownloadedFile.chapter_id == chapter.id))
+        if has_files:
+            continue
+        for release in list(chapter.releases):
+            for job in session.scalars(select(DownloadJob).where(DownloadJob.chapter_release_id == release.id)):
+                session.delete(job)
+            session.delete(release)
+        session.delete(chapter)
+        removed += 1
+    if removed:
+        commit_with_retry(session)
+    return removed
+
+
+async def repair_known_series(session: Session, limit: int = 100) -> dict[str, int]:
+    cleanup = cleanup_bad_discovery_rows(session)
+    removed_chapters = cleanup["chapters"] + remove_legacy_bad_chapters(session)
+    refreshed = 0
+    rescanned = 0
+    rows = session.scalars(
+        select(SourceSeries)
+        .join(Series)
+        .order_by(
+            Series.status.in_(["reading", "interested"]).desc(),
+            SourceSeries.last_checked_at.asc(),
+            SourceSeries.id.asc(),
+        )
+        .limit(limit)
+    ).all()
+    for source_series in rows:
+        try:
+            count = await rescan_source_series(session, source_series.id)
+        except Exception as exc:
+            logger.warning("repair rescan failed for source_series=%s: %s", source_series.id, exc)
+            continue
+        rescanned += 1
+        if count:
+            refreshed += count
+    covers = await refresh_missing_covers(session, limit=limit)
+    removed_chapters += remove_legacy_bad_chapters(session)
+    result = {
+        "rescanned": rescanned,
+        "chapters": refreshed,
+        "removed_chapters": removed_chapters,
+        "removed_series": cleanup["series"],
+        "covers": covers,
+    }
+    record_activity(
+        session,
+        "repair",
+        "success",
+        (
+            f"Repair rescanned {rescanned} source series, refreshed {refreshed} chapters, "
+            f"removed {removed_chapters} bad chapters, refreshed {covers} covers"
+        ),
+        metadata=result,
+    )
+    commit_with_retry(session)
+    return result
+
+
 def bulk_update_match_candidates(session: Session, candidate_ids: list[int], action: str) -> int:
     count = 0
     for candidate_id in candidate_ids:
@@ -2126,6 +2350,15 @@ def shared_external_ids(left: dict[str, str], right: dict[str, str]) -> bool:
 def recover_stale_download_jobs(session: Session) -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=settings.download_stale_minutes)
     count = 0
+    orphaned = session.scalars(
+        select(DownloadJob)
+        .outerjoin(ChapterRelease, ChapterRelease.id == DownloadJob.chapter_release_id)
+        .outerjoin(Chapter, Chapter.id == ChapterRelease.chapter_id)
+        .where(or_(ChapterRelease.id.is_(None), Chapter.id.is_(None)))
+    ).all()
+    for job in orphaned:
+        session.delete(job)
+        count += 1
     for job in session.scalars(select(DownloadJob).where(DownloadJob.status == "running")):
         updated_at = ensure_aware(job.updated_at)
         if updated_at and updated_at <= cutoff:

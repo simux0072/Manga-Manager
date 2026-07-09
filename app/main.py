@@ -48,6 +48,7 @@ from app.services import (
     FIRST_IMPORT_CHAPTERS,
     cleanup_bad_discovery_rows,
     create_pull_job,
+    decode_metadata,
     drain_download_queue,
     drain_kavita_sync_queue,
     bulk_update_match_candidates,
@@ -72,6 +73,7 @@ from app.services import (
     recover_stale_kavita_sync_jobs,
     recover_stale_pull_jobs,
     refresh_missing_covers,
+    repair_known_series,
     rescan_source_series,
     retry_download_job,
     retry_failed_downloads,
@@ -310,10 +312,30 @@ def discovery_item(series: Series) -> dict:
         )
         if len(chapter_rows) >= 3:
             break
+    source_metrics = []
+    for source in series.sources:
+        metadata = decode_metadata(source.metadata_json)
+        metrics = []
+        if metadata.get("rating"):
+            metrics.append(f"rating {metadata['rating']}")
+        if metadata.get("follows"):
+            metrics.append(f"{metadata['follows']} bookmarks")
+        if metadata.get("rating_count"):
+            metrics.append(f"{metadata['rating_count']} ratings")
+        if metadata.get("rank"):
+            metrics.append(f"rank {metadata['rank']}")
+        if metrics:
+            source_metrics.append({"source": source.source, "text": " · ".join(metrics)})
+    aliases = [value for value in (series.aliases or "").split("|") if value][:3]
+    genres = [value for value in (series.genres or "").split(",") if value][:4]
     return {
         "series": series,
         "chapters": chapter_rows,
         "kavita_url": kavita_series_url(series),
+        "description": series.description,
+        "aliases": aliases,
+        "genres": genres,
+        "source_metrics": source_metrics,
     }
 
 
@@ -659,6 +681,33 @@ def notifications_rss(session: Session = Depends(get_session)):
     )
 
 
+@app.get("/new-chapters", response_class=HTMLResponse)
+def new_chapters(request: Request, session: Session = Depends(get_session)):
+    chapters = session.scalars(
+        select(Chapter)
+        .join(Series)
+        .where(Series.status.in_(["reading", "interested"]))
+        .where(Chapter.downloaded_source != "")
+        .where(~Chapter.progress.has(ChapterProgress.status == "read"))
+        .options(
+            selectinload(Chapter.series),
+            selectinload(Chapter.progress),
+            selectinload(Chapter.releases),
+        )
+    ).all()
+    chapters = sorted(chapters, key=chapter_platform_release_time, reverse=True)[:100]
+    return templates.TemplateResponse(
+        request,
+        "new_chapters.html",
+        {
+            "chapters": chapters,
+            "kavita_chapter_url": kavita_chapter_url,
+            "chapter_platform_release_time": chapter_platform_release_time,
+            "active": "new",
+        },
+    )
+
+
 @app.get("/matches", response_class=HTMLResponse)
 def matches(request: Request, session: Session = Depends(get_session)):
     candidates = session.scalars(
@@ -1001,9 +1050,31 @@ def pull_job_payload(job: SourcePullJob) -> dict:
 
 
 def jobs_status_payload(session: Session) -> dict:
-    downloads = session.scalars(
-        select(DownloadJob).order_by(DownloadJob.updated_at.desc(), DownloadJob.id.desc()).limit(100)
-    ).all()
+    recover_stale_download_jobs(session)
+    recover_stale_kavita_sync_jobs(session)
+    group_limit = settings.job_status_group_limit
+    download_rows: dict[int, DownloadJob] = {}
+    for query in (
+        select(DownloadJob)
+        .where(DownloadJob.status.in_(["running", "delayed"]))
+        .order_by(DownloadJob.updated_at.desc(), DownloadJob.id.desc())
+        .limit(group_limit * 4),
+        select(DownloadJob)
+        .where(DownloadJob.status == "queued")
+        .order_by(DownloadJob.priority.asc(), DownloadJob.created_at.asc(), DownloadJob.id.asc())
+        .limit(group_limit * 4),
+        select(DownloadJob)
+        .where(DownloadJob.status == "failed")
+        .order_by(DownloadJob.updated_at.desc(), DownloadJob.id.desc())
+        .limit(group_limit * 2),
+        select(DownloadJob)
+        .where(DownloadJob.status.in_(["complete", "skipped"]))
+        .order_by(DownloadJob.updated_at.desc(), DownloadJob.id.desc())
+        .limit(group_limit * 2),
+    ):
+        for job in session.scalars(query):
+            download_rows[job.id] = job
+    downloads = list(download_rows.values())
     kavita_jobs = session.scalars(
         select(KavitaSyncJob).order_by(KavitaSyncJob.updated_at.desc(), KavitaSyncJob.id.desc()).limit(25)
     ).all()
@@ -1014,7 +1085,13 @@ def jobs_status_payload(session: Session) -> dict:
     download_groups = grouped_download_payloads(downloads, session)
     pull_total = sum(job.total_items for job in active_pulls)
     pull_processed = sum(job.processed_items for job in active_pulls)
-    active_downloads = sum(1 for job in download_groups if job["active"])
+    download_counts = {
+        status: count
+        for status, count in session.execute(
+            select(DownloadJob.status, func.count()).group_by(DownloadJob.status)
+        )
+    }
+    active_downloads = sum(download_counts.get(status, 0) for status in ("queued", "running", "delayed"))
     active_kavita = sum(1 for job in kavita_jobs if job.status in {"queued", "running"})
     return {
         "overall": {
@@ -1028,12 +1105,7 @@ def jobs_status_payload(session: Session) -> dict:
         "downloads": download_groups,
         "kavita": [kavita_job_payload(job) for job in kavita_jobs],
         "counts": {
-            "downloads": {
-                status: count
-                for status, count in session.execute(
-                    select(DownloadJob.status, func.count()).group_by(DownloadJob.status)
-                )
-            },
+            "downloads": download_counts,
             "kavita": {
                 status: count
                 for status, count in session.execute(
@@ -1176,6 +1248,23 @@ async def refresh_covers(request: Request, session: Session = Depends(get_sessio
     )
 
 
+@app.post("/maintenance/repair-known-series")
+async def repair_series(request: Request, session: Session = Depends(get_session)):
+    result = await repair_known_series(session)
+    message = (
+        f"Repair rescanned {result['rescanned']} source series, "
+        f"removed {result['removed_chapters']} bad chapters, "
+        f"refreshed {result['covers']} covers."
+    )
+    return json_or_redirect(
+        request,
+        {"ok": True, **result, "message": message},
+        "/info",
+        "repair",
+        count=result["rescanned"],
+    )
+
+
 @app.post("/kavita/want-to-read/sync")
 async def kavita_want_to_read_sync(request: Request, session: Session = Depends(get_session)):
     count = await sync_kavita_want_to_read(session)
@@ -1299,8 +1388,17 @@ def disable_source(source: str, session: Session = Depends(get_session)):
 
 
 @app.post("/matches/{candidate_id}/merge")
-def merge_candidate(candidate_id: int, session: Session = Depends(get_session)):
-    merge_match_candidate(session, candidate_id)
+def merge_candidate(candidate_id: int, request: Request, session: Session = Depends(get_session)):
+    try:
+        ok = merge_match_candidate(session, candidate_id)
+    except Exception as exc:
+        logger.exception("match merge failed candidate_id=%s", candidate_id)
+        session.rollback()
+        if wants_json(request):
+            return JSONResponse({"ok": False, "message": str(exc)}, status_code=500)
+        return RedirectResponse("/matches?notice=merge-error", status_code=303)
+    if wants_json(request):
+        return JSONResponse({"ok": ok, "message": "Merged match." if ok else "Match was not mergeable."})
     return RedirectResponse("/matches", status_code=303)
 
 

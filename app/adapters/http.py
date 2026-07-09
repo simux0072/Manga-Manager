@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+from email.utils import parsedate_to_datetime
 import time
+from datetime import datetime, timedelta, timezone
 
 import httpx
 from bs4 import BeautifulSoup
 
+from app.adapters.base import SourceRateLimited
 from app.settings import settings
 
 
@@ -48,7 +51,7 @@ class HttpSourceClient:
             headers["Referer"] = referer
         await self.wait_for_throttle()
         async with self.client.stream("GET", url, headers=headers) as response:
-            response.raise_for_status()
+            self.raise_for_status(response)
             content_type = response.headers.get("content-type", "")
             if content_type and not content_type.startswith("image/"):
                 raise RuntimeError(f"unexpected content type {content_type} for {url}")
@@ -90,8 +93,16 @@ class HttpSourceClient:
     ) -> httpx.Response:
         await self.wait_for_throttle()
         response = await self.client.request(method, url, headers=headers)
-        response.raise_for_status()
+        self.raise_for_status(response)
         return response
+
+    def raise_for_status(self, response: httpx.Response) -> None:
+        if response.status_code == 429:
+            raise SourceRateLimited(
+                f"rate limited by {self.base_url}",
+                retry_after=retry_after_from_headers(response.headers),
+            )
+        response.raise_for_status()
 
     async def wait_for_throttle(self) -> None:
         if self.throttle_seconds <= 0:
@@ -107,3 +118,21 @@ class HttpSourceClient:
         if self._client is not None:
             await self._client.aclose()
             self._client = None
+
+
+def retry_after_from_headers(headers: httpx.Headers) -> datetime | None:
+    value = headers.get("retry-after")
+    if not value:
+        return None
+    now = datetime.now(timezone.utc)
+    try:
+        seconds = int(value)
+    except ValueError:
+        try:
+            parsed = parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    return now + timedelta(seconds=max(seconds, 0))

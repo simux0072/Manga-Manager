@@ -78,11 +78,27 @@
                 <span data-source="{{ source.source }}">{{ source.source }}</span>
               {% endfor %}
             </div>
+            {% if row.description %}
+              <p class="update-description">{{ row.description }}</p>
+            {% endif %}
+            {% if row.aliases %}
+              <p class="muted">Also: {{ row.aliases|join(", ") }}</p>
+            {% endif %}
+            {% if row.genres %}
+              <p class="muted">Genres: {{ row.genres|join(", ") }}</p>
+            {% endif %}
+            {% if row.source_metrics %}
+              <div class="sources">
+                {% for metric in row.source_metrics %}
+                  <span data-source="{{ metric.source }}">{{ metric.source }} · {{ metric.text }}</span>
+                {% endfor %}
+              </div>
+            {% endif %}
           </div>
         </a>
         <div class="update-chapters">
           {% for chapter in row.chapters %}
-            <a class="chapter-row" data-source="{{ chapter.source }}" href="/chapters/{{ chapter.id }}/open">
+            <a class="chapter-row" data-source-row="{{ chapter.source }}" href="/chapters/{{ chapter.id }}/open">
               <span>Ch. {{ chapter.number }}{% if chapter.title %} · {{ chapter.title }}{% endif %}</span>
               <span>{{ chapter.source }} · {{ chapter.published_at|relative_time }}</span>
             </a>

@@ -2,6 +2,7 @@ const SOURCE_FILTER_KEY = "manga-manager.hiddenSources";
 const state = {
   jobs: null,
   expandedJobs: new Set(),
+  drawerSections: new Map(),
   filter: new URLSearchParams(window.location.search).get("filter") || "all",
   view: new URLSearchParams(window.location.search).get("view") || "list",
 };
@@ -48,6 +49,14 @@ function activeSources(card) {
 
 function cardMatchesSource(card, hidden) {
   const sources = activeSources(card);
+  if (card.matches(".update-card")) {
+    const visibleRows = [...card.querySelectorAll("[data-source-row], .sources [data-source]")]
+      .filter((row) => {
+        const source = row.dataset.sourceRow || row.dataset.source || "";
+        return source && !hidden.has(source);
+      });
+    return sources.length === 0 || visibleRows.length > 0;
+  }
   return sources.length === 0 || sources.some((source) => !hidden.has(source));
 }
 
@@ -67,12 +76,12 @@ function applyFilters() {
   document.querySelectorAll("[data-source-toggle]").forEach((toggle) => {
     toggle.checked = !hidden.has(toggle.value);
   });
+  document.querySelectorAll("[data-source-row], .update-card .sources [data-source]").forEach((row) => {
+    const source = row.dataset.sourceRow || row.dataset.source || "";
+    row.hidden = Boolean(source && hidden.has(source));
+  });
   document.querySelectorAll("[data-series-card]").forEach((card) => {
     card.hidden = !cardMatchesSource(card, hidden) || !cardMatchesLibraryFilter(card);
-  });
-  document.querySelectorAll("[data-source-row]").forEach((row) => {
-    const source = row.dataset.sourceRow || "";
-    row.hidden = Boolean(source && hidden.has(source));
   });
   document.querySelectorAll("[data-library-filter]").forEach((link) => {
     const active = link.dataset.libraryFilter === state.filter;
@@ -317,10 +326,17 @@ function renderJob(job, options = {}) {
 function renderSection(title, jobs, options = {}) {
   const section = document.createElement("details");
   section.className = "drawer-section";
-  section.open = options.open !== false;
+  const key = options.key || title.toLowerCase();
+  section.open = state.drawerSections.has(key)
+    ? state.drawerSections.get(key)
+    : options.open !== false;
   const heading = document.createElement("summary");
-  heading.textContent = `${title} (${jobs.length})`;
+  const count = options.count ?? jobs.length;
+  heading.textContent = `${title} (${count})`;
   section.append(heading);
+  section.addEventListener("toggle", () => {
+    state.drawerSections.set(key, section.open);
+  });
   const body = document.createElement("div");
   body.className = "job-list";
   if (!jobs.length) {
@@ -351,6 +367,24 @@ function splitJobsByStatus(payload) {
     completed: jobs
       .filter((job) => ["complete", "skipped"].includes(job.status))
       .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || "")),
+  };
+}
+
+function statusCounts(payload) {
+  const downloads = (payload.counts && payload.counts.downloads) || {};
+  const pulls = (payload.counts && payload.counts.pulls) || {};
+  const kavita = (payload.counts && payload.counts.kavita) || {};
+  const sum = (source, names) => names.reduce((total, name) => total + (source[name] || 0), 0);
+  return {
+    active:
+      sum(downloads, ["queued", "running", "delayed"]) +
+      sum(pulls, ["queued", "running"]) +
+      sum(kavita, ["queued", "running"]),
+    failed: sum(downloads, ["failed"]) + sum(pulls, ["failed"]) + sum(kavita, ["failed"]),
+    completed:
+      sum(downloads, ["complete", "skipped"]) +
+      sum(pulls, ["complete", "skipped"]) +
+      sum(kavita, ["complete", "skipped"]),
   };
 }
 
@@ -386,18 +420,26 @@ function renderJobs(payload) {
   const drawer = document.getElementById("jobs-drawer-content");
   if (drawer) {
     const byStatus = splitJobsByStatus(payload);
+    const counts = statusCounts(payload);
     drawer.replaceChildren(
-      renderSection("Queued", byStatus.active),
-      renderSection("Completed", byStatus.completed.slice(0, 10), {open: false}),
-      renderSection("Failed", byStatus.failed.slice(0, 10), {open: false}),
+      renderSection("Queued", byStatus.active, {key: "queued", count: counts.active}),
+      renderSection("Completed", byStatus.completed.slice(0, 10), {key: "completed", count: counts.completed, open: false}),
+      renderSection("Failed", byStatus.failed.slice(0, 10), {key: "failed", count: counts.failed, open: false}),
     );
   }
   const byStatus = splitJobsByStatus(payload);
+  const counts = statusCounts(payload);
   Object.entries(byStatus).forEach(([status, jobs]) => {
     document.querySelectorAll(`[data-jobs-status="${status}"]`).forEach((target) => {
       target.replaceChildren(
         ...jobs.map((job) => renderJob(job, {showChapters: job.kind === "download_series"})),
       );
+      if (counts[status] > jobs.length) {
+        const more = document.createElement("p");
+        more.className = "muted";
+        more.textContent = `Showing ${jobs.length} of ${counts[status]} jobs.`;
+        target.append(more);
+      }
       if (!jobs.length) {
         const empty = document.createElement("p");
         empty.className = "empty";

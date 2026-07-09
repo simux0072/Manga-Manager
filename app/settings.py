@@ -35,7 +35,7 @@ class Settings(BaseSettings):
     request_timeout_seconds: float = Field(default=25.0, ge=5.0)
     max_page_bytes: int = Field(default=25 * 1024 * 1024, ge=1)
     max_cover_bytes: int = Field(default=5 * 1024 * 1024, ge=1)
-    asura_request_interval_seconds: float = Field(default=0.0, ge=0.0)
+    asura_request_interval_seconds: float = Field(default=2.0, ge=0.0)
     mangafire_request_interval_seconds: float = Field(default=0.0, ge=0.0)
     kingofshojo_request_interval_seconds: float = Field(default=0.0, ge=0.0)
     user_agent: str = "MangaManager/0.1 personal archiver"
@@ -49,6 +49,9 @@ class Settings(BaseSettings):
     max_download_attempts: int = Field(default=3, ge=1)
     download_retry_base_minutes: int = Field(default=15, ge=1)
     download_stale_minutes: int = Field(default=60, ge=1)
+    rate_limit_cooldown_minutes: int = Field(default=30, ge=1)
+    asura_rate_limit_cooldown_minutes: int = Field(default=60, ge=1)
+    job_status_group_limit: int = Field(default=25, ge=5)
     keep_replaced_files: bool = True
     retention_replaced_days: int = Field(default=0, ge=0)
     retention_replaced_max_per_chapter: int = Field(default=0, ge=0)

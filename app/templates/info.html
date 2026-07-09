@@ -9,6 +9,7 @@
     <form method="post" action="/drain-kavita-sync" data-async-form>{{ csrf_input()|safe }}<button>Run Kavita drain</button></form>
     <form method="post" action="/kavita/want-to-read/sync" data-async-form>{{ csrf_input()|safe }}<button>Sync Want to Read</button></form>
     <form method="post" action="/maintenance/refresh-missing-covers" data-async-form>{{ csrf_input()|safe }}<button>Refresh missing covers</button></form>
+    <form method="post" action="/maintenance/repair-known-series" data-async-form>{{ csrf_input()|safe }}<button>Repair known manga</button></form>
     <form method="post" action="/maintenance/cleanup-retention" data-async-form>{{ csrf_input()|safe }}<button>Cleanup retention</button></form>
     <form method="post" action="/retry-failed" data-async-form>{{ csrf_input()|safe }}<button>Retry failed jobs</button></form>
   </div>
@@ -65,6 +66,7 @@
         <th>Source</th>
         <th>State</th>
         <th>Failures</th>
+        <th>Download cooldown</th>
         <th>Last poll</th>
         <th>Last error</th>
       </tr>
@@ -75,6 +77,7 @@
           <td>{{ source.source }}</td>
           <td class="{{ 'status-ok' if source.enabled else 'status-bad' }}">{{ "enabled" if source.enabled else "disabled" }}</td>
           <td>{{ source.consecutive_failures }}</td>
+          <td>{{ source.download_cooldown_until or "" }}{% if source.download_cooldown_reason %} · {{ source.download_cooldown_reason }}{% endif %}</td>
           <td>{{ source.last_poll_at or "never" }}</td>
           <td>{{ source.last_error or "" }}</td>
         </tr>

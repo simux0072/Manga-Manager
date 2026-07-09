@@ -12,6 +12,13 @@ class ChapterTemporarilyUnavailable(RuntimeError):
         self.retry_after = retry_after
 
 
+class SourceRateLimited(RuntimeError):
+    def __init__(self, message: str, retry_after=None, source: str = "") -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+        self.source = source
+
+
 class SourceAdapter(ABC):
     source: str
     base_url: str

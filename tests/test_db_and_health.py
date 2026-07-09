@@ -19,7 +19,7 @@ import app.scheduler as scheduler_module
 import app.services as services
 from app.db import Base
 from app.domain import ChapterItem, SeriesItem
-from app.models import DownloadJob, KavitaSyncJob, SourceHealth, SourcePullJob
+from app.models import ChapterProgress, DownloadJob, KavitaSyncJob, SourceHealth, SourcePullJob
 from app.services import merge_series_item, upsert_release
 
 
@@ -80,6 +80,7 @@ def test_existing_sqlite_compat_migration_adds_columns_and_unique_index(tmp_path
     with engine.begin() as connection:
         connection.execute(text("CREATE TABLE series (id INTEGER PRIMARY KEY)"))
         connection.execute(text("CREATE TABLE source_series (id INTEGER PRIMARY KEY)"))
+        connection.execute(text("CREATE TABLE source_health (source VARCHAR(50) PRIMARY KEY)"))
         connection.execute(
             text("CREATE TABLE chapter_release (id INTEGER PRIMARY KEY, published_at DATETIME)")
         )
@@ -108,10 +109,12 @@ def test_existing_sqlite_compat_migration_adds_columns_and_unique_index(tmp_path
     inspector = inspect(engine)
     series_columns = {column["name"] for column in inspector.get_columns("series")}
     source_columns = {column["name"] for column in inspector.get_columns("source_series")}
+    health_columns = {column["name"] for column in inspector.get_columns("source_health")}
     release_columns = {column["name"] for column in inspector.get_columns("chapter_release")}
     job_columns = {column["name"] for column in inspector.get_columns("download_job")}
     assert {"cover_path", "external_ids"} <= series_columns
-    assert {"cover_path", "external_ids", "detail_fetched_at"} <= source_columns
+    assert {"cover_path", "external_ids", "detail_fetched_at", "metadata_json"} <= source_columns
+    assert {"download_cooldown_until", "download_cooldown_reason"} <= health_columns
     assert "first_seen_at" in release_columns
     assert "retry_after" in job_columns
     assert "uq_download_job_chapter_release" in {
@@ -251,7 +254,7 @@ def test_versioned_sqlite_upgrade_adds_download_job_unique_index(tmp_path, monke
         ).scalar_one() == 1
         assert (
             connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            == "a9c2d6e8f104"
+            == "c41d7a2f5b80"
         )
         try:
             connection.execute(
@@ -521,6 +524,36 @@ def test_library_pick_something_is_not_actionable_without_ready_series():
 
     assert "Nothing ready yet" in html
     assert f'href="/series/{source_series.series_id}/open"' not in html
+
+
+def test_new_chapters_lists_unread_downloaded_chapters():
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    session = Session()
+    source_series = merge_series_item(
+        session,
+        SeriesItem(source="mangafire", source_id="gl3", title="Readable Example", url="x"),
+    )
+    source_series.series.status = "reading"
+    release = upsert_release(
+        session,
+        source_series,
+        ChapterItem("mangafire", source_series.source_id, "12", "Chapter 12", "x", None),
+    )
+    chapter = session.get(main.Chapter, release.chapter_id)
+    chapter.downloaded_source = "mangafire"
+    session.add(ChapterProgress(chapter_id=chapter.id, status="unread"))
+    session.commit()
+
+    try:
+        html = main.new_chapters(make_request("/new-chapters"), session).body.decode()
+    finally:
+        session.close()
+
+    assert "Readable Example" in html
+    assert "Ch. 12" in html
+    assert f'href="/chapters/{chapter.id}/open"' in html
 
 
 async def test_rescan_source_detail_reports_failures(monkeypatch):
@@ -846,7 +879,16 @@ def test_discovery_uses_update_cards_with_series_and_chapter_links(monkeypatch):
     session = Session()
     source_series = merge_series_item(
         session,
-        SeriesItem(source="mangafire", source_id="gl3", title="Very Long Example Title", url="x"),
+        SeriesItem(
+            source="mangafire",
+            source_id="gl3",
+            title="Very Long Example Title",
+            url="x",
+            aliases=("Alt Example",),
+            description="A useful description for the update card.",
+            genres=("Action", "Drama"),
+            metadata={"follows": 123, "rating": 9.1},
+        ),
     )
     release = upsert_release(
         session,
@@ -874,6 +916,11 @@ def test_discovery_uses_update_cards_with_series_and_chapter_links(monkeypatch):
     assert html.index("update-chapters") < content_end
     assert f'href="/series/{source_series.series_id}/open"' in html
     assert f'href="/chapters/{release.chapter_id}/open"' in html
+    assert 'data-source-row="mangafire"' in html
+    assert "A useful description" in html
+    assert "Alt Example" in html
+    assert "rating 9.1" in html
+    assert "123 bookmarks" in html
     assert "Ch. 12" in html
 
 
@@ -902,12 +949,15 @@ def test_app_js_has_source_filters_and_jobs_drawer():
     assert "setupAsyncForms" in script
     assert "EventSource" in script
     assert "download_series" in script
+    assert "drawerSections" in script
+    assert "statusCounts" in script
     assert 'renderSection("Queued"' in script
     assert 'renderSection("Completed"' in script
     assert 'renderSection("Failed"' in script
     assert ".slice(0, 10)" in script
     assert "data-jobs-status" in script
     assert "data-source-row" in script
+    assert ".update-card .sources [data-source]" in script
     assert "showChapters: job.kind === \"download_series\"" in script
     assert "toast-stack" in Path("app/templates/base.html").read_text()
 

@@ -101,6 +101,12 @@ def apply_compat_migrations() -> None:
         ddl.append("ALTER TABLE source_series ADD COLUMN external_ids TEXT DEFAULT '' NOT NULL")
     if "detail_fetched_at" not in columns_by_table.get("source_series", set()):
         ddl.append("ALTER TABLE source_series ADD COLUMN detail_fetched_at DATETIME")
+    if "metadata_json" not in columns_by_table.get("source_series", set()):
+        ddl.append("ALTER TABLE source_series ADD COLUMN metadata_json TEXT DEFAULT '' NOT NULL")
+    if "source_health" in columns_by_table and "download_cooldown_until" not in columns_by_table["source_health"]:
+        ddl.append("ALTER TABLE source_health ADD COLUMN download_cooldown_until DATETIME")
+    if "source_health" in columns_by_table and "download_cooldown_reason" not in columns_by_table["source_health"]:
+        ddl.append("ALTER TABLE source_health ADD COLUMN download_cooldown_reason TEXT DEFAULT '' NOT NULL")
     if "first_seen_at" not in columns_by_table.get("chapter_release", set()):
         ddl.append("ALTER TABLE chapter_release ADD COLUMN first_seen_at DATETIME")
     if "retry_after" not in columns_by_table.get("download_job", set()):

@@ -78,6 +78,17 @@ class MangaFireAdapter(SourceAdapter):
         if entry.get("anilistId"):
             external_ids["anilist"] = str(entry["anilistId"])
         popularity = entry.get("follows") or entry.get("ratingCount") or entry.get("rank") or 0
+        metadata = compact_metadata(
+            {
+                "follows": entry.get("follows"),
+                "rating": entry.get("rating") or entry.get("score"),
+                "rating_count": entry.get("ratingCount"),
+                "rank": entry.get("rank"),
+                "status": entry.get("status"),
+                "type": entry.get("type"),
+                "year": entry.get("year"),
+            }
+        )
         return SeriesItem(
             source=self.source,
             source_id=str(hid),
@@ -89,6 +100,7 @@ class MangaFireAdapter(SourceAdapter):
             genres=genres,
             popularity=float(popularity or 0),
             external_ids=external_ids,
+            metadata=metadata,
         )
 
     async def get_chapters(self, source_series: SeriesItem) -> list[ChapterItem]:
@@ -259,3 +271,7 @@ def names_from_terms(values) -> tuple[str, ...]:
 
 def html_text(value: str) -> str:
     return BeautifulSoup(value, "html.parser").get_text(" ", strip=True) if value else ""
+
+
+def compact_metadata(values: dict[str, object]) -> dict[str, object]:
+    return {key: value for key, value in values.items() if value not in (None, "", [], {})}

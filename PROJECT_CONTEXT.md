@@ -18,8 +18,11 @@ The application is a FastAPI server with server-rendered HTML pages:
 
 - `/` shows newly discovered series as a compact update list with covers, recent chapters, and source
   health.
-- `/library` shows a Today panel, operations health, tracked/interested series, recent download jobs,
-  and Kavita sync jobs.
+- `/library` shows a Today panel, tracked/interested series, source filters, and local reading state.
+- `/new-chapters` shows unread downloaded chapters for tracked series, with local and Kavita links
+  when available.
+- `/info` shows operations health, source cooldowns, live job counts, grouped job details, and
+  maintenance actions.
 - `/matches` shows possible cross-source series matches for manual merge/separation.
 - `/healthz` returns JSON with app, scheduler, and source health.
 - POST routes handle polling, queueing downloads, running downloads, retrying failed jobs, status
@@ -96,6 +99,7 @@ The scheduler:
 - `DownloadJob`: one job per chapter release; `chapter_release_id` is unique.
 - `DownloadedFile`: historical file metadata for downloaded CBZs.
 - `SourceHealth`: per-source enabled state, last poll time, last error, and failure count.
+  Download cooldown fields track source/CDN rate limits separately from poll health.
 - `ManualMatchRule`: records manual merge/separate decisions.
 - `MatchCandidate`: possible source-series-to-series matches pending user review.
 
@@ -127,8 +131,9 @@ files.
 
 Download fallback keeps this order per chapter. The best available source is tried first. If that
 source has a failed job at `MAX_DOWNLOAD_ATTEMPTS`, the queue may select the next lower-priority
-available release for the same chapter. Lower-priority sources are used immediately only when a
-higher-priority release is missing or not currently downloadable.
+available release for the same chapter. If the best source is temporarily rate-limited, the source
+is put on download cooldown and lower-priority releases may be used until the cooldown expires. When
+the higher-priority source becomes available again, later queueing can replace lower-priority files.
 
 ## Settings
 
@@ -152,7 +157,10 @@ Important settings:
 - `REQUEST_TIMEOUT_SECONDS`: normal HTTP timeout.
 - `MAX_PAGE_BYTES`: per-page image byte cap for downloads.
 - `MAX_COVER_BYTES`: per-cover image byte cap.
-- `*_REQUEST_INTERVAL_SECONDS`: optional per-source throttling.
+- `*_REQUEST_INTERVAL_SECONDS`: per-source request pacing. Asura defaults to conservative pacing.
+- `RATE_LIMIT_COOLDOWN_MINUTES`: default source cooldown when a 429 has no `Retry-After`.
+- `ASURA_RATE_LIMIT_COOLDOWN_MINUTES`: Asura-specific 429 cooldown fallback.
+- `JOB_STATUS_GROUP_LIMIT`: grouped jobs shown per live status slice before Info reports more exist.
 - `DOWNLOADS_ENABLED`: global download queue toggle.
 - `MIN_PAGES_PER_CHAPTER`: rejects suspicious downloads with too few pages.
 - `MAX_DOWNLOAD_ATTEMPTS`: retry limit.
@@ -182,7 +190,8 @@ Current behavior:
   `download_job.chapter_release_id`.
 - Versioned DBs have an Alembic revision that deduplicates download jobs and creates the unique
   download-job index if the DB was already upgraded before that invariant existed.
-- A later Alembic revision adds Kavita mapping columns for local series and chapters.
+- Later Alembic revisions add Kavita mapping columns, source-series metadata, and source download
+  cooldown fields.
 
 ## Download Workflow
 
@@ -192,18 +201,19 @@ Current behavior:
 2. Recovers stale running jobs.
 3. Finds tracked series with status `reading` or `interested`.
 4. Finds eligible chapter releases for those series.
-5. Queues the selected source release for each chapter. Selection follows source priority and can
-   fall back to a lower-priority release after the best source reaches `MAX_DOWNLOAD_ATTEMPTS`.
+5. Queues the selected source release for each chapter. Selection follows source priority, skips
+   sources currently in download cooldown, and can fall back after content failures.
 6. Handles uniqueness races gracefully if another queue attempt already created the job.
 
 `run_next_download(session)`:
 
 1. Recovers stale running jobs.
-2. Atomically claims one due queued job with a conditional `queued -> running` update.
+2. Atomically claims one due queued or due delayed job with a conditional `queued/delayed -> running`
+   update.
 3. Revalidates that the release is still due, still the chapter best source, and can replace any
    existing downloaded source.
-4. Marks obsolete jobs as `skipped`, future-due jobs as `delayed`, and missing release/chapter jobs as
-   `failed`.
+4. Marks obsolete jobs as `skipped`, future-due jobs as `delayed`, and removes orphaned jobs whose
+   release/chapter no longer exists.
 5. Builds a `ChapterItem`.
 6. Streams page bytes from the source adapter into a same-directory temporary CBZ with job/release
    identity in the staging filename.
@@ -214,6 +224,12 @@ Current behavior:
 11. Triggers Kavita folder scan after successful download and refreshes local Kavita series/chapter
     mappings.
 12. Applies delay/retry/failure state depending on the exception.
+
+HTTP 429s are represented as source rate limits, not content failures. They do not consume normal
+download attempts. The source receives a cooldown from `Retry-After` or the configured fallback, the
+current job becomes `delayed`, and a lower-priority fallback release is queued when available.
+Content errors such as invalid image bytes or too few pages still use retry/backoff and terminal
+fallback behavior. Cover images are used for metadata/covers only, not as fake chapter pages.
 
 The download workflow does not keep every page in memory at once. Each page is fetched, validated by
 size and image decodability, and written to the staged CBZ before the next page is fetched. Temporary
@@ -248,16 +264,36 @@ remaining sources from being polled.
 
 ## Discovery And Kavita Click Workflow
 
-Discovery is optimized for scanning recent updates rather than reading long descriptions:
+Discovery is optimized for scanning recent updates:
 
 - Desktop uses a two-column update-card layout; mobile collapses to one column.
-- Each card shows cover art, a single-line truncated title, source badges, and the newest 2-3 distinct
-  chapter releases.
+- Each card shows cover art, a single-line truncated title, source badges, optional source metrics,
+  description excerpt, aliases/genres, and the newest 2-3 distinct chapter releases.
 - Chapter rows show chapter number/title, source, and relative age such as `5h ago`, `1d ago`, or an
   absolute date.
 - The cover/title area links to `/series/{series_id}/open`.
 - Chapter rows link to `/chapters/{chapter_id}/open`.
 - Buttons for `Reading`, `Interested`, and `Ignore` remain separate form controls.
+
+The `Visible websites` toggles hide source badges and chapter rows first, then hide a card when no
+visible source rows remain. MangaFire remains English-only; MangaFire titles with no English
+chapters are skipped during discovery.
+
+## Operations And Repair
+
+The top-bar jobs drawer is a compact status surface. It groups queued/running/delayed, completed,
+and failed work, preserves expanded section state across SSE refreshes, and caps completed/failed
+rows for readability. `/info` is the authoritative job view: it reports true status counts even when
+the rendered grouped rows are capped.
+
+`repair_known_series(session)` backs the Info `Repair known manga` action. It:
+
+1. Runs legacy bad discovery cleanup.
+2. Removes bad placeholder chapter rows such as template `{{number}}`, `first chapter`, or
+   `latest chapter` when they have no downloaded files.
+3. Rescans known source-series rows, prioritizing tracked series.
+4. Refreshes missing covers.
+5. Records a repair activity event.
 
 Kavita behavior:
 

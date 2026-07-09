@@ -5,6 +5,8 @@
 </section>
 {% if request.query_params.get("notice") == "bulk-matches" %}
   <p class="notice">Updated {{ request.query_params.get("count", "0") }} match candidates.</p>
+{% elif request.query_params.get("notice") == "merge-error" %}
+  <p class="notice">Merge failed. Check the logs for details.</p>
 {% endif %}
 <section class="table">
   <form id="bulk-match-form" method="post" action="/matches/bulk" class="source-actions bulk-actions">{{ csrf_input()|safe }}

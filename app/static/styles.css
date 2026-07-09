@@ -303,6 +303,16 @@ h3 {
   white-space: nowrap;
 }
 
+.update-description {
+  color: #b7c4d6;
+  display: -webkit-box;
+  font-size: 13px;
+  line-height: 1.35;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+}
+
 .update-chapters {
   display: grid;
   gap: 4px;
@@ -847,7 +857,8 @@ button.secondary:hover,
 
 .jobs-drawer-content {
   display: grid;
-  gap: 14px;
+  align-content: start;
+  gap: 8px;
   overflow: auto;
 }
 
@@ -869,7 +880,7 @@ button.secondary:hover,
 
 .drawer-section {
   display: grid;
-  gap: 8px;
+  gap: 6px;
 }
 
 .drawer-section summary {

@@ -67,6 +67,8 @@ class AsuraAdapter(SourceAdapter):
             if not href or not path.startswith(f"{series_path}/chapter/"):
                 continue
             number = normalize_chapter_number(title or href)
+            if not re.search(r"\d", number):
+                number = normalize_chapter_number(href)
             if not href or not number:
                 continue
             container_text = link.parent.get_text(" ", strip=True) if link.parent else title

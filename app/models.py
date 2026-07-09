@@ -55,6 +55,7 @@ class SourceSeries(Base):
     popularity: Mapped[float] = mapped_column(Float, default=0)
     external_ids: Mapped[str] = mapped_column(Text, default="")
     cover_path: Mapped[str] = mapped_column(Text, default="")
+    metadata_json: Mapped[str] = mapped_column(Text, default="")
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     detail_fetched_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -193,6 +194,8 @@ class SourceHealth(Base):
     last_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str] = mapped_column(Text, default="")
     consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
+    download_cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    download_cooldown_reason: Mapped[str] = mapped_column(Text, default="")
 
 
 class SourcePullJob(Base):

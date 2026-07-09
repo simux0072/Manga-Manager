@@ -11,7 +11,7 @@ from sqlalchemy.orm import sessionmaker
 
 import app.services as services
 import app.db as db
-from app.adapters.base import ChapterTemporarilyUnavailable
+from app.adapters.base import ChapterTemporarilyUnavailable, SourceRateLimited
 from app.kavita import KavitaChapter, KavitaReadProgress, KavitaSeries
 from app.db import Base
 from app.domain import ChapterItem, SeriesItem
@@ -758,6 +758,33 @@ def test_claim_next_download_job_prevents_stale_double_claim(tmp_path):
 
     assert services.claim_next_download_job(first).id == job_id
     assert services.claim_next_download_job(stale) is None
+
+
+def test_claim_next_download_job_resumes_due_delayed_job():
+    session = make_session()
+    source_series = merge_series_item(
+        session,
+        SeriesItem(source="mangafire", source_id="gl3", title="Example", url="x"),
+    )
+    release = upsert_release(
+        session,
+        source_series,
+        ChapterItem("mangafire", source_series.source_id, "1", "Chapter 1", "x", None),
+    )
+    session.flush()
+    session.add(
+        DownloadJob(
+            chapter_release_id=release.id,
+            status="delayed",
+            retry_after=datetime.now(timezone.utc) - timedelta(minutes=1),
+        )
+    )
+    session.commit()
+
+    job = services.claim_next_download_job(session)
+
+    assert job is not None
+    assert job.status == "running"
 
 
 async def test_run_next_download_marks_temporary_unavailable_as_delayed(monkeypatch):
@@ -1760,8 +1787,18 @@ def test_external_ids_auto_match_different_titles():
 def test_recover_stale_running_jobs_requeues_old_job(monkeypatch):
     session = make_session()
     monkeypatch.setattr(services.settings, "download_stale_minutes", 60)
+    source_series = merge_series_item(
+        session,
+        SeriesItem(source="mangafire", source_id="gl3", title="Example", url="x"),
+    )
+    release = upsert_release(
+        session,
+        source_series,
+        ChapterItem("mangafire", source_series.source_id, "1", "Chapter 1", "x", None),
+    )
+    session.flush()
     job = DownloadJob(
-        chapter_release_id=1,
+        chapter_release_id=release.id,
         status="running",
         updated_at=datetime.now(timezone.utc) - timedelta(hours=2),
     )
@@ -1778,9 +1815,19 @@ def test_recover_stale_running_jobs_handles_reloaded_sqlite_datetime(tmp_path, m
     Session = make_file_session_factory(tmp_path / "stale.db")
     setup = Session()
     monkeypatch.setattr(services.settings, "download_stale_minutes", 60)
+    source_series = merge_series_item(
+        setup,
+        SeriesItem(source="mangafire", source_id="gl3", title="Example", url="x"),
+    )
+    release = upsert_release(
+        setup,
+        source_series,
+        ChapterItem("mangafire", source_series.source_id, "1", "Chapter 1", "x", None),
+    )
+    setup.flush()
     setup.add(
         DownloadJob(
-            chapter_release_id=1,
+            chapter_release_id=release.id,
             status="running",
             updated_at=datetime.now(timezone.utc) - timedelta(hours=2),
         )
@@ -1791,6 +1838,15 @@ def test_recover_stale_running_jobs_handles_reloaded_sqlite_datetime(tmp_path, m
     session = Session()
     assert recover_stale_download_jobs(session) == 1
     assert session.query(DownloadJob).one().status == "queued"
+
+
+def test_recover_stale_download_jobs_removes_orphaned_unknown_series_job():
+    session = make_session()
+    session.add(DownloadJob(chapter_release_id=999, status="failed", error="release or chapter missing"))
+    session.commit()
+
+    assert recover_stale_download_jobs(session) == 1
+    assert session.query(DownloadJob).count() == 0
 
 
 async def test_failed_download_uses_backoff_and_is_not_immediately_retried(monkeypatch):
@@ -1822,6 +1878,48 @@ async def test_failed_download_uses_backoff_and_is_not_immediately_retried(monke
 
     assert not await services.run_next_download(session)
     assert job.attempts == 1
+
+
+async def test_rate_limited_download_sets_source_cooldown_and_queues_fallback(monkeypatch):
+    retry_at = datetime(2030, 1, 1, tzinfo=timezone.utc)
+
+    class RateLimitedAdapter:
+        async def download_chapter_pages(self, chapter):
+            raise SourceRateLimited("rate limited", retry_at)
+
+    session = make_session()
+    monkeypatch.setattr(services, "adapter_for_source", lambda source: RateLimitedAdapter())
+    asura = merge_series_item(
+        session,
+        SeriesItem(source="asura", source_id="asura/example", title="Example", url="a"),
+    )
+    mangafire = merge_series_item(
+        session,
+        SeriesItem(source="mangafire", source_id="mf/example", title="Example", url="m"),
+    )
+    asura_release = upsert_release(
+        session,
+        asura,
+        ChapterItem("asura", asura.source_id, "1", "Chapter 1", "a", None),
+    )
+    asura_release.downloadable_after = None
+    fallback_release = upsert_release(
+        session,
+        mangafire,
+        ChapterItem("mangafire", mangafire.source_id, "1", "Chapter 1", "m", None),
+    )
+    session.add(DownloadJob(chapter_release_id=asura_release.id))
+    session.commit()
+
+    assert await services.run_next_download(session)
+
+    jobs = {job.chapter_release_id: job for job in session.query(DownloadJob).all()}
+    assert jobs[asura_release.id].status == "delayed"
+    assert jobs[asura_release.id].attempts == 0
+    assert services.ensure_aware(jobs[asura_release.id].retry_after) == retry_at
+    assert jobs[fallback_release.id].status == "queued"
+    health = session.get(SourceHealth, "asura")
+    assert services.ensure_aware(health.download_cooldown_until) == retry_at
 
 
 async def test_terminal_download_failure_queues_next_source(monkeypatch):
@@ -1943,6 +2041,31 @@ def test_manual_merge_moves_all_old_source_rows_and_deletes_old_series():
         "mangafire",
     }
     assert candidate.status == "merged"
+
+
+def test_manual_merge_removes_candidates_pointing_at_old_series():
+    session = make_session()
+    target = merge_series_item(
+        session,
+        SeriesItem(source="kingofshojo", source_id="manga/example", title="Example", url="x"),
+    )
+    duplicate = merge_series_item(
+        session,
+        SeriesItem(source="asura", source_id="comics/example", title="Example Duplicate", url="y"),
+    )
+    other = merge_series_item(
+        session,
+        SeriesItem(source="mangafire", source_id="gl3", title="Other", url="z"),
+    )
+    candidate = MatchCandidate(source_series_id=duplicate.id, candidate_series_id=target.series_id)
+    stale = MatchCandidate(source_series_id=other.id, candidate_series_id=duplicate.series_id)
+    session.add_all([candidate, stale])
+    session.commit()
+
+    assert merge_match_candidate(session, candidate.id)
+
+    assert session.query(Series).count() == 2
+    assert session.get(MatchCandidate, stale.id) is None
 
 
 async def test_poll_source_continues_when_one_item_fails(monkeypatch):

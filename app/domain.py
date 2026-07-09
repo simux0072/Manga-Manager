@@ -27,6 +27,7 @@ class SeriesItem:
     genres: tuple[str, ...] = ()
     popularity: float = 0
     external_ids: dict[str, str] = field(default_factory=dict)
+    metadata: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
