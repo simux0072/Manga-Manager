@@ -12,17 +12,22 @@
 </section>
 
 <section class="table">
-  {% for event in events %}
-    <article class="activity-row">
-      <div>
-        <strong>{{ event.kind }}</strong>
-        <span class="{{ 'status-bad' if event.status == 'error' else 'status-ok' if event.status == 'success' else '' }}">{{ event.status }}</span>
-      </div>
-      <p>{{ event.message }}</p>
-      <span class="muted">{{ event.created_at|relative_time }}</span>
-    </article>
-  {% else %}
-    <p class="empty">No activity recorded yet.</p>
+  {% for label, rows in groups.items() %}
+    <details class="activity-group" {{ "open" if label == "Warnings and errors" or label == "Downloads" else "" }}>
+      <summary>{{ label }} <span class="muted">{{ rows|length }}</span></summary>
+      {% for event in rows %}
+        <article class="activity-row">
+          <div>
+            <strong>{{ event.kind }}</strong>
+            <span class="{{ 'status-bad' if event.status == 'error' else 'status-ok' if event.status == 'success' else '' }}">{{ event.status }}</span>
+          </div>
+          <p>{{ event.message }}</p>
+          <span class="muted">{{ event.created_at|relative_time }}</span>
+        </article>
+      {% else %}
+        <p class="empty">No entries.</p>
+      {% endfor %}
+    </details>
   {% endfor %}
 </section>
 {% endblock %}

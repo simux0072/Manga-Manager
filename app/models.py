@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Integer, String, Text, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, Index, Integer, String, Text, UniqueConstraint, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db import Base
@@ -142,6 +142,8 @@ class DownloadJob(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     chapter_release_id: Mapped[int] = mapped_column(ForeignKey("chapter_release.id"), index=True)
     status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
+    priority: Mapped[int] = mapped_column(Integer, default=100, index=True)
+    job_type: Mapped[str] = mapped_column(String(30), default="normal", index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     error: Mapped[str] = mapped_column(Text, default="")
     retry_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -191,6 +193,29 @@ class SourceHealth(Base):
     last_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str] = mapped_column(Text, default="")
     consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
+
+
+class SourcePullJob(Base):
+    __tablename__ = "source_pull_job"
+    __table_args__ = (
+        Index(
+            "uq_source_pull_job_active_source",
+            "source",
+            unique=True,
+            sqlite_where=text("status IN ('queued', 'running')"),
+            postgresql_where=text("status IN ('queued', 'running')"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source: Mapped[str] = mapped_column(String(50), default="", index=True)
+    status: Mapped[str] = mapped_column(String(30), default="queued", index=True)
+    total_items: Mapped[int] = mapped_column(Integer, default=0)
+    processed_items: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow, index=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class ManualMatchRule(Base):

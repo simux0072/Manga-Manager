@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     kavita_url: str = ""
     kavita_api_key: str = ""
     kavita_sync_want_to_read: bool = False
+    kavita_sync_read_progress: bool = False
     kavita_series_url_template: str = "{base_url}/library/{library_id}/series/{series_id}"
     kavita_chapter_url_template: str = (
         "{base_url}/library/{library_id}/series/{series_id}/chapter/{chapter_id}"
@@ -39,6 +40,11 @@ class Settings(BaseSettings):
     kingofshojo_request_interval_seconds: float = Field(default=0.0, ge=0.0)
     user_agent: str = "MangaManager/0.1 personal archiver"
     downloads_enabled: bool = True
+    discovery_page_size: int = Field(default=50, ge=10)
+    first_import_chapters: int = Field(default=5, ge=1)
+    source_pull_concurrency: int = Field(default=4, ge=1)
+    download_concurrency: int = Field(default=2, ge=1)
+    backfill_downloads_enabled: bool = True
     min_pages_per_chapter: int = Field(default=3, ge=1)
     max_download_attempts: int = Field(default=3, ge=1)
     download_retry_base_minutes: int = Field(default=15, ge=1)

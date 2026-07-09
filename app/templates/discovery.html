@@ -4,14 +4,21 @@
   <h1>Discovery</h1>
   <div class="source-actions">
     {% for source in enabled_sources %}
-      <form method="post" action="/poll/{{ source }}">{{ csrf_input()|safe }}
-        <button>Poll {{ source_labels.get(source, source) }}</button>
+      <form method="post" action="/pull/{{ source }}" data-async-form>{{ csrf_input()|safe }}
+        <button>Pull {{ source_labels.get(source, source) }}</button>
       </form>
     {% endfor %}
-    <form method="post" action="/poll-all">{{ csrf_input()|safe }}
-      <button>Poll all enabled</button>
+    <form method="post" action="/pull-all" data-async-form>{{ csrf_input()|safe }}
+      <button>Pull all enabled</button>
     </form>
   </div>
+</section>
+
+<section class="source-filter" data-source-filter>
+  <span class="muted">Visible websites</span>
+  {% for source in enabled_sources %}
+    <label><input type="checkbox" data-source-toggle value="{{ source }}" checked> {{ source_labels.get(source, source) }}</label>
+  {% endfor %}
 </section>
 
 {% if health %}
@@ -38,8 +45,10 @@
 {% endif %}
 
 {% if pending %}
-  {% if pending == "poll-all" %}
-    <p class="notice">Poll complete: {{ request.query_params.get("ok", "0") }} of {{ request.query_params.get("total", "0") }} sources succeeded.</p>
+  {% if pending == "pull-all" %}
+    <p class="notice">Pull started. Progress appears in the top bar.</p>
+  {% elif pending == "pull-existing" %}
+    <p class="notice">That source is already pulling. Progress appears in the top bar.</p>
   {% else %}
     <p class="notice">Import queued. Kavita links will appear after download and scan complete.</p>
   {% endif %}
@@ -48,8 +57,8 @@
 <section class="update-grid">
   {% for row in discovery_items %}
     {% set item = row.series %}
-    <article class="update-card">
-      <a class="update-main" href="/series/{{ item.id }}/open">
+    <article class="update-card" data-series-card data-series-id="{{ item.id }}" data-status="{{ item.status }}" data-sources="{{ item.sources|map(attribute='source')|join(' ') }}">
+      <a class="update-cover-link" href="/series/{{ item.id }}/open" aria-label="Open {{ item.title }}">
         <div class="cover">
           {% if item.cover_path %}
             <img src="/covers/{{ item.cover_path.split('/')[-1] }}" alt="">
@@ -59,36 +68,38 @@
             <span>No cover</span>
           {% endif %}
         </div>
-        <div class="update-summary">
-          <h2 title="{{ item.title }}">{{ item.title }}</h2>
-          <div class="sources">
-            {% for source in item.sources %}
-              <span>{{ source.source }} · {{ source.source|priority }}</span>
-            {% endfor %}
-          </div>
-        </div>
       </a>
-      <div class="update-chapters">
-        {% for chapter in row.chapters %}
-          <a class="chapter-row" href="/chapters/{{ chapter.id }}/open">
-            <span>Ch. {{ chapter.number }}{% if chapter.title %} · {{ chapter.title }}{% endif %}</span>
-            <span>{{ chapter.source }} · {{ chapter.published_at|relative_time }}</span>
-          </a>
-        {% else %}
-          <span class="chapter-row muted">No chapters collected yet</span>
-        {% endfor %}
+      <div class="update-content">
+        <a class="update-main" href="/series/{{ item.id }}/open">
+          <div class="update-summary">
+            <h2 title="{{ item.title }}">{{ item.title }}</h2>
+            <div class="sources">
+              {% for source in item.sources %}
+                <span data-source="{{ source.source }}">{{ source.source }}</span>
+              {% endfor %}
+            </div>
+          </div>
+        </a>
+        <div class="update-chapters">
+          {% for chapter in row.chapters %}
+            <a class="chapter-row" data-source="{{ chapter.source }}" href="/chapters/{{ chapter.id }}/open">
+              <span>Ch. {{ chapter.number }}{% if chapter.title %} · {{ chapter.title }}{% endif %}</span>
+              <span>{{ chapter.source }} · {{ chapter.published_at|relative_time }}</span>
+            </a>
+          {% else %}
+            <span class="chapter-row muted">No chapters collected yet</span>
+          {% endfor %}
+        </div>
       </div>
-      <form class="actions compact" method="post" action="/series/{{ item.id }}/status">{{ csrf_input()|safe }}
-        <button name="status" value="reading">Reading</button>
-        <button name="status" value="interested">Interested</button>
-        <button name="status" value="ignored">Ignore</button>
-        {% if row.kavita_url %}
-          <a class="button-link" href="{{ row.kavita_url }}">Open in Kavita</a>
-        {% endif %}
+      <form class="bookmark-action" method="post" action="/series/{{ item.id }}/status" data-async-form data-remove-on-success="true">{{ csrf_input()|safe }}
+        <button name="status" value="interested" title="Download">☆</button>
       </form>
     </article>
   {% else %}
-    <p class="empty">No discovered manga yet. Poll a source to populate this list.</p>
+    <p class="empty">No discovered manga yet. Pull a source to populate this list.</p>
   {% endfor %}
 </section>
+{% if has_next %}
+  <p class="load-more"><a class="button-link" href="/?page={{ page + 1 }}">Load more</a></p>
+{% endif %}
 {% endblock %}

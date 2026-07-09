@@ -108,15 +108,33 @@ class MangaFireAdapter(SourceAdapter):
 
     def parse_chapters(self, payload, source_series: SeriesItem) -> list[ChapterItem]:
         chapters: list[ChapterItem] = []
-        for entry in api_items(payload):
-            if entry.get("language") and entry.get("language") != "en":
+        for entry in api_chapter_items(payload):
+            if not is_english_chapter(entry.get("language") or entry.get("lang")):
                 continue
-            chapter_id = entry.get("id")
-            number = normalize_chapter_number(str(entry.get("number") or ""))
+            chapter_id = (
+                entry.get("id")
+                or entry.get("hid")
+                or entry.get("chapterId")
+                or entry.get("chapter_id")
+            )
+            raw_number = (
+                entry.get("number")
+                or entry.get("chapter")
+                or entry.get("chapterNumber")
+                or entry.get("name")
+                or entry.get("title")
+                or ""
+            )
+            number = normalize_chapter_number(str(raw_number))
             if not chapter_id or not number:
                 continue
-            title = entry.get("name") or f"Chapter {number}"
-            created_at = unix_datetime(entry.get("createdAt"))
+            title = entry.get("name") or entry.get("title") or f"Chapter {number}"
+            created_at = unix_datetime(
+                entry.get("createdAt")
+                or entry.get("created_at")
+                or entry.get("uploadedAt")
+                or entry.get("publishedAt")
+            )
             chapters.append(
                 ChapterItem(
                     source=self.source,
@@ -155,6 +173,33 @@ def api_items(payload) -> list[dict]:
     if isinstance(payload, dict) and isinstance(payload.get("items"), list):
         return payload["items"]
     return []
+
+
+def api_chapter_items(payload) -> list[dict]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    if isinstance(data, dict):
+        for key in ("items", "chapters", "data"):
+            if isinstance(data.get(key), list):
+                return [item for item in data[key] if isinstance(item, dict)]
+    if isinstance(data, list):
+        return [item for item in data if isinstance(item, dict)]
+    for key in ("items", "chapters"):
+        if isinstance(payload.get(key), list):
+            return [item for item in payload[key] if isinstance(item, dict)]
+    return []
+
+
+def is_english_chapter(value) -> bool:
+    if value in (None, ""):
+        return True
+    if isinstance(value, dict):
+        value = value.get("code") or value.get("name") or value.get("language") or ""
+    normalized = str(value).strip().lower().replace("_", "-")
+    return normalized in {"en", "eng", "english", "en-us", "en-gb"}
 
 
 def api_title(payload) -> dict:

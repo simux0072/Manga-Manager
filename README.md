@@ -113,9 +113,10 @@ Path-mapping troubleshooting:
 - After changing paths, run `Run Kavita drain` from Library to rescan immediately runnable work.
 
 Discovery cards link into Kavita when a series or chapter is already mapped. If a newly discovered
-series is not in Kavita yet, clicking the series queues the newest 3 missing chapters and returns to
-Discovery with a pending state. Clicking a chapter queues that exact chapter first. The scheduler or
-manual `Run download drain` action performs downloads, and `Run Kavita drain` performs scan/map work.
+series is not in Kavita yet, clicking the bookmark/download control queues the newest configured
+missing chapters first, then lower-priority backfill jobs for older chapters. Clicking a chapter
+queues that exact chapter first. The scheduler or manual `Run download drain` action performs
+downloads, and `Run Kavita drain` performs scan/map work.
 Use `Run next download` or `Run Kavita sync` when you only want to process one job.
 
 Optional Kavita settings:
@@ -151,6 +152,9 @@ The Discovery page is a two-column update list on desktop and one column on mobi
 cover art, a truncated title, source badges, and the newest 2-3 known chapter releases with relative
 ages. The cover/title area opens the series; chapter rows open the specific chapter.
 
+Manual source refresh actions are labeled `Pull`. Pulls run in the background and the top bar shows
+pull progress. Discovery is paginated with a `Load more` control using `DISCOVERY_PAGE_SIZE`.
+
 MangaFire defaults to the latest/new updates feed via `MANGAFIRE_DISCOVERY_MODE=new`. Set
 `MANGAFIRE_DISCOVERY_MODE=hot` only if you explicitly want MangaFire's hot feed.
 
@@ -179,7 +183,7 @@ Expected no-Kavita behavior:
 - Library shows Today and Operations panels.
 - Library shows Kavita as not configured.
 - `Run Kavita sync` and `Run Kavita drain` do not crash; queued sync jobs remain available for later.
-- Source polling controls render. Only poll/download content you have the right to archive.
+- Source pull controls render. Only pull/download content you have the right to archive.
 
 To test the Kavita integration end to end, run Kavita separately and mount this repo's
 `storage/library` into Kavita as `/manga`. Add a Kavita Manga library pointed at `/manga/Manga` or
@@ -194,7 +198,7 @@ KAVITA_API_KEY=<your-api-key>
 
 Restart Manga Manager after editing `.env`. Then:
 
-1. Poll a source or use an already discovered series.
+1. Pull a source or use an already discovered series.
 2. Mark one series `Interested` or `Reading`.
 3. Click `Queue downloads`, then `Run download drain`.
 4. Confirm a CBZ appears under `storage/library/Manga/<series>/`.

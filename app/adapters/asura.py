@@ -7,7 +7,7 @@ from urllib.parse import urljoin, urlparse
 
 from app.adapters.base import ChapterTemporarilyUnavailable, SourceAdapter
 from app.adapters.http import HttpSourceClient
-from app.adapters.parsing import extract_image_urls
+from app.adapters.parsing import clean_chapter_title, extract_image_urls, nearby_cover_attr, parse_source_date
 from app.domain import ChapterItem, SeriesItem, normalize_chapter_number
 from app.settings import settings
 
@@ -41,10 +41,7 @@ class AsuraAdapter(SourceAdapter):
                 continue
             url = urljoin(self.base_url, href)
             source_id = urlparse(url).path.strip("/")
-            cover = ""
-            image = link.select_one("img")
-            if image:
-                cover = image.get("src") or image.get("data-src") or ""
+            cover = nearby_cover_attr(link)
             items.append(
                 SeriesItem(
                     source=self.source,
@@ -72,13 +69,16 @@ class AsuraAdapter(SourceAdapter):
             number = normalize_chapter_number(title or href)
             if not href or not number:
                 continue
+            container_text = link.parent.get_text(" ", strip=True) if link.parent else title
+            published_at = parse_source_date(container_text)
             chapters.append(
                 ChapterItem(
                     source=self.source,
                     source_series_id=source_series.source_id,
                     number=number,
-                    title=title,
+                    title=clean_chapter_title(number, title, published_at),
                     url=urljoin(self.base_url, href),
+                    published_at=published_at,
                 )
             )
         return dedupe_chapters(chapters)

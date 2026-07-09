@@ -1,23 +1,26 @@
 from __future__ import annotations
 
 import io
+import asyncio
 import hashlib
 import json
 import logging
 import shutil
 import re
 import smtplib
+import time
 import zipfile
 from email.message import EmailMessage
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
 import httpx
 from PIL import Image
 from sqlalchemy import or_, select, update
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, OperationalError, PendingRollbackError
 from sqlalchemy.orm import Session
 
 from app.adapters import adapter_for_source, enabled_source_names
@@ -47,6 +50,7 @@ from app.models import (
     Series,
     SeriesProgress,
     SourceHealth,
+    SourcePullJob,
     SourceSeries,
     utcnow,
 )
@@ -55,9 +59,28 @@ from app.settings import settings
 
 logger = logging.getLogger(__name__)
 TRACKED_STATUSES = {"reading", "interested"}
-FIRST_IMPORT_CHAPTERS = 3
+FIRST_IMPORT_CHAPTERS = settings.first_import_chapters
 SERIES_PROGRESS_STATUSES = {"interested", "reading", "caught_up", "paused"}
 CHAPTER_PROGRESS_STATUSES = {"unread", "reading", "read"}
+
+
+def is_sqlite_locked_error(exc: BaseException) -> bool:
+    return "database is locked" in str(exc).lower()
+
+
+def commit_with_retry(session: Session, *, attempts: int = 4, delay_seconds: float = 0.15) -> None:
+    for attempt in range(1, attempts + 1):
+        try:
+            session.commit()
+            return
+        except OperationalError as exc:
+            session.rollback()
+            if not is_sqlite_locked_error(exc) or attempt == attempts:
+                raise
+            time.sleep(delay_seconds * attempt)
+        except PendingRollbackError:
+            session.rollback()
+            raise
 
 
 @dataclass(frozen=True)
@@ -325,7 +348,7 @@ def upsert_release(session: Session, source_series: SourceSeries, item: ChapterI
     if release:
         release.title = item.title or release.title
         release.url = item.url
-        release.published_at = item.published_at or release.published_at
+        release.published_at = earliest_datetime(release.published_at, item.published_at)
         release.first_seen_at = release.first_seen_at or first_seen_at
         release.downloadable_after = downloadable_after
         release.chapter_id = chapter.id
@@ -346,7 +369,14 @@ def upsert_release(session: Session, source_series: SourceSeries, item: ChapterI
     return release
 
 
-async def poll_source(session: Session, source: str) -> int:
+PullProgressCallback = Callable[[int, int], None]
+
+
+async def poll_source(
+    session: Session,
+    source: str,
+    progress: PullProgressCallback | None = None,
+) -> int:
     if source not in enabled_source_names():
         raise RuntimeError(f"source {source} is disabled or unavailable")
     health = session.get(SourceHealth, source) or SourceHealth(
@@ -357,7 +387,7 @@ async def poll_source(session: Session, source: str) -> int:
     )
     session.add(health)
     if not health.enabled:
-        session.commit()
+        commit_with_retry(session)
         return 0
 
     adapter = adapter_for_source(source)
@@ -366,10 +396,13 @@ async def poll_source(session: Session, source: str) -> int:
     try:
         try:
             items = await adapter.list_recent()
+            if progress is not None:
+                progress(0, len(items))
+                commit_with_retry(session)
             count = 0
             item_failures = 0
             cover_cache_results: list[CoverCacheResult] = []
-            for item in items:
+            for index, item in enumerate(items, start=1):
                 try:
                     chapters = await adapter.get_chapters(item)
                     with session.begin_nested():
@@ -383,6 +416,9 @@ async def poll_source(session: Session, source: str) -> int:
                 except Exception as exc:
                     item_failures += 1
                     logger.warning("failed to poll %s item %s: %s", source, item.url, exc)
+                if progress is not None:
+                    progress(index, len(items))
+                    commit_with_retry(session)
             if items and item_failures == len(items):
                 record_source_failure(health, f"all {item_failures} discovered items failed")
                 record_activity(
@@ -402,16 +438,157 @@ async def poll_source(session: Session, source: str) -> int:
                     source=source,
                     metadata={"count": count, "item_failures": item_failures},
                 )
-            session.commit()
+            commit_with_retry(session)
             cleanup_stale_cover_images(cover_cache_results)
             return count
         except Exception as exc:
             record_source_failure(health, str(exc))
             record_activity(session, "source_poll", "error", str(exc), source=source)
-            session.commit()
+            commit_with_retry(session)
             raise
     finally:
         await close_adapter(adapter)
+
+
+def create_pull_job(session: Session, source: str) -> tuple[SourcePullJob, bool]:
+    existing = session.scalar(
+        select(SourcePullJob)
+        .where(SourcePullJob.source == source)
+        .where(SourcePullJob.status.in_(["queued", "running"]))
+        .order_by(SourcePullJob.created_at.desc(), SourcePullJob.id.desc())
+        .limit(1)
+    )
+    if existing is not None:
+        return existing, False
+    job = SourcePullJob(source=source, status="queued", total_items=0, processed_items=0)
+    session.add(job)
+    try:
+        commit_with_retry(session)
+    except IntegrityError:
+        session.rollback()
+        existing = session.scalar(
+            select(SourcePullJob)
+            .where(SourcePullJob.source == source)
+            .where(SourcePullJob.status.in_(["queued", "running"]))
+            .order_by(SourcePullJob.created_at.desc(), SourcePullJob.id.desc())
+            .limit(1)
+        )
+        if existing is None:
+            raise
+        return existing, False
+    session.refresh(job)
+    return job, True
+
+
+async def run_pull_job(job_id: int) -> None:
+    from app.db import SessionLocal
+
+    with SessionLocal() as session:
+        job = session.get(SourcePullJob, job_id)
+        if job is None:
+            return
+        job.status = "running"
+        job.updated_at = utcnow()
+        commit_with_retry(session)
+        logger.info("pull job started job_id=%s source=%s", job.id, job.source)
+        try:
+            def update_progress(processed: int, total: int) -> None:
+                if job.status not in {"queued", "running"}:
+                    return
+                job.total_items = total
+                job.processed_items = processed
+                job.updated_at = utcnow()
+
+            count = await poll_source(session, job.source, progress=update_progress)
+            queue_downloads(session)
+        except Exception as exc:
+            logger.exception("pull job failed for %s", job.source)
+            job = session.get(SourcePullJob, job_id)
+            if job is not None:
+                job.status = "failed"
+                job.error = str(exc)
+                job.updated_at = utcnow()
+                job.completed_at = utcnow()
+                commit_with_retry(session)
+            return
+        job = session.get(SourcePullJob, job_id)
+        if job is not None:
+            if job.total_items == 0:
+                job.total_items = count
+            job.processed_items = max(job.processed_items, job.total_items)
+            job.status = "complete"
+            job.updated_at = utcnow()
+            job.completed_at = utcnow()
+            commit_with_retry(session)
+            logger.info(
+                "pull job complete job_id=%s source=%s processed=%s total=%s imported=%s",
+                job.id,
+                job.source,
+                job.processed_items,
+                job.total_items,
+                count,
+            )
+
+
+async def run_pull_jobs_limited(job_ids: list[int]) -> None:
+    semaphore = asyncio.Semaphore(settings.source_pull_concurrency)
+
+    async def worker(job_id: int) -> None:
+        async with semaphore:
+            await run_pull_job(job_id)
+
+    await asyncio.gather(*(worker(job_id) for job_id in job_ids))
+
+
+def recover_stale_pull_jobs(session: Session) -> int:
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=settings.download_stale_minutes)
+    recovered = 0
+    for job in session.scalars(
+        select(SourcePullJob)
+        .where(SourcePullJob.status.in_(["queued", "running"]))
+        .where(SourcePullJob.updated_at < cutoff)
+    ):
+        job.status = "failed"
+        job.error = "recovered stale pull job"
+        job.updated_at = utcnow()
+        job.completed_at = utcnow()
+        recovered += 1
+    commit_with_retry(session)
+    return recovered
+
+
+def pull_status(session: Session) -> dict:
+    active = session.scalars(
+        select(SourcePullJob)
+        .where(SourcePullJob.status.in_(["queued", "running"]))
+        .order_by(SourcePullJob.created_at.desc(), SourcePullJob.id.desc())
+    ).all()
+    jobs = session.scalars(
+        select(SourcePullJob)
+        .order_by(SourcePullJob.created_at.desc(), SourcePullJob.id.desc())
+        .limit(10)
+    ).all()
+    latest = jobs[0] if jobs else None
+    total = sum(job.total_items for job in active)
+    processed = sum(job.processed_items for job in active)
+    return {
+        "active": bool(active),
+        "status": latest.status if latest else "idle",
+        "source": latest.source if latest else "",
+        "processed": processed,
+        "total": total,
+        "error": latest.error if latest else "",
+        "jobs": [
+            {
+                "source": job.source,
+                "status": job.status,
+                "processed": job.processed_items,
+                "total": job.total_items,
+                "error": job.error,
+            }
+            for job in jobs
+        ],
+    }
 
 
 def record_source_success(health: SourceHealth, item_failures: int = 0) -> None:
@@ -484,7 +661,7 @@ def queue_downloads(session: Session) -> int:
             queued += 1
         except IntegrityError:
             logger.info("download job already exists for release %s", release.id)
-    session.commit()
+    commit_with_retry(session)
     return queued
 
 
@@ -518,36 +695,102 @@ def selected_release_for_chapter(
     return None
 
 
-def queue_release(session: Session, release: ChapterRelease) -> bool:
+def next_release_for_chapter(
+    session: Session,
+    chapter: Chapter,
+    *,
+    exclude_release_id: int | None = None,
+    now: datetime | None = None,
+) -> ChapterRelease | None:
+    release_id = selected_release_for_chapter(session, chapter, now)
+    if release_id is None:
+        return None
+    if exclude_release_id is None or release_id != exclude_release_id:
+        return session.get(ChapterRelease, release_id)
+    releases = session.scalars(
+        select(ChapterRelease)
+        .where(ChapterRelease.chapter_id == chapter.id)
+        .where(ChapterRelease.id != exclude_release_id)
+        .order_by(ChapterRelease.id)
+    ).all()
+    now = now or datetime.now(timezone.utc)
+    for release in sorted(
+        releases,
+        key=lambda item: SOURCE_PRIORITY.get(item.source, 0),
+        reverse=True,
+    ):
+        downloadable_after = ensure_aware(release.downloadable_after)
+        if downloadable_after and downloadable_after > now:
+            continue
+        job = session.scalar(select(DownloadJob).where(DownloadJob.chapter_release_id == release.id))
+        if job and job.status == "failed" and job.attempts >= settings.max_download_attempts:
+            continue
+        return release
+    return None
+
+
+def queue_next_chapter_download(
+    session: Session,
+    chapter: Chapter,
+    *,
+    exclude_release_id: int,
+    priority: int = 100,
+    job_type: str = "normal",
+) -> bool:
+    release = next_release_for_chapter(
+        session,
+        chapter,
+        exclude_release_id=exclude_release_id,
+    )
+    if release is None:
+        return False
+    return queue_release(session, release, priority=priority, job_type=job_type)
+
+
+def queue_release(
+    session: Session,
+    release: ChapterRelease,
+    *,
+    priority: int = 100,
+    job_type: str = "normal",
+) -> bool:
     existing = session.scalar(select(DownloadJob).where(DownloadJob.chapter_release_id == release.id))
     if existing:
         if existing.status in {"failed", "skipped", "delayed"}:
             existing.status = "queued"
             existing.error = ""
             existing.retry_after = None
+            existing.priority = min(existing.priority, priority)
+            existing.job_type = job_type
             existing.updated_at = utcnow()
-            session.commit()
+            commit_with_retry(session)
             return True
         return False
-    session.add(DownloadJob(chapter_release_id=release.id))
-    session.commit()
+    session.add(DownloadJob(chapter_release_id=release.id, priority=priority, job_type=job_type))
+    commit_with_retry(session)
     return True
 
 
-def queue_chapter_download(session: Session, chapter: Chapter) -> bool:
+def queue_chapter_download(
+    session: Session,
+    chapter: Chapter,
+    *,
+    priority: int = 100,
+    job_type: str = "normal",
+) -> bool:
     release_id = selected_release_for_chapter(session, chapter)
     if release_id is None:
         return False
     release = session.get(ChapterRelease, release_id)
-    return queue_release(session, release) if release is not None else False
+    return (
+        queue_release(session, release, priority=priority, job_type=job_type)
+        if release is not None
+        else False
+    )
 
 
 def newest_missing_chapters(series: Series, limit: int = FIRST_IMPORT_CHAPTERS) -> list[Chapter]:
-    chapters = sorted(
-        series.chapters,
-        key=lambda chapter: newest_chapter_time(chapter),
-        reverse=True,
-    )
+    chapters = sorted(series.chapters, key=chapter_sort_key, reverse=True)
     return [
         chapter
         for chapter in chapters
@@ -556,11 +799,36 @@ def newest_missing_chapters(series: Series, limit: int = FIRST_IMPORT_CHAPTERS) 
 
 
 def newest_chapter_time(chapter: Chapter) -> datetime:
+    return chapter_platform_release_time(chapter)
+
+
+def release_display_time(release: ChapterRelease) -> datetime:
+    return (
+        ensure_aware(release.published_at)
+        or ensure_aware(release.first_seen_at)
+        or utcnow()
+    )
+
+
+def chapter_platform_release_time(chapter: Chapter) -> datetime:
     values = [
-        ensure_aware(release.published_at) or ensure_aware(release.first_seen_at) or chapter.updated_at
+        release_display_time(release)
         for release in chapter.releases
     ]
-    return max(values) if values else ensure_aware(chapter.updated_at) or utcnow()
+    return min(values) if values else ensure_aware(chapter.updated_at) or utcnow()
+
+
+def series_latest_platform_release_time(series: Series) -> datetime:
+    values = [chapter_platform_release_time(chapter) for chapter in series.chapters]
+    return max(values) if values else ensure_aware(series.updated_at) or utcnow()
+
+
+def chapter_sort_key(chapter: Chapter) -> tuple[int, Decimal, datetime]:
+    try:
+        number = Decimal(chapter.number)
+    except InvalidOperation:
+        return (0, Decimal(0), chapter_platform_release_time(chapter))
+    return (1, number, chapter_platform_release_time(chapter))
 
 
 def queue_newest_missing_chapters(
@@ -572,8 +840,14 @@ def queue_newest_missing_chapters(
             folder_path = Path(chapter.cbz_path).parent if chapter.cbz_path else None
             if queue_kavita_sync(session, series, folder_path):
                 queued += 1
-        elif queue_chapter_download(session, chapter):
+        elif queue_chapter_download(session, chapter, priority=10, job_type="first_import"):
             queued += 1
+    if settings.backfill_downloads_enabled:
+        for chapter in newest_missing_chapters(series, limit=10_000)[limit:]:
+            if not chapter.downloaded_source and queue_chapter_download(
+                session, chapter, priority=200, job_type="backfill"
+            ):
+                queued += 1
     return queued
 
 
@@ -587,12 +861,32 @@ async def run_next_download(session: Session) -> bool:
     if release is None or release.chapter is None:
         job.status = "failed"
         job.error = "release or chapter missing"
-        session.commit()
+        commit_with_retry(session)
+        logger.error("download job failed job_id=%s reason=%s", job.id, job.error)
         return True
 
+    logger.info(
+        "download job started job_id=%s release_id=%s source=%s series_id=%s chapter_id=%s chapter=%s attempt=%s",
+        job.id,
+        release.id,
+        release.source,
+        release.chapter.series_id,
+        release.chapter.id,
+        release.number,
+        job.attempts,
+    )
+
     if delay_job_if_not_due(session, job, release):
+        logger.info(
+            "download job delayed job_id=%s source=%s chapter_id=%s retry_after=%s",
+            job.id,
+            release.source,
+            release.chapter.id,
+            job.retry_after,
+        )
         return True
     if skip_job_if_obsolete(session, job, release):
+        logger.info("download job skipped job_id=%s reason=%s", job.id, job.error)
         return True
 
     adapter = adapter_for_source(release.source)
@@ -601,7 +895,8 @@ async def run_next_download(session: Session) -> bool:
         job.error = f"source {release.source} is disabled or unavailable"
         job.retry_after = None
         job.updated_at = utcnow()
-        session.commit()
+        commit_with_retry(session)
+        logger.error("download job failed job_id=%s reason=%s", job.id, job.error)
         return True
 
     staging_path: Path | None = None
@@ -647,7 +942,16 @@ async def run_next_download(session: Session) -> bool:
         job.error = ""
         job.retry_after = None
         job.updated_at = utcnow()
-        session.commit()
+        commit_with_retry(session)
+        logger.info(
+            "download job complete job_id=%s source=%s series_id=%s chapter_id=%s pages=%s path=%s",
+            job.id,
+            release.source,
+            chapter.series_id,
+            chapter.id,
+            image_count,
+            final_path,
+        )
         record_activity(
             session,
             "download",
@@ -658,7 +962,7 @@ async def run_next_download(session: Session) -> bool:
             chapter_id=chapter.id,
             download_job_id=job.id,
         )
-        session.commit()
+        commit_with_retry(session)
         queue_kavita_sync(session, chapter.series, final_path.parent)
     except ChapterTemporarilyUnavailable as exc:
         retry_after = ensure_aware(exc.retry_after) or (
@@ -679,7 +983,15 @@ async def run_next_download(session: Session) -> bool:
             chapter_id=release.chapter.id,
             download_job_id=job.id,
         )
-        session.commit()
+        commit_with_retry(session)
+        logger.warning(
+            "download job delayed job_id=%s source=%s chapter_id=%s retry_after=%s reason=%s",
+            job.id,
+            release.source,
+            release.chapter.id,
+            retry_after,
+            exc,
+        )
     except Exception as exc:
         if staging_path is not None:
             staging_path.unlink(missing_ok=True)
@@ -691,6 +1003,7 @@ async def run_next_download(session: Session) -> bool:
             job.retry_after = next_retry_after(job.attempts)
         job.error = str(exc)
         job.updated_at = utcnow()
+        terminal_failure = job.status == "failed"
         record_activity(
             session,
             "download",
@@ -701,7 +1014,33 @@ async def run_next_download(session: Session) -> bool:
             chapter_id=release.chapter.id,
             download_job_id=job.id,
         )
-        session.commit()
+        commit_with_retry(session)
+        logger.warning(
+            "download job %s job_id=%s source=%s chapter_id=%s attempt=%s retry_after=%s reason=%s",
+            "failed" if terminal_failure else "retrying",
+            job.id,
+            release.source,
+            release.chapter.id,
+            job.attempts,
+            job.retry_after,
+            exc,
+            exc_info=terminal_failure,
+        )
+        if terminal_failure:
+            queued_fallback = queue_next_chapter_download(
+                session,
+                release.chapter,
+                exclude_release_id=release.id,
+                priority=job.priority + 1,
+                job_type=job.job_type,
+            )
+            logger.info(
+                "download fallback queued job_id=%s source=%s chapter_id=%s queued=%s",
+                job.id,
+                release.source,
+                release.chapter.id,
+                queued_fallback,
+            )
     finally:
         await close_adapter(adapter)
     return True
@@ -716,7 +1055,7 @@ def delay_job_if_not_due(session: Session, job: DownloadJob, release: ChapterRel
     job.error = "release is not downloadable yet"
     job.retry_after = downloadable_after
     job.updated_at = utcnow()
-    session.commit()
+    commit_with_retry(session)
     return True
 
 
@@ -740,7 +1079,7 @@ def skip_job_if_obsolete(session: Session, job: DownloadJob, release: ChapterRel
     job.error = reason
     job.retry_after = None
     job.updated_at = utcnow()
-    session.commit()
+    commit_with_retry(session)
     return True
 
 
@@ -770,14 +1109,14 @@ def queue_kavita_sync(
         if folder and folder != existing.folder_path:
             existing.folder_path = folder
         if existing.status in {"queued", "running"}:
-            session.commit()
+            commit_with_retry(session)
             return False
         existing.status = "queued"
         existing.error = ""
         existing.attempts = 0
         existing.retry_after = None
         existing.updated_at = utcnow()
-        session.commit()
+        commit_with_retry(session)
         return True
     try:
         with session.begin_nested():
@@ -785,9 +1124,9 @@ def queue_kavita_sync(
             session.flush()
     except IntegrityError:
         logger.info("Kavita sync job already exists for series %s", series.id)
-        session.commit()
+        commit_with_retry(session)
         return False
-    session.commit()
+    commit_with_retry(session)
     return True
 
 
@@ -841,7 +1180,7 @@ async def run_next_kavita_sync(session: Session) -> bool:
         job.status = "failed"
         job.error = "series missing"
         job.updated_at = utcnow()
-        session.commit()
+        commit_with_retry(session)
         return True
     folder_path = Path(job.folder_path) if job.folder_path else None
     try:
@@ -873,7 +1212,7 @@ async def run_next_kavita_sync(session: Session) -> bool:
         kavita_sync_job_id=job.id,
         metadata={"error": error} if error else None,
     )
-    session.commit()
+    commit_with_retry(session)
     return True
 
 
@@ -905,7 +1244,7 @@ def claim_next_kavita_sync_job(session: Session) -> KavitaSyncJob | None:
     if result.rowcount != 1:
         session.rollback()
         return None
-    session.commit()
+    commit_with_retry(session)
     return session.scalar(
         select(KavitaSyncJob)
         .where(KavitaSyncJob.id == job_id)
@@ -971,7 +1310,7 @@ def claim_next_download_job(session: Session) -> DownloadJob | None:
         select(DownloadJob.id)
         .where(DownloadJob.status == "queued")
         .where(ready_filter)
-        .order_by(DownloadJob.created_at.asc())
+        .order_by(DownloadJob.priority.asc(), DownloadJob.created_at.asc())
         .limit(1)
     )
     if job_id is None:
@@ -993,7 +1332,7 @@ def claim_next_download_job(session: Session) -> DownloadJob | None:
     if result.rowcount != 1:
         session.rollback()
         return None
-    session.commit()
+    commit_with_retry(session)
     return session.scalar(
         select(DownloadJob)
         .where(DownloadJob.id == job_id)
@@ -1118,6 +1457,36 @@ async def cache_cover_image(
         return None
 
 
+async def refresh_missing_covers(session: Session, limit: int = 100) -> int:
+    refreshed = 0
+    results: list[CoverCacheResult] = []
+    rows = session.scalars(
+        select(SourceSeries)
+        .where(SourceSeries.cover_url != "")
+        .where(SourceSeries.cover_path == "")
+        .order_by(SourceSeries.id.asc())
+        .limit(limit)
+    ).all()
+    for source_series in rows:
+        result = await cache_cover_image(
+            session,
+            source_series,
+            SeriesItem(
+                source=source_series.source,
+                source_id=source_series.source_id,
+                title=source_series.title,
+                url=source_series.url,
+                cover_url=source_series.cover_url,
+            ),
+        )
+        if result is not None:
+            results.append(result)
+            refreshed += 1
+    commit_with_retry(session)
+    cleanup_stale_cover_images(results)
+    return refreshed
+
+
 def cleanup_stale_cover_images(results: list[CoverCacheResult]) -> None:
     active_paths = {result.active_path for result in results}
     for result in results:
@@ -1182,13 +1551,18 @@ async def sync_series_with_kavita(
     if match is None:
         if series.kavita_series_id:
             clear_kavita_mapping(series)
-            session.commit()
+            commit_with_retry(session)
         return False
     series.kavita_series_id = match.id
     series.kavita_library_id = match.library_id
     series.kavita_synced_at = utcnow()
     chapters = await client.series_detail(match.id)
     chapters_by_number = {normalize_chapter_number(chapter.number): chapter for chapter in chapters}
+    chapter_progress = (
+        getattr(client, "chapter_progress", None)
+        if settings.kavita_sync_read_progress
+        else None
+    )
     for chapter in series.chapters:
         kavita_chapter = chapters_by_number.get(normalize_chapter_number(chapter.number))
         if kavita_chapter is None:
@@ -1200,7 +1574,18 @@ async def sync_series_with_kavita(
         chapter.kavita_chapter_id = kavita_chapter.id
         chapter.kavita_volume_id = kavita_chapter.volume_id
         chapter.kavita_mapped_at = utcnow()
-    session.commit()
+        kavita_progress = (
+            await chapter_progress(kavita_chapter.id, kavita_chapter.pages_total)
+            if chapter_progress is not None
+            else None
+        )
+        if (
+            kavita_progress is not None
+            and kavita_progress.pages_total > 0
+            and kavita_progress.pages_read >= kavita_progress.pages_total
+        ):
+            apply_chapter_progress(session, chapter.id, "read")
+    commit_with_retry(session)
     return True
 
 
@@ -1272,7 +1657,7 @@ def retry_failed_downloads(session: Session) -> int:
         job.retry_after = None
         job.updated_at = utcnow()
         count += 1
-    session.commit()
+    commit_with_retry(session)
     return count
 
 
@@ -1285,7 +1670,7 @@ def retry_download_job(session: Session, job_id: int) -> bool:
     job.attempts = 0
     job.retry_after = None
     job.updated_at = utcnow()
-    session.commit()
+    commit_with_retry(session)
     return True
 
 
@@ -1306,7 +1691,7 @@ def retry_failed_kavita_syncs(session: Session) -> int:
         job.retry_after = None
         job.updated_at = utcnow()
         count += 1
-    session.commit()
+    commit_with_retry(session)
     return count
 
 
@@ -1319,14 +1704,32 @@ def retry_kavita_sync_job(session: Session, job_id: int) -> bool:
     job.attempts = 0
     job.retry_after = None
     job.updated_at = utcnow()
-    session.commit()
+    commit_with_retry(session)
     return True
 
 
 async def drain_download_queue(session: Session) -> int:
+    if settings.download_concurrency <= 1:
+        count = 0
+        while await run_next_download(session):
+            count += 1
+        return count
+    from app.db import SessionLocal
+
+    lock = asyncio.Lock()
     count = 0
-    while await run_next_download(session):
-        count += 1
+
+    async def worker() -> None:
+        nonlocal count
+        while True:
+            with SessionLocal() as worker_session:
+                processed = await run_next_download(worker_session)
+            if not processed:
+                return
+            async with lock:
+                count += 1
+
+    await asyncio.gather(*(worker() for _ in range(settings.download_concurrency)))
     return count
 
 
@@ -1366,7 +1769,7 @@ async def rescan_source_series(session: Session, source_series_id: int) -> int:
                 upsert_release(session, source_series, chapter)
             source_series.detail_fetched_at = utcnow()
             source_series.last_checked_at = utcnow()
-        session.commit()
+        commit_with_retry(session)
         return len(chapters)
     finally:
         await close_adapter(adapter)
@@ -1410,7 +1813,7 @@ def merge_match_candidate(session: Session, candidate_id: int) -> bool:
     if old_series is not None and old_series.id != target.id:
         session.flush()
         session.delete(old_series)
-    session.commit()
+    commit_with_retry(session)
     return True
 
 
@@ -1426,7 +1829,7 @@ def keep_match_candidate_separate(session: Session, candidate_id: int) -> bool:
         )
     )
     candidate.status = "separate"
-    session.commit()
+    commit_with_retry(session)
     return True
 
 
@@ -1439,7 +1842,7 @@ def set_series_progress(
     rating: int | None = None,
 ) -> SeriesProgress | None:
     progress = apply_series_progress(session, series_id, status, note=note, rating=rating)
-    session.commit()
+    commit_with_retry(session)
     return progress
 
 
@@ -1479,7 +1882,7 @@ def apply_series_progress(
 
 def set_chapter_progress(session: Session, chapter_id: int, status: str) -> ChapterProgress | None:
     progress = apply_chapter_progress(session, chapter_id, status)
-    session.commit()
+    commit_with_retry(session)
     return progress
 
 
@@ -1521,7 +1924,7 @@ def mark_series_caught_up(session: Session, series_id: int) -> int:
         if apply_chapter_progress(session, chapter.id, "read") is not None:
             count += 1
     apply_series_progress(session, series_id, "caught_up")
-    session.commit()
+    commit_with_retry(session)
     return count
 
 
@@ -1542,7 +1945,7 @@ async def sync_kavita_want_to_read(session: Session) -> int:
         f"Imported {count} Kavita Want to Read series",
         metadata={"count": count},
     )
-    session.commit()
+    commit_with_retry(session)
     return count
 
 
@@ -1593,8 +1996,64 @@ def cleanup_replaced_files(session: Session) -> int:
         f"Removed {removed} replaced files",
         metadata={"removed": removed},
     )
-    session.commit()
+    commit_with_retry(session)
     return removed
+
+
+def cleanup_bad_discovery_rows(session: Session) -> dict[str, int]:
+    removed_chapters = 0
+    removed_series = 0
+    bad_chapters = session.scalars(
+        select(Chapter).where(
+            or_(
+                Chapter.number.contains("{{"),
+                Chapter.number.contains("number"),
+                Chapter.title.contains("{{"),
+                Chapter.title.contains("number"),
+            )
+        )
+    ).all()
+    for chapter in bad_chapters:
+        has_files = session.scalar(select(DownloadedFile.id).where(DownloadedFile.chapter_id == chapter.id))
+        if has_files:
+            continue
+        for release in list(chapter.releases):
+            session.delete(release)
+        session.delete(chapter)
+        removed_chapters += 1
+
+    for source_series in session.scalars(select(SourceSeries).where(SourceSeries.source == "kingofshojo")).all():
+        title = source_series.title.strip().lower()
+        if title not in {"manhwa", "manga", "manhua", "text mode", "list mode"}:
+            continue
+        series = source_series.series
+        has_files = session.scalar(
+            select(DownloadedFile.id).join(Chapter).where(Chapter.series_id == series.id)
+        )
+        if has_files or series.status != "new":
+            continue
+        for candidate in session.scalars(select(MatchCandidate).where(MatchCandidate.source_series_id == source_series.id)):
+            session.delete(candidate)
+        session.delete(source_series)
+        session.flush()
+        remaining_sources = session.scalar(
+            select(SourceSeries.id).where(SourceSeries.series_id == series.id).limit(1)
+        )
+        remaining_chapters = session.scalar(
+            select(Chapter.id).where(Chapter.series_id == series.id).limit(1)
+        )
+        if remaining_sources is None and remaining_chapters is None:
+            session.delete(series)
+        removed_series += 1
+    if removed_chapters or removed_series:
+        record_activity(
+            session,
+            "cleanup",
+            "success",
+            f"Removed {removed_chapters} bad chapters and {removed_series} pseudo-series",
+        )
+        commit_with_retry(session)
+    return {"chapters": removed_chapters, "series": removed_series}
 
 
 def bulk_update_match_candidates(session: Session, candidate_ids: list[int], action: str) -> int:
@@ -1660,7 +2119,7 @@ def recover_stale_download_jobs(session: Session) -> int:
             job.updated_at = utcnow()
             count += 1
     if count:
-        session.commit()
+        commit_with_retry(session)
     return count
 
 
@@ -1676,7 +2135,7 @@ def recover_stale_kavita_sync_jobs(session: Session) -> int:
             job.updated_at = utcnow()
             count += 1
     if count:
-        session.commit()
+        commit_with_retry(session)
     return count
 
 
@@ -1691,6 +2150,16 @@ def ensure_aware(value: datetime | None) -> datetime | None:
     if value.tzinfo is None:
         return value.replace(tzinfo=timezone.utc)
     return value
+
+
+def earliest_datetime(left: datetime | None, right: datetime | None) -> datetime | None:
+    left = ensure_aware(left)
+    right = ensure_aware(right)
+    if left is None:
+        return right
+    if right is None:
+        return left
+    return min(left, right)
 
 
 def recompute_chapter_best_source(chapter: Chapter) -> None:

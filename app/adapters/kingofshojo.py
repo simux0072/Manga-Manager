@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
-from urllib.parse import urljoin, urlparse
+import re
+from urllib.parse import unquote, urljoin, urlparse
 
 from app.adapters.asura import dedupe_chapters, dedupe_series
 from app.adapters.base import SourceAdapter
 from app.adapters.http import HttpSourceClient
-from app.adapters.parsing import extract_image_urls
+from app.adapters.parsing import clean_chapter_title, extract_image_urls, nearby_cover_attr, parse_source_date
 from app.domain import ChapterItem, SeriesItem, normalize_chapter_number
 from app.settings import settings
 
@@ -38,13 +39,12 @@ class KingOfShojoAdapter(SourceAdapter):
         for link in soup.select("a[href*='/manga/']")[:120]:
             title = link.get("title") or link.get_text(" ", strip=True)
             href = link.get("href", "")
-            if not title or not href or href.rstrip("/") == f"{self.base_url}/manga":
+            if not title or not href:
                 continue
             url = urljoin(self.base_url, href)
-            if urlparse(url).path.strip("/") == "manga":
+            if is_non_series_link(url, title):
                 continue
-            image = link.select_one("img")
-            cover = image.get("src") or image.get("data-src") if image else ""
+            cover = nearby_cover_attr(link)
             items.append(
                 SeriesItem(
                     source=self.source,
@@ -70,13 +70,16 @@ class KingOfShojoAdapter(SourceAdapter):
             number = normalize_chapter_number(title or href)
             if not href or not number:
                 continue
+            container_text = link.parent.get_text(" ", strip=True) if link.parent else title
+            published_at = parse_source_date(container_text)
             chapters.append(
                 ChapterItem(
                     source=self.source,
                     source_series_id=source_series.source_id,
                     number=number,
-                    title=title,
+                    title=clean_chapter_title(number, title, published_at),
                     url=urljoin(self.base_url, href),
+                    published_at=published_at,
                 )
             )
         return dedupe_chapters(chapters)
@@ -99,9 +102,22 @@ class KingOfShojoAdapter(SourceAdapter):
 
 
 def is_template_or_empty_link(href: str, title: str) -> bool:
+    combined = unquote(f"{href} {title}").lower()
     if not href:
         return True
-    if href.startswith("#") or "{{" in href or "{{" in title:
+    if href.startswith("#") or "{{" in combined or "number" in combined and "date" in combined:
         return True
     path = urlparse(urljoin(KingOfShojoAdapter.base_url, href)).path.strip("/")
     return not path or "chapter" not in path
+
+
+def is_non_series_link(url: str, title: str) -> bool:
+    path = urlparse(url).path.strip("/").lower()
+    title = " ".join(title.lower().split())
+    if path in {"manga", "manga/list-mode"}:
+        return True
+    if path == "manga/" or not path.startswith("manga/"):
+        return True
+    if re.search(r"\b(text mode|list mode|manhwa|manga|manhua|genres?|filter)\b", title):
+        return True
+    return False

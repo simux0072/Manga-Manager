@@ -84,7 +84,9 @@ class FakeFullAsyncClient:
             {"method": "GET", "url": url, "headers": headers, "params": params}
         )
         if url.endswith("/api/Series/series-detail"):
-            return FakeResponse({"chapters": [{"id": 42, "number": "12", "volumeId": 3}]})
+            return FakeResponse({"chapters": [{"id": 42, "number": "12", "volumeId": 3, "pages": 11}]})
+        if url.endswith("/api/Reader/get-progress"):
+            return FakeResponse({"chapterId": params["chapterId"], "pageNum": 11})
         return FakeResponse(None)
 
 
@@ -99,6 +101,7 @@ async def test_kavita_client_folder_scan_series_and_want_to_read(monkeypatch, tm
     await client.scan_folder(tmp_path / "Example")
     series = await client.list_series()
     chapters = await client.series_detail(7)
+    progress = await client.chapter_progress(42, pages_total=11)
     wanted = await client.want_to_read()
     await client.add_want_to_read([7])
 
@@ -111,8 +114,18 @@ async def test_kavita_client_folder_scan_series_and_want_to_read(monkeypatch, tm
     assert series[0].mal_id == "11"
     assert chapters[0].id == 42
     assert chapters[0].number == "12"
+    assert chapters[0].pages_total == 11
+    assert progress.chapter_id == 42
+    assert progress.pages_read == 11
+    assert progress.pages_total == 11
     assert wanted[0].name == "Wanted"
     assert FakeFullAsyncClient.requests[-1]["json"] == {"seriesIds": [7]}
+    assert {
+        "method": "GET",
+        "url": "http://kavita/api/Reader/get-progress",
+        "headers": {"x-api-key": "secret"},
+        "params": {"chapterId": 42},
+    } in FakeFullAsyncClient.requests
 
 
 def test_kavita_client_renders_urls(monkeypatch):

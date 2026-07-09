@@ -23,6 +23,14 @@ class KavitaChapter:
     id: int
     number: str
     volume_id: int | None = None
+    pages_total: int = 0
+
+
+@dataclass(frozen=True)
+class KavitaReadProgress:
+    chapter_id: int
+    pages_read: int = 0
+    pages_total: int = 0
 
 
 class KavitaClient:
@@ -121,6 +129,21 @@ class KavitaClient:
             chapters.extend(volume.get("chapters") or [])
         return [chapter for item in chapters if (chapter := parse_chapter(item)) is not None]
 
+    async def chapter_progress(
+        self, chapter_id: int, pages_total: int = 0
+    ) -> KavitaReadProgress | None:
+        if not self.configured:
+            return None
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.get(
+                f"{self.base_url}/api/Reader/get-progress",
+                params={"chapterId": chapter_id},
+                headers=self.headers(),
+            )
+            response.raise_for_status()
+        payload = response.json()
+        return parse_read_progress(payload, chapter_id, pages_total)
+
     async def want_to_read(self) -> list[KavitaSeries]:
         if not self.configured:
             return []
@@ -206,6 +229,26 @@ def parse_chapter(item: dict) -> KavitaChapter | None:
         id=int(chapter_id),
         number=number,
         volume_id=item.get("volumeId"),
+        pages_total=int(item.get("pagesTotal") or item.get("pages") or item.get("totalPages") or 0),
+    )
+
+
+def parse_read_progress(
+    item: dict | None, chapter_id: int, pages_total: int = 0
+) -> KavitaReadProgress | None:
+    if not isinstance(item, dict):
+        return None
+    progress_chapter_id = int(item.get("chapterId") or item.get("chapter_id") or chapter_id)
+    return KavitaReadProgress(
+        chapter_id=progress_chapter_id,
+        pages_read=int(item.get("pagesRead") or item.get("pageNum") or item.get("page") or 0),
+        pages_total=int(
+            item.get("pagesTotal")
+            or item.get("pages")
+            or item.get("totalPages")
+            or pages_total
+            or 0
+        ),
     )
 
 

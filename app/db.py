@@ -3,7 +3,7 @@ from pathlib import Path
 
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import create_engine, inspect, text
+from sqlalchemy import create_engine, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
 
 from app.settings import settings
@@ -13,9 +13,24 @@ class Base(DeclarativeBase):
     pass
 
 
-connect_args = {"check_same_thread": False} if settings.database_url.startswith("sqlite") else {}
+connect_args = (
+    {"check_same_thread": False, "timeout": 30}
+    if settings.database_url.startswith("sqlite")
+    else {}
+)
 engine = create_engine(settings.database_url, connect_args=connect_args)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+
+if settings.database_url.startswith("sqlite"):
+
+    @event.listens_for(engine, "connect")
+    def configure_sqlite(connection, _connection_record) -> None:
+        cursor = connection.cursor()
+        cursor.execute("PRAGMA busy_timeout=30000")
+        cursor.execute("PRAGMA journal_mode=WAL")
+        cursor.execute("PRAGMA synchronous=NORMAL")
+        cursor.close()
 
 
 def init_db() -> None:
@@ -90,6 +105,10 @@ def apply_compat_migrations() -> None:
         ddl.append("ALTER TABLE chapter_release ADD COLUMN first_seen_at DATETIME")
     if "retry_after" not in columns_by_table.get("download_job", set()):
         ddl.append("ALTER TABLE download_job ADD COLUMN retry_after DATETIME")
+    if "priority" not in columns_by_table.get("download_job", set()):
+        ddl.append("ALTER TABLE download_job ADD COLUMN priority INTEGER DEFAULT 100 NOT NULL")
+    if "job_type" not in columns_by_table.get("download_job", set()):
+        ddl.append("ALTER TABLE download_job ADD COLUMN job_type VARCHAR(30) DEFAULT 'normal' NOT NULL")
     if "chapter" in columns_by_table and "kavita_chapter_id" not in columns_by_table["chapter"]:
         ddl.append("ALTER TABLE chapter ADD COLUMN kavita_chapter_id INTEGER")
     if "chapter" in columns_by_table and "kavita_volume_id" not in columns_by_table["chapter"]:
@@ -100,6 +119,7 @@ def apply_compat_migrations() -> None:
     create_series_progress = "series_progress" not in columns_by_table
     create_chapter_progress = "chapter_progress" not in columns_by_table
     create_activity_event = "activity_event" not in columns_by_table
+    create_source_pull_job = "source_pull_job" not in columns_by_table
 
     with engine.begin() as connection:
         for statement in ddl:
@@ -206,6 +226,47 @@ def apply_compat_migrations() -> None:
                 connection.execute(
                     text(f"CREATE INDEX ix_activity_event_{name} ON activity_event ({column})")
                 )
+        if create_source_pull_job:
+            connection.execute(
+                text(
+                    "CREATE TABLE source_pull_job ("
+                    "id INTEGER PRIMARY KEY, "
+                    "source VARCHAR(50) DEFAULT '' NOT NULL, "
+                    "status VARCHAR(30) DEFAULT 'queued' NOT NULL, "
+                    "total_items INTEGER DEFAULT 0 NOT NULL, "
+                    "processed_items INTEGER DEFAULT 0 NOT NULL, "
+                    "error TEXT DEFAULT '' NOT NULL, "
+                    "created_at DATETIME NOT NULL, "
+                    "updated_at DATETIME NOT NULL, "
+                    "completed_at DATETIME"
+                    ")"
+                )
+            )
+            connection.execute(text("CREATE INDEX ix_source_pull_job_source ON source_pull_job (source)"))
+            connection.execute(text("CREATE INDEX ix_source_pull_job_status ON source_pull_job (status)"))
+            connection.execute(text("CREATE INDEX ix_source_pull_job_created_at ON source_pull_job (created_at)"))
+            connection.execute(
+                text(
+                    "CREATE UNIQUE INDEX uq_source_pull_job_active_source "
+                    "ON source_pull_job (source) "
+                    "WHERE status IN ('queued', 'running')"
+                )
+            )
+        elif "source_pull_job" in columns_by_table:
+            pull_indexes = {
+                index["name"]
+                for index in inspector.get_indexes("source_pull_job")
+                if index.get("name")
+            }
+            if "uq_source_pull_job_active_source" not in pull_indexes:
+                connection.execute(text(deduplicate_active_pull_jobs_sql()))
+                connection.execute(
+                    text(
+                        "CREATE UNIQUE INDEX uq_source_pull_job_active_source "
+                        "ON source_pull_job (source) "
+                        "WHERE status IN ('queued', 'running')"
+                    )
+                )
         if "first_seen_at" in columns_by_table.get("chapter_release", set()) or any(
             "first_seen_at" in statement for statement in ddl
         ):
@@ -232,6 +293,28 @@ def apply_compat_migrations() -> None:
                     "ON download_job (chapter_release_id)"
                 )
             )
+
+
+def deduplicate_active_pull_jobs_sql() -> str:
+    return (
+        "UPDATE source_pull_job AS job "
+        "SET status = 'failed', "
+        "error = CASE "
+        "WHEN COALESCE(error, '') = '' THEN 'deduplicated before active pull job constraint' "
+        "ELSE error END, "
+        "updated_at = CURRENT_TIMESTAMP, "
+        "completed_at = COALESCE(completed_at, CURRENT_TIMESTAMP) "
+        "WHERE status IN ('queued', 'running') "
+        "AND EXISTS ("
+        "SELECT 1 FROM source_pull_job AS newer "
+        "WHERE newer.source = job.source "
+        "AND newer.status IN ('queued', 'running') "
+        "AND ("
+        "newer.created_at > job.created_at "
+        "OR (newer.created_at = job.created_at AND newer.id > job.id)"
+        ")"
+        ")"
+    )
 
 
 def deduplicate_download_jobs_sql(columns: set[str]) -> str:

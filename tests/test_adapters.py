@@ -39,7 +39,7 @@ def test_asura_parses_comics_and_filters_chapter_images():
           <img src="https://cdn.asurascans.com/asura-images/covers/star.webp">
           Star-Embracing Swordmaster Chapter 128 Just now
         </a>
-        <a href="/comics/star-embracing-swordmaster-a80d257e/chapter/128">Chapter 128</a>
+        <div><a href="/comics/star-embracing-swordmaster-a80d257e/chapter/128">Chapter 128 Sep 29, 2025</a></div>
         """,
         "html.parser",
     )
@@ -51,9 +51,10 @@ def test_asura_parses_comics_and_filters_chapter_images():
     assert recent[0].title == "Star-Embracing Swordmaster"
 
     chapters = adapter.parse_chapters(soup, recent[0])
-    assert [(chapter.number, chapter.url) for chapter in chapters] == [
-        ("128", "https://asurascans.com/comics/star-embracing-swordmaster-a80d257e/chapter/128")
+    assert [(chapter.number, chapter.title, chapter.url) for chapter in chapters] == [
+        ("128", "Chapter 128", "https://asurascans.com/comics/star-embracing-swordmaster-a80d257e/chapter/128")
     ]
+    assert chapters[0].published_at is not None
 
     chapter_soup = BeautifulSoup(
         """
@@ -67,11 +68,28 @@ def test_asura_parses_comics_and_filters_chapter_images():
     ]
 
 
+def test_asura_uses_parent_card_cover():
+    soup = BeautifulSoup(
+        """
+        <div class="card">
+          <img data-src="/covers/parent.webp">
+          <a href="/comics/parent-cover">Parent Cover Chapter 4</a>
+        </div>
+        """,
+        "html.parser",
+    )
+
+    recent = AsuraAdapter().parse_recent_series(soup)
+
+    assert recent[0].cover_url == "https://asurascans.com/covers/parent.webp"
+
+
 def test_kingofshojo_filters_template_chapters_and_non_reader_images():
     soup = BeautifulSoup(
         """
         <a href="https://kingofshojo.com/selena-chapter-128/">Latest: Chapter 128</a>
         <a href="#/chapter-{{number}}">Chapter {{number}} {{date}}</a>
+        <a href="https://kingofshojo.com#/chapter-%7B%7Bnumber%7D%7D">Chapter {{number}} {{date}}</a>
         <a href="https://kingofshojo.com/selena-chapter-127-5/">Chapter 127.5</a>
         """,
         "html.parser",
@@ -99,6 +117,47 @@ def test_kingofshojo_filters_template_chapters_and_non_reader_images():
     assert adapter.parse_chapter_image_urls(chapter_soup) == [
         "https://cdn.kingofshojo.com/king-bucket/298784/59/1_result.webp"
     ]
+
+
+def test_kingofshojo_filters_navigation_series_and_extracts_dates():
+    soup = BeautifulSoup(
+        """
+        <a href="/manga/?status=&type=manhwa&order=">Manhwa</a>
+        <a href="/manga/list-mode">Text Mode</a>
+        <a href="/manga/tears-on-a-withered-flower/">
+          <img data-lazy-src="/covers/tears.webp">Tears on a Withered Flower
+        </a>
+        <div><a href="https://kingofshojo.com/tears-on-a-withered-flower-chapter-109/">Latest: Chapter 109 Jul 07, 2026</a></div>
+        """,
+        "html.parser",
+    )
+    adapter = KingOfShojoAdapter()
+    recent = adapter.parse_recent_series(soup)
+    assert [item.title for item in recent] == ["Tears on a Withered Flower"]
+    assert recent[0].cover_url == "https://kingofshojo.com/covers/tears.webp"
+
+    chapters = adapter.parse_chapters(
+        soup,
+        SeriesItem("kingofshojo", "manga/tears-on-a-withered-flower", "Tears", "https://kingofshojo.com/manga/tears-on-a-withered-flower/"),
+    )
+    assert chapters[0].number == "109"
+    assert chapters[0].title == "Chapter 109"
+    assert chapters[0].published_at is not None
+
+
+def test_kingofshojo_uses_parent_card_cover():
+    soup = BeautifulSoup(
+        """
+        <article style="background-image: url('/covers/card.jpg')">
+          <a href="/manga/card-cover/">Card Cover</a>
+        </article>
+        """,
+        "html.parser",
+    )
+
+    recent = KingOfShojoAdapter().parse_recent_series(soup)
+
+    assert recent[0].cover_url == "https://kingofshojo.com/covers/card.jpg"
 
 
 def test_mangafire_uses_api_payloads_for_titles_chapters_and_pages():
@@ -141,6 +200,62 @@ def test_mangafire_uses_api_payloads_for_titles_chapters_and_pages():
     assert adapter.parse_chapter_image_urls(
         {"data": {"pages": [{"url": "https://m3z.mfcdn3.xyz/mf/page.jpg"}]}}
     ) == ["https://m3z.mfcdn3.xyz/mf/page.jpg"]
+
+
+def test_mangafire_parses_current_chapter_payload_variants():
+    adapter = MangaFireAdapter()
+    source = SeriesItem(
+        source="mangafire",
+        source_id="gl3",
+        title="Gun X Clover",
+        url="https://mangafire.to/title/gl3-gun-x-clover",
+    )
+
+    chapters = adapter.parse_chapters(
+        {
+            "data": {
+                "chapters": [
+                    {
+                        "hid": "abc123",
+                        "chapter": "Chapter 61",
+                        "title": "The Return",
+                        "language": {"code": "en-us"},
+                        "created_at": 1_720_000_000,
+                    },
+                    {
+                        "hid": "skip",
+                        "chapter": "Chapter 60",
+                        "title": "Spanish",
+                        "language": {"name": "Spanish"},
+                    },
+                ]
+            }
+        },
+        source,
+    )
+
+    assert len(chapters) == 1
+    assert chapters[0].number == "61"
+    assert chapters[0].title == "The Return"
+    assert chapters[0].url == "https://mangafire.to/title/gl3-gun-x-clover/chapter/abc123"
+
+
+def test_mangafire_parses_top_level_chapters_with_missing_language():
+    adapter = MangaFireAdapter()
+    source = SeriesItem(
+        source="mangafire",
+        source_id="gl3",
+        title="Gun X Clover",
+        url="https://mangafire.to/title/gl3-gun-x-clover",
+    )
+
+    chapters = adapter.parse_chapters(
+        {"chapters": [{"chapterId": 777, "chapterNumber": 62, "name": "Chapter 62"}]},
+        source,
+    )
+
+    assert [chapter.number for chapter in chapters] == ["62"]
+    assert chapters[0].url == "https://mangafire.to/title/gl3-gun-x-clover/chapter/777"
 
 
 def test_mangafire_parses_detail_metadata():

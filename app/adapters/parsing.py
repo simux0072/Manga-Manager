@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin
 
 from bs4 import BeautifulSoup
@@ -18,6 +19,79 @@ def first_attr(tag, *names: str) -> str:
                 return str(value).split(",")[0].strip().split(" ")[0]
             return str(value)
     return ""
+
+
+def image_attr(tag) -> str:
+    return first_attr(
+        tag,
+        "data-src",
+        "data-lazy-src",
+        "data-original",
+        "data-url",
+        "data-cfsrc",
+        "srcset",
+        "src",
+    )
+
+
+def nearby_cover_attr(link) -> str:
+    image = link.select_one("img")
+    if image:
+        return image_attr(image)
+    for parent in link.parents:
+        if getattr(parent, "name", None) in {"body", "html", "[document]"}:
+            break
+        image = parent.select_one("img")
+        if image:
+            return image_attr(image)
+        for attr in ("data-bg", "data-background", "data-src", "style"):
+            value = str(parent.get(attr) or "")
+            if not value:
+                continue
+            if attr == "style":
+                match = re.search(r"url\(['\"]?([^'\")]+)", value)
+                if match:
+                    return match.group(1)
+            else:
+                return value
+    og_image = link.find_next("meta", attrs={"property": "og:image"})
+    return str(og_image.get("content") or "") if og_image else ""
+
+
+def parse_source_date(value: str) -> datetime | None:
+    value = " ".join((value or "").replace(",", " ").split())
+    if not value:
+        return None
+    now = datetime.now(timezone.utc)
+    lowered = value.lower()
+    if "just now" in lowered or "today" in lowered:
+        return now
+    if "yesterday" in lowered:
+        return now - timedelta(days=1)
+    for fmt in ("%b %d %Y", "%B %d %Y", "%Y-%m-%d", "%m/%d/%Y"):
+        match = re.search(r"([A-Za-z]{3,9}\s+\d{1,2}\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4})", value)
+        if not match:
+            continue
+        try:
+            return datetime.strptime(match.group(1), fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def clean_chapter_title(number: str, title: str, published_at: datetime | None = None) -> str:
+    title = " ".join((title or "").replace("Latest:", "").split())
+    if published_at is not None:
+        for fmt in ("%b %-d, %Y", "%B %-d, %Y", "%b %d, %Y", "%B %d, %Y", "%Y-%m-%d"):
+            try:
+                title = title.replace(published_at.strftime(fmt), "")
+            except ValueError:
+                continue
+    title = re.sub(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b", "", title)
+    title = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "", title)
+    title = " ".join(title.split("·")).strip()
+    title = " ".join(title.split())
+    return title or f"Chapter {number}"
 
 
 def extract_image_urls(soup: BeautifulSoup, base_url: str) -> list[str]:

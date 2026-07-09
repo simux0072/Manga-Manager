@@ -1,3 +1,4 @@
+import asyncio
 import io
 import zipfile
 from datetime import datetime, timedelta, timezone
@@ -5,17 +6,20 @@ from pathlib import Path
 
 from PIL import Image
 from sqlalchemy import create_engine
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import sessionmaker
 
 import app.services as services
+import app.db as db
 from app.adapters.base import ChapterTemporarilyUnavailable
-from app.kavita import KavitaChapter, KavitaSeries
+from app.kavita import KavitaChapter, KavitaReadProgress, KavitaSeries
 from app.db import Base
 from app.domain import ChapterItem, SeriesItem
 from app.models import (
     ActivityEvent,
     Chapter,
     ChapterProgress,
+    ChapterRelease,
     DownloadJob,
     DownloadedFile,
     KavitaSyncJob,
@@ -23,6 +27,8 @@ from app.models import (
     Series,
     SeriesProgress,
     SourceHealth,
+    SourcePullJob,
+    SourceSeries,
 )
 from app.services import (
     deactivate_downloaded_files,
@@ -53,6 +59,28 @@ def make_file_session_factory(path):
     engine = create_engine(f"sqlite:///{path}", connect_args={"check_same_thread": False})
     Base.metadata.create_all(engine)
     return sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+
+
+def test_commit_with_retry_rolls_back_and_retries_sqlite_lock(monkeypatch):
+    class Session:
+        commits = 0
+        rollbacks = 0
+
+        def commit(self):
+            self.commits += 1
+            if self.commits == 1:
+                raise OperationalError("commit", {}, Exception("database is locked"))
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    session = Session()
+    monkeypatch.setattr(services.time, "sleep", lambda delay: None)
+
+    services.commit_with_retry(session)
+
+    assert session.commits == 2
+    assert session.rollbacks == 1
 
 
 def image_bytes(image_format: str = "PNG") -> bytes:
@@ -122,6 +150,204 @@ def test_queue_downloads_only_for_tracked_best_source():
 
     assert queue_downloads(session) == 1
     assert release.chapter.best_source == "mangafire"
+
+
+def test_chapter_sort_key_orders_numeric_chapters_descending_with_decimals():
+    session = make_session()
+    source_series = merge_series_item(
+        session,
+        SeriesItem(source="mangafire", source_id="manga/example", title="Example", url="x"),
+    )
+    for number in ["127", "127.5", "128", "special"]:
+        upsert_release(
+            session,
+            source_series,
+            ChapterItem("mangafire", source_series.source_id, number, f"Chapter {number}", "x", None),
+        )
+    session.commit()
+
+    ordered = sorted(source_series.series.chapters, key=services.chapter_sort_key, reverse=True)
+
+    assert [chapter.number for chapter in ordered] == ["128", "127.5", "127", "special"]
+
+
+def test_platform_release_time_keeps_original_date_when_priority_source_arrives_later():
+    session = make_session()
+    original_time = datetime(2026, 7, 6, tzinfo=timezone.utc)
+    higher_priority_time = datetime(2026, 7, 8, tzinfo=timezone.utc)
+    low = merge_series_item(
+        session,
+        SeriesItem(source="mangafire", source_id="manga/example", title="Example", url="x"),
+    )
+    high = merge_series_item(
+        session,
+        SeriesItem(source="asura", source_id="series/example", title="Example", url="y"),
+    )
+    low_release = upsert_release(
+        session,
+        low,
+        ChapterItem("mangafire", low.source_id, "10", "Chapter 10", "x", original_time),
+    )
+    upsert_release(
+        session,
+        high,
+        ChapterItem("asura", high.source_id, "10", "Chapter 10", "y", higher_priority_time),
+    )
+    session.commit()
+
+    chapter = session.get(Chapter, low_release.chapter_id)
+
+    assert chapter.best_source == "asura"
+    assert services.chapter_platform_release_time(chapter) == original_time
+
+
+def test_upsert_release_keeps_earliest_published_at_for_same_source_repoll():
+    session = make_session()
+    original_time = datetime(2026, 7, 6, tzinfo=timezone.utc)
+    later_time = datetime(2026, 7, 8, tzinfo=timezone.utc)
+    source_series = merge_series_item(
+        session,
+        SeriesItem(source="mangafire", source_id="manga/example", title="Example", url="x"),
+    )
+    release = upsert_release(
+        session,
+        source_series,
+        ChapterItem("mangafire", source_series.source_id, "10", "Chapter 10", "x", original_time),
+    )
+    session.commit()
+
+    same_release = upsert_release(
+        session,
+        source_series,
+        ChapterItem("mangafire", source_series.source_id, "10", "Chapter 10", "y", later_time),
+    )
+    session.commit()
+
+    assert same_release.id == release.id
+    assert same_release.published_at == original_time
+    assert services.chapter_platform_release_time(same_release.chapter) == original_time
+
+
+def test_upsert_release_fills_missing_published_at_for_same_source_repoll():
+    session = make_session()
+    published_at = datetime(2026, 7, 8, tzinfo=timezone.utc)
+    source_series = merge_series_item(
+        session,
+        SeriesItem(source="mangafire", source_id="manga/example", title="Example", url="x"),
+    )
+    release = upsert_release(
+        session,
+        source_series,
+        ChapterItem("mangafire", source_series.source_id, "10", "Chapter 10", "x", None),
+    )
+    session.commit()
+    assert release.published_at is None
+
+    same_release = upsert_release(
+        session,
+        source_series,
+        ChapterItem("mangafire", source_series.source_id, "10", "Chapter 10", "y", published_at),
+    )
+    session.commit()
+
+    assert same_release.id == release.id
+    assert same_release.published_at == published_at
+
+
+def test_create_pull_job_reuses_active_source_job():
+    session = make_session()
+
+    first, first_created = services.create_pull_job(session, "mangafire")
+    second, second_created = services.create_pull_job(session, "mangafire")
+
+    assert first_created
+    assert not second_created
+    assert second.id == first.id
+    assert session.query(SourcePullJob).count() == 1
+
+    first.status = "complete"
+    session.commit()
+
+    third, third_created = services.create_pull_job(session, "mangafire")
+    assert third_created
+    assert third.id != first.id
+    assert session.query(SourcePullJob).count() == 2
+
+
+async def test_run_pull_job_updates_progress_without_sqlite_lock(tmp_path, monkeypatch):
+    class Adapter:
+        async def list_recent(self):
+            return [
+                SeriesItem(source="mangafire", source_id="good", title="Good", url="good"),
+                SeriesItem(source="mangafire", source_id="bad", title="Bad", url="bad"),
+            ]
+
+        async def get_chapters(self, item):
+            if item.source_id == "bad":
+                raise RuntimeError("detail failed")
+            return [ChapterItem("mangafire", item.source_id, "1", "Chapter 1", item.url, None)]
+
+        async def aclose(self):
+            return None
+
+    Session = make_file_session_factory(tmp_path / "pull.db")
+    monkeypatch.setattr(db, "SessionLocal", Session)
+    monkeypatch.setattr(services, "adapter_for_source", lambda source: Adapter())
+    monkeypatch.setattr(services, "enabled_source_names", lambda: ["mangafire"])
+    monkeypatch.setattr(services.settings, "downloads_enabled", False)
+    with Session() as session:
+        job, created = services.create_pull_job(session, "mangafire")
+        assert created
+        job_id = job.id
+
+    await services.run_pull_job(job_id)
+
+    with Session() as session:
+        job = session.get(SourcePullJob, job_id)
+        assert job.status == "complete"
+        assert job.processed_items == 2
+        assert job.total_items == 2
+        assert job.error == ""
+
+
+async def test_run_pull_jobs_limited_respects_source_pull_concurrency(monkeypatch):
+    running = 0
+    max_running = 0
+    calls = []
+
+    async def fake_run_pull_job(job_id):
+        nonlocal running, max_running
+        calls.append(job_id)
+        running += 1
+        max_running = max(max_running, running)
+        await asyncio.sleep(0)
+        running -= 1
+
+    monkeypatch.setattr(services.settings, "source_pull_concurrency", 1)
+    monkeypatch.setattr(services, "run_pull_job", fake_run_pull_job)
+
+    await services.run_pull_jobs_limited([1, 2, 3])
+
+    assert calls == [1, 2, 3]
+    assert max_running == 1
+
+
+def test_recover_stale_pull_jobs_marks_old_active_jobs_failed(monkeypatch):
+    session = make_session()
+    monkeypatch.setattr(services.settings, "download_stale_minutes", 60)
+    stale = SourcePullJob(
+        source="mangafire",
+        status="running",
+        updated_at=datetime.now(timezone.utc) - timedelta(hours=2),
+    )
+    fresh = SourcePullJob(source="asura", status="running", updated_at=datetime.now(timezone.utc))
+    session.add_all([stale, fresh])
+    session.commit()
+
+    assert services.recover_stale_pull_jobs(session) == 1
+    assert stale.status == "failed"
+    assert stale.error == "recovered stale pull job"
+    assert fresh.status == "running"
 
 
 def test_progress_helpers_record_series_and_chapter_activity():
@@ -855,12 +1081,24 @@ async def test_run_next_download_rejects_corrupt_page_bytes(tmp_path, monkeypatc
     session.flush()
     session.add(DownloadJob(chapter_release_id=release.id))
     session.commit()
+    records = []
+
+    def fake_info(message, *args, **kwargs):
+        records.append(message % args)
+
+    def fake_warning(message, *args, **kwargs):
+        records.append(message % args)
+
+    monkeypatch.setattr(services.logger, "info", fake_info)
+    monkeypatch.setattr(services.logger, "warning", fake_warning)
 
     assert await services.run_next_download(session)
 
     job = session.query(DownloadJob).one()
     assert job.status == "failed"
     assert "invalid image page" in job.error
+    assert any(f"download job started job_id={job.id}" in record for record in records)
+    assert any(f"download job failed job_id={job.id}" in record for record in records)
     assert not list((tmp_path / "library").rglob("*.cbz"))
     assert not list((tmp_path / "library").rglob("*.tmp"))
 
@@ -969,6 +1207,40 @@ async def test_run_next_kavita_sync_maps_series(monkeypatch):
     assert sync_job.status == "complete"
     assert source_series.series.kavita_series_id == 7
     assert chapter.kavita_chapter_id == 42
+
+
+async def test_sync_series_with_kavita_imports_read_progress(monkeypatch):
+    class FakeKavitaClient:
+        configured = True
+
+        async def list_series(self):
+            return [KavitaSeries(id=7, name="Example", library_id=2)]
+
+        async def series_detail(self, series_id):
+            return [KavitaChapter(id=42, number="1", volume_id=3, pages_total=12)]
+
+        async def chapter_progress(self, chapter_id, pages_total=0):
+            return KavitaReadProgress(chapter_id=chapter_id, pages_read=12, pages_total=pages_total)
+
+    session = make_session()
+    monkeypatch.setattr(services.settings, "kavita_sync_read_progress", True)
+    monkeypatch.setattr(services, "configured_kavita_client", lambda: FakeKavitaClient())
+    source_series = merge_series_item(
+        session,
+        SeriesItem(source="mangafire", source_id="gl3", title="Example", url="x"),
+    )
+    release = upsert_release(
+        session,
+        source_series,
+        ChapterItem("mangafire", source_series.source_id, "1", "Chapter 1", "x", None),
+    )
+    session.commit()
+
+    assert await services.sync_series_with_kavita(session, source_series.series)
+
+    progress = session.query(ChapterProgress).filter_by(chapter_id=release.chapter_id).one()
+    assert progress.status == "read"
+    assert progress.read_at is not None
 
 
 async def test_run_next_kavita_sync_retries_no_match(monkeypatch):
@@ -1552,6 +1824,58 @@ async def test_failed_download_uses_backoff_and_is_not_immediately_retried(monke
     assert job.attempts == 1
 
 
+async def test_terminal_download_failure_queues_next_source(monkeypatch):
+    class FailingAdapter:
+        async def download_chapter_pages(self, chapter):
+            raise RuntimeError("terminal failure")
+
+    session = make_session()
+    monkeypatch.setattr(services.settings, "max_download_attempts", 1)
+    monkeypatch.setattr(services, "adapter_for_source", lambda source: FailingAdapter())
+    asura = merge_series_item(
+        session,
+        SeriesItem(source="asura", source_id="asura/example", title="Example", url="a"),
+    )
+    mangafire = merge_series_item(
+        session,
+        SeriesItem(source="mangafire", source_id="mf/example", title="Example", url="m"),
+    )
+    king = merge_series_item(
+        session,
+        SeriesItem(source="kingofshojo", source_id="king/example", title="Example", url="k"),
+    )
+    asura_release = upsert_release(
+        session,
+        asura,
+        ChapterItem("asura", asura.source_id, "1", "Chapter 1", "a", None),
+    )
+    upsert_release(
+        session,
+        mangafire,
+        ChapterItem("mangafire", mangafire.source_id, "1", "Chapter 1", "m", None),
+    )
+    king_release = upsert_release(
+        session,
+        king,
+        ChapterItem("kingofshojo", king.source_id, "1", "Chapter 1", "k", None),
+    )
+    asura_release.downloadable_after = None
+    session.add(DownloadJob(chapter_release_id=asura_release.id, priority=10))
+    session.commit()
+
+    assert await services.run_next_download(session)
+
+    jobs = {
+        session.get(ChapterRelease, job.chapter_release_id).source: job
+        for job in session.query(DownloadJob).all()
+    }
+    assert jobs["asura"].status == "failed"
+    assert jobs["mangafire"].status == "queued"
+    assert jobs["mangafire"].priority == 11
+    assert "kingofshojo" not in jobs
+    assert king_release.id
+
+
 def test_manual_merge_recomputes_best_source_for_duplicate_chapter():
     session = make_session()
     low = merge_series_item(
@@ -1650,6 +1974,32 @@ async def test_poll_source_continues_when_one_item_fails(monkeypatch):
     assert health.consecutive_failures == 0
     assert health.enabled
     assert health.last_error == "1 item failures"
+
+
+async def test_poll_source_reports_total_and_processed_progress(monkeypatch):
+    class Adapter:
+        async def list_recent(self):
+            return [
+                SeriesItem(source="mangafire", source_id="good", title="Good", url="good"),
+                SeriesItem(source="mangafire", source_id="bad", title="Bad", url="bad"),
+            ]
+
+        async def get_chapters(self, item):
+            if item.source_id == "bad":
+                raise RuntimeError("detail failed")
+            return [ChapterItem("mangafire", item.source_id, "1", "Chapter 1", item.url, None)]
+
+    session = make_session()
+    progress = []
+    monkeypatch.setattr(services, "adapter_for_source", lambda source: Adapter())
+
+    assert await services.poll_source(
+        session,
+        "mangafire",
+        progress=lambda processed, total: progress.append((processed, total)),
+    ) == 1
+
+    assert progress == [(0, 2), (1, 2), (2, 2)]
 
 
 async def test_poll_source_failed_item_does_not_leave_dangling_cover_path(tmp_path, monkeypatch):
@@ -1789,6 +2139,59 @@ async def test_poll_all_sources_continues_after_source_failure(monkeypatch):
     assert result["mangafire"]["ok"]
     assert session.query(Series).filter_by(title="Good").one()
     assert session.get(SourceHealth, "asura").last_error == "source down"
+
+
+def test_cleanup_bad_discovery_rows_removes_empty_pseudo_series():
+    session = make_session()
+    source_series = merge_series_item(
+        session,
+        SeriesItem(source="kingofshojo", source_id="text-mode", title="Text Mode", url="x"),
+    )
+    upsert_release(
+        session,
+        source_series,
+        ChapterItem("kingofshojo", source_series.source_id, "{{ number }}", "{{ title }}", "x", None),
+    )
+    session.add(MatchCandidate(source_series_id=source_series.id, candidate_series_id=source_series.series_id))
+    session.commit()
+
+    result = services.cleanup_bad_discovery_rows(session)
+
+    assert result["chapters"] == 1
+    assert result["series"] == 1
+    assert session.query(Chapter).count() == 0
+    assert session.query(SourceSeries).count() == 0
+    assert session.query(Series).count() == 0
+    assert session.query(MatchCandidate).count() == 0
+
+
+def test_cleanup_bad_discovery_rows_keeps_pseudo_series_with_files(tmp_path):
+    session = make_session()
+    source_series = merge_series_item(
+        session,
+        SeriesItem(source="kingofshojo", source_id="manhwa", title="Manhwa", url="x"),
+    )
+    release = upsert_release(
+        session,
+        source_series,
+        ChapterItem("kingofshojo", source_series.source_id, "1", "Chapter 1", "x", None),
+    )
+    session.flush()
+    session.add(
+        DownloadedFile(
+            chapter_id=release.chapter_id,
+            chapter_release_id=release.id,
+            source="kingofshojo",
+            path=str(tmp_path / "chapter.cbz"),
+        )
+    )
+    session.commit()
+
+    result = services.cleanup_bad_discovery_rows(session)
+
+    assert result["series"] == 0
+    assert session.query(Series).count() == 1
+    assert session.query(SourceSeries).count() == 1
 
 
 def test_existing_source_refreshes_parent_metadata():
@@ -2222,6 +2625,7 @@ async def test_drain_download_queue_runs_until_no_ready_jobs(monkeypatch):
         return calls <= 2
 
     monkeypatch.setattr(services, "run_next_download", fake_run_next_download)
+    monkeypatch.setattr(services.settings, "download_concurrency", 1)
 
     assert await drain_download_queue(session) == 2
     assert calls == 3

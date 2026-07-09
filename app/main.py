@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import logging
 import asyncio
+import json
 import secrets
 import hashlib
 import random
+import time
 from html import escape
 from datetime import datetime, timedelta, timezone
 from contextlib import asynccontextmanager
@@ -12,7 +14,14 @@ from pathlib import Path
 from urllib.parse import urlencode
 
 from fastapi import Depends, FastAPI, Form, Request
-from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
+from fastapi.responses import (
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    Response,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import func, select
@@ -25,27 +34,34 @@ from app.models import (
     ActivityEvent,
     Chapter,
     ChapterProgress,
+    ChapterRelease,
     DownloadJob,
     KavitaSyncJob,
     MatchCandidate,
     Series,
     SeriesProgress,
     SourceHealth,
+    SourcePullJob,
 )
 from app.scheduler import create_scheduler
 from app.services import (
     FIRST_IMPORT_CHAPTERS,
+    cleanup_bad_discovery_rows,
+    create_pull_job,
     drain_download_queue,
     drain_kavita_sync_queue,
     bulk_update_match_candidates,
     cleanup_replaced_files,
+    commit_with_retry,
     keep_match_candidate_separate,
+    chapter_platform_release_time,
+    chapter_sort_key,
     kavita_chapter_url,
     kavita_series_url,
     merge_match_candidate,
-    newest_chapter_time,
-    poll_all_sources,
-    poll_source,
+    release_display_time,
+    series_latest_platform_release_time,
+    pull_status,
     pending_kavita_sync_series_count,
     queue_chapter_download,
     queue_downloads,
@@ -54,6 +70,8 @@ from app.services import (
     queue_pending_kavita_syncs,
     recover_stale_download_jobs,
     recover_stale_kavita_sync_jobs,
+    recover_stale_pull_jobs,
+    refresh_missing_covers,
     rescan_source_series,
     retry_download_job,
     retry_failed_downloads,
@@ -61,6 +79,8 @@ from app.services import (
     retry_kavita_sync_job,
     run_next_download,
     run_next_kavita_sync,
+    run_pull_job,
+    run_pull_jobs_limited,
     set_chapter_progress,
     set_series_progress,
     mark_series_caught_up,
@@ -70,6 +90,23 @@ from app.services import (
 from app.settings import settings
 
 
+def configure_logging() -> None:
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(
+            level=logging.INFO,
+            format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        )
+    else:
+        root.setLevel(logging.INFO)
+    for logger_name in ("app", "app.main", "app.services", "app.scheduler"):
+        app_logger = logging.getLogger(logger_name)
+        app_logger.disabled = False
+        app_logger.propagate = True
+        app_logger.setLevel(logging.INFO)
+
+
+configure_logging()
 logger = logging.getLogger(__name__)
 SOURCE_LABELS = {
     "asura": "Asura",
@@ -86,6 +123,9 @@ async def lifespan(app: FastAPI):
     with SessionLocal() as session:
         recover_stale_download_jobs(session)
         recover_stale_kavita_sync_jobs(session)
+        if hasattr(session, "scalars"):
+            recover_stale_pull_jobs(session)
+            cleanup_bad_discovery_rows(session)
     logger.info("stale job recovery complete")
     scheduler = None
     app.state.scheduler = None
@@ -127,6 +167,47 @@ templates = Jinja2Templates(directory="app/templates")
 templates.env.filters["priority"] = source_priority_label
 templates.env.filters["relative_time"] = lambda value: relative_time(value)
 templates.env.globals["csrf_input"] = lambda: csrf_input()
+
+
+def log_background_task(coroutine, description: str) -> asyncio.Task:
+    task = asyncio.create_task(coroutine)
+
+    def report_result(done: asyncio.Task) -> None:
+        try:
+            done.result()
+        except asyncio.CancelledError:
+            logger.info("background task cancelled: %s", description)
+        except Exception:
+            logger.exception("background task failed: %s", description)
+
+    task.add_done_callback(report_result)
+    logger.info("background task scheduled: %s", description)
+    return task
+
+
+@app.middleware("http")
+async def request_logging_middleware(request: Request, call_next):
+    started_at = time.perf_counter()
+    try:
+        response = await call_next(request)
+    except Exception:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        logger.exception(
+            "request failed method=%s path=%s duration_ms=%.1f",
+            request.method,
+            request.url.path,
+            elapsed_ms,
+        )
+        raise
+    elapsed_ms = (time.perf_counter() - started_at) * 1000
+    logger.info(
+        "request complete method=%s path=%s status=%s duration_ms=%.1f",
+        request.method,
+        request.url.path,
+        response.status_code,
+        elapsed_ms,
+    )
+    return response
 
 
 @app.middleware("http")
@@ -196,13 +277,11 @@ def relative_time(value) -> str:
     days = hours // 24
     if days < 7:
         return f"{days}d ago"
-    if days < 14:
-        return "last week"
     return value.date().isoformat()
 
 
 def discovery_item(series: Series) -> dict:
-    chapters = sorted(series.chapters, key=newest_chapter_time, reverse=True)
+    chapters = sorted(series.chapters, key=chapter_sort_key, reverse=True)
     chapter_rows = []
     seen_numbers = set()
     for chapter in chapters:
@@ -213,7 +292,7 @@ def discovery_item(series: Series) -> dict:
             chapter.releases,
             key=lambda release: (
                 source_priority_label(release.source),
-                release.published_at or release.first_seen_at,
+                release_display_time(release),
                 release.id,
             ),
             reverse=True,
@@ -225,7 +304,7 @@ def discovery_item(series: Series) -> dict:
                 "number": chapter.number,
                 "title": chapter.title or (release.title if release else ""),
                 "source": chapter.best_source or (release.source if release else ""),
-                "published_at": (release.published_at or release.first_seen_at) if release else None,
+                "published_at": chapter_platform_release_time(chapter) if release else None,
                 "kavita_url": kavita_chapter_url(chapter),
             }
         )
@@ -325,6 +404,7 @@ def notice_context(request: Request) -> dict[str, str]:
         "progress": "Progress updated.",
         "caught-up": f"Marked {count or '0'} chapters read.",
         "cleanup": f"Retention cleanup removed {count or '0'} files.",
+        "covers": f"Refreshed {count or '0'} missing covers.",
         "wtr": f"Kavita Want to Read imported {count or '0'} series.",
         "bulk-matches": f"Updated {count or '0'} match candidates.",
     }
@@ -334,6 +414,14 @@ def notice_context(request: Request) -> dict[str, str]:
 def notice_redirect(path: str, notice: str, **params: object) -> RedirectResponse:
     query = {"notice": notice, **{key: value for key, value in params.items() if value != ""}}
     return RedirectResponse(f"{path}?{urlencode(query)}", status_code=303)
+
+
+def json_or_redirect(request: Request, payload: dict, path: str, notice: str = "", **params: object):
+    if wants_json(request):
+        return JSONResponse(payload)
+    if notice:
+        return notice_redirect(path, notice, **params)
+    return RedirectResponse(path, status_code=303)
 
 
 def truncate_notice_error(value: str, limit: int = 160) -> str:
@@ -439,6 +527,9 @@ def random_mapped_series(series: list[Series]) -> Series | None:
 
 @app.get("/", response_class=HTMLResponse)
 def discovery(request: Request, session: Session = Depends(get_session)):
+    page = max(1, int(request.query_params.get("page", "1") or "1"))
+    page_size = settings.discovery_page_size
+    offset = (page - 1) * page_size
     series = session.scalars(
         select(Series)
         .where(Series.status == "new")
@@ -446,9 +537,10 @@ def discovery(request: Request, session: Session = Depends(get_session)):
             selectinload(Series.sources),
             selectinload(Series.chapters).selectinload(Chapter.releases),
         )
-        .order_by(Series.updated_at.desc())
-        .limit(200)
     ).all()
+    series = sorted(series, key=series_latest_platform_release_time, reverse=True)
+    has_next = len(series) > offset + page_size
+    series = series[offset : offset + page_size]
     enabled_sources = enabled_source_names()
     health_rows = {row.source: row for row in session.scalars(select(SourceHealth)).all()}
     health = [
@@ -466,6 +558,8 @@ def discovery(request: Request, session: Session = Depends(get_session)):
             "enabled_sources": enabled_sources,
             "source_labels": SOURCE_LABELS,
             "pending": request_query_value(request, "pending"),
+            "page": page,
+            "has_next": has_next,
             "active": "discovery",
         },
     )
@@ -488,25 +582,32 @@ def library(request: Request, session: Session = Depends(get_session)):
         )
         .order_by(Series.updated_at.desc())
     ).all()
-    jobs = session.scalars(
-        select(DownloadJob).order_by(DownloadJob.updated_at.desc()).limit(20)
-    ).all()
-    kavita_jobs = session.scalars(
-        select(KavitaSyncJob).order_by(KavitaSyncJob.updated_at.desc()).limit(20)
-    ).all()
     return templates.TemplateResponse(
         request,
         "library.html",
         {
             "series": rows,
-            "jobs": jobs,
-            "kavita_jobs": kavita_jobs,
-            "operations": operations_status(request, session),
             "notice": notice_context(request),
             "highlights": library_highlights(highlighted_rows, session),
+            "enabled_sources": enabled_source_names(),
+            "source_labels": SOURCE_LABELS,
             "view": request.query_params.get("view", "list"),
             "filter": request.query_params.get("filter", "all"),
             "active": "library",
+        },
+    )
+
+
+@app.get("/info", response_class=HTMLResponse)
+def info(request: Request, session: Session = Depends(get_session)):
+    return templates.TemplateResponse(
+        request,
+        "info.html",
+        {
+            "operations": operations_status(request, session),
+            "jobs_payload": jobs_status_payload(session),
+            "notice": notice_context(request),
+            "active": "info",
         },
     )
 
@@ -521,10 +622,17 @@ def activity(request: Request, session: Session = Depends(get_session)):
     if status:
         query = query.where(ActivityEvent.status == status)
     events = session.scalars(query.order_by(ActivityEvent.created_at.desc()).limit(200)).all()
+    groups = {
+        "Warnings and errors": [event for event in events if event.status in {"warning", "error"}],
+        "Pulls": [event for event in events if event.kind in {"source_poll", "cleanup"}],
+        "Downloads": [event for event in events if event.kind == "download"],
+        "Kavita": [event for event in events if event.kind.startswith("kavita")],
+        "Progress": [event for event in events if "progress" in event.kind],
+    }
     return templates.TemplateResponse(
         request,
         "activity.html",
-        {"events": events, "kind": kind, "status": status, "active": "activity"},
+        {"events": events, "groups": groups, "kind": kind, "status": status, "active": "activity"},
     )
 
 
@@ -567,43 +675,84 @@ def matches(request: Request, session: Session = Depends(get_session)):
 
 
 @app.post("/series/{series_id}/status")
-def set_status(series_id: int, status: str = Form(...), session: Session = Depends(get_session)):
+def set_status(
+    series_id: int,
+    request: Request,
+    status: str = Form(...),
+    session: Session = Depends(get_session),
+):
     if status not in {"new", "reading", "interested", "ignored"}:
         status = "new"
     series = session.get(Series, series_id)
+    queued = 0
     if series:
         series.status = status
-        session.commit()
-        queue_downloads(session)
-    return RedirectResponse("/", status_code=303)
+        commit_with_retry(session)
+        if status in {"reading", "interested"}:
+            queued = queue_downloads(session)
+    return json_or_redirect(
+        request,
+        {
+            "ok": series is not None,
+            "series_id": series_id,
+            "status": status,
+            "queued": queued,
+            "message": "Manga queued." if queued else "Manga updated.",
+            "remove": status in {"new", "ignored", "interested"},
+        },
+        "/",
+    )
 
 
 @app.post("/series/{series_id}/progress")
 def update_series_progress(
     series_id: int,
+    request: Request,
     status: str = Form(...),
     note: str = Form(""),
     rating: int | None = Form(None),
     session: Session = Depends(get_session),
 ):
     set_series_progress(session, series_id, status, note=note, rating=rating)
-    return notice_redirect("/library", "progress")
+    return json_or_redirect(
+        request,
+        {"ok": True, "series_id": series_id, "status": status, "message": "Progress updated."},
+        "/library",
+        "progress",
+    )
 
 
 @app.post("/series/{series_id}/caught-up")
-def caught_up(series_id: int, session: Session = Depends(get_session)):
+def caught_up(series_id: int, request: Request, session: Session = Depends(get_session)):
     count = mark_series_caught_up(session, series_id)
-    return notice_redirect("/library", "caught-up", count=count)
+    return json_or_redirect(
+        request,
+        {
+            "ok": True,
+            "series_id": series_id,
+            "count": count,
+            "message": f"Marked {count} chapters read.",
+        },
+        "/library",
+        "caught-up",
+        count=count,
+    )
 
 
 @app.post("/chapters/{chapter_id}/progress")
 def update_chapter_progress(
     chapter_id: int,
+    request: Request,
     status: str = Form(...),
     session: Session = Depends(get_session),
 ):
     set_chapter_progress(session, chapter_id, status)
-    return notice_redirect("/library", "progress")
+    return json_or_redirect(
+        request,
+        {"ok": True, "chapter_id": chapter_id, "status": status, "message": "Progress updated."},
+        "/library",
+        "progress",
+    )
 
 
 @app.get("/series/{series_id}/open")
@@ -615,8 +764,9 @@ async def open_series(series_id: int, session: Session = Depends(get_session)):
     if url:
         return RedirectResponse(url, status_code=303)
     series.status = "interested"
-    session.commit()
-    queue_newest_missing_chapters(session, series, FIRST_IMPORT_CHAPTERS)
+    commit_with_retry(session)
+    queued = queue_newest_missing_chapters(session, series, FIRST_IMPORT_CHAPTERS)
+    logger.info("series queued series_id=%s title=%s queued_chapters=%s", series.id, series.title, queued)
     if any(chapter.downloaded_source and not chapter.kavita_chapter_id for chapter in series.chapters):
         queue_kavita_sync(session, series)
     return RedirectResponse("/?pending=kavita-import", status_code=303)
@@ -631,106 +781,495 @@ async def open_chapter(chapter_id: int, session: Session = Depends(get_session))
     if url:
         return RedirectResponse(url, status_code=303)
     chapter.series.status = "interested"
-    session.commit()
+    commit_with_retry(session)
     if chapter.downloaded_source and not chapter.kavita_chapter_id:
         folder_path = Path(chapter.cbz_path).parent if chapter.cbz_path else None
         queue_kavita_sync(session, chapter.series, folder_path)
+        logger.info("chapter queued for Kavita sync chapter_id=%s series_id=%s", chapter.id, chapter.series_id)
     else:
-        queue_chapter_download(session, chapter)
+        queued = queue_chapter_download(session, chapter)
+        logger.info(
+            "chapter download queued chapter_id=%s series_id=%s chapter=%s queued=%s",
+            chapter.id,
+            chapter.series_id,
+            chapter.number,
+            queued,
+        )
     return RedirectResponse("/?pending=kavita-chapter", status_code=303)
 
 
 @app.post("/poll/{source}")
-async def poll(source: str, session: Session = Depends(get_session)):
+async def poll(source: str, request: Request, session: Session = Depends(get_session)):
+    return await pull(source, request, session)
+
+
+@app.post("/pull/{source}")
+async def pull(source: str, request: Request, session: Session = Depends(get_session)):
     if source in enabled_source_names():
-        await poll_source(session, source)
+        job, created = create_pull_job(session, source)
+        if created:
+            log_background_task(run_pull_job(job.id), f"pull source={source} job_id={job.id}")
+            if wants_json(request):
+                return JSONResponse(
+                    {
+                        "ok": True,
+                        "created": True,
+                        "message": f"Queued {SOURCE_LABELS.get(source, source)} pull.",
+                        "job": pull_job_payload(job),
+                    }
+                )
+            return RedirectResponse("/", status_code=303)
+        if wants_json(request):
+            return JSONResponse(
+                {
+                    "ok": True,
+                    "created": False,
+                    "message": f"{SOURCE_LABELS.get(source, source)} is already pulling.",
+                    "job": pull_job_payload(job),
+                }
+            )
+        return RedirectResponse("/?pending=pull-existing", status_code=303)
+    if wants_json(request):
+        return JSONResponse({"ok": False, "message": "Source is not enabled."}, status_code=400)
     return RedirectResponse("/", status_code=303)
 
 
 @app.post("/poll-all")
-async def poll_all(session: Session = Depends(get_session)):
-    results = await poll_all_sources(session)
-    ok_count = sum(1 for result in results.values() if result["ok"])
+async def poll_all(request: Request, session: Session = Depends(get_session)):
+    return await pull_all(request, session)
+
+
+@app.post("/pull-all")
+async def pull_all(request: Request, session: Session = Depends(get_session)):
+    created = 0
+    job_ids = []
+    jobs = []
+    include_payload = wants_json(request)
+    for source in enabled_source_names():
+        job, job_created = create_pull_job(session, source)
+        if job_created:
+            created += 1
+            job_ids.append(job.id)
+        if include_payload:
+            jobs.append(pull_job_payload(job))
+    if job_ids:
+        log_background_task(run_pull_jobs_limited(job_ids), f"pull-all job_ids={job_ids}")
+    if wants_json(request):
+        return JSONResponse(
+            {
+                "ok": True,
+                "created": created,
+                "jobs": jobs,
+                "message": f"Queued {created} pull jobs." if created else "Sources are already pulling.",
+            }
+        )
     return RedirectResponse(
-        f"/?pending=poll-all&ok={ok_count}&total={len(results)}",
+        "/?pending=pull-all" if created else "/?pending=pull-existing",
         status_code=303,
     )
 
 
+@app.get("/api/pull-status")
+def api_pull_status(session: Session = Depends(get_session)):
+    return pull_status(session)
+
+
+def wants_json(request: Request) -> bool:
+    return "application/json" in request.headers.get("accept", "")
+
+
+def iso_time(value) -> str:
+    return value.isoformat() if value else ""
+
+
+def download_job_payload(job: DownloadJob, session: Session) -> dict:
+    release = session.get(ChapterRelease, job.chapter_release_id)
+    chapter = release.chapter if release else None
+    series = chapter.series if chapter else None
+    return {
+        "id": job.id,
+        "kind": "download",
+        "status": job.status,
+        "attempts": job.attempts,
+        "priority": job.priority,
+        "job_type": job.job_type,
+        "error": job.error,
+        "retry_after": iso_time(job.retry_after),
+        "created_at": iso_time(job.created_at),
+        "updated_at": iso_time(job.updated_at),
+        "retryable": job.status == "failed",
+        "chapter_release_id": job.chapter_release_id,
+        "source": release.source if release else "",
+        "series_id": series.id if series else None,
+        "series_title": series.title if series else "",
+        "chapter_id": chapter.id if chapter else None,
+        "chapter_number": chapter.number if chapter else "",
+    }
+
+
+ACTIVE_JOB_STATUSES = {"queued", "running", "delayed"}
+PROCESSED_DOWNLOAD_STATUSES = {"complete", "failed", "skipped"}
+
+
+def download_group_status(chapter_jobs: list[dict]) -> str:
+    statuses = {job["status"] for job in chapter_jobs}
+    if "running" in statuses:
+        return "running"
+    if "queued" in statuses:
+        return "queued"
+    if "delayed" in statuses:
+        return "delayed"
+    if "failed" in statuses:
+        return "failed"
+    return "complete"
+
+
+def download_group_payload(series_id: int | None, chapter_jobs: list[dict]) -> dict:
+    sorted_jobs = sorted(chapter_jobs, key=lambda job: job.get("updated_at", ""), reverse=True)
+    counts = {
+        status: sum(1 for job in chapter_jobs if job["status"] == status)
+        for status in ("queued", "running", "delayed", "complete", "failed", "skipped")
+    }
+    processed = sum(1 for job in chapter_jobs if job["status"] in PROCESSED_DOWNLOAD_STATUSES)
+    total = len(chapter_jobs)
+    latest = sorted_jobs[0] if sorted_jobs else {}
+    title = latest.get("series_title") or "Unknown series"
+    status = download_group_status(chapter_jobs)
+    group_id = series_id if series_id is not None else f"unknown-{latest.get('id', '0')}"
+    return {
+        "id": group_id,
+        "kind": "download_series",
+        "status": status,
+        "processed": processed,
+        "total": total,
+        "active": status in ACTIVE_JOB_STATUSES,
+        "retryable": any(job.get("retryable") for job in chapter_jobs),
+        "series_id": series_id,
+        "series_title": title,
+        "updated_at": latest.get("updated_at", ""),
+        "created_at": min((job.get("created_at", "") for job in chapter_jobs), default=""),
+        "error": next((job.get("error", "") for job in sorted_jobs if job.get("error")), ""),
+        "counts": counts,
+        "chapters": sorted_jobs,
+    }
+
+
+def grouped_download_payloads(jobs: list[DownloadJob], session: Session) -> list[dict]:
+    grouped: dict[int | None, list[dict]] = {}
+    for job in jobs:
+        payload = download_job_payload(job, session)
+        grouped.setdefault(payload["series_id"], []).append(payload)
+    return sorted(
+        (download_group_payload(series_id, chapter_jobs) for series_id, chapter_jobs in grouped.items()),
+        key=lambda group: group.get("updated_at", ""),
+        reverse=True,
+    )
+
+
+def kavita_job_payload(job: KavitaSyncJob) -> dict:
+    series = job.series
+    return {
+        "id": job.id,
+        "kind": "kavita",
+        "status": job.status,
+        "attempts": job.attempts,
+        "error": job.error,
+        "retry_after": iso_time(job.retry_after),
+        "created_at": iso_time(job.created_at),
+        "updated_at": iso_time(job.updated_at),
+        "retryable": job.status in {"failed", "skipped"},
+        "series_id": job.series_id,
+        "series_title": series.title if series else "",
+        "folder_path": job.folder_path,
+    }
+
+
+def pull_job_payload(job: SourcePullJob) -> dict:
+    return {
+        "id": job.id,
+        "kind": "pull",
+        "source": job.source,
+        "status": job.status,
+        "processed": job.processed_items,
+        "total": job.total_items,
+        "error": job.error,
+        "created_at": iso_time(job.created_at),
+        "updated_at": iso_time(job.updated_at),
+        "completed_at": iso_time(job.completed_at),
+        "retryable": False,
+    }
+
+
+def jobs_status_payload(session: Session) -> dict:
+    downloads = session.scalars(
+        select(DownloadJob).order_by(DownloadJob.updated_at.desc(), DownloadJob.id.desc()).limit(100)
+    ).all()
+    kavita_jobs = session.scalars(
+        select(KavitaSyncJob).order_by(KavitaSyncJob.updated_at.desc(), KavitaSyncJob.id.desc()).limit(25)
+    ).all()
+    pull_jobs = session.scalars(
+        select(SourcePullJob).order_by(SourcePullJob.updated_at.desc(), SourcePullJob.id.desc()).limit(25)
+    ).all()
+    active_pulls = [job for job in pull_jobs if job.status in {"queued", "running"}]
+    download_groups = grouped_download_payloads(downloads, session)
+    pull_total = sum(job.total_items for job in active_pulls)
+    pull_processed = sum(job.processed_items for job in active_pulls)
+    active_downloads = sum(1 for job in download_groups if job["active"])
+    active_kavita = sum(1 for job in kavita_jobs if job.status in {"queued", "running"})
+    return {
+        "overall": {
+            "active": bool(active_pulls or active_downloads or active_kavita),
+            "processed": pull_processed,
+            "total": pull_total,
+            "active_downloads": active_downloads,
+            "active_kavita": active_kavita,
+        },
+        "pulls": [pull_job_payload(job) for job in pull_jobs],
+        "downloads": download_groups,
+        "kavita": [kavita_job_payload(job) for job in kavita_jobs],
+        "counts": {
+            "downloads": {
+                status: count
+                for status, count in session.execute(
+                    select(DownloadJob.status, func.count()).group_by(DownloadJob.status)
+                )
+            },
+            "kavita": {
+                status: count
+                for status, count in session.execute(
+                    select(KavitaSyncJob.status, func.count()).group_by(KavitaSyncJob.status)
+                )
+            },
+            "pulls": {
+                status: count
+                for status, count in session.execute(
+                    select(SourcePullJob.status, func.count()).group_by(SourcePullJob.status)
+                )
+            },
+        },
+    }
+
+
+@app.get("/api/jobs/status")
+def api_jobs_status(session: Session = Depends(get_session)):
+    return jobs_status_payload(session)
+
+
+def sse_event(event: str, data: dict) -> str:
+    return f"event: {event}\ndata: {json.dumps(data, default=str, separators=(',', ':'))}\n\n"
+
+
+def job_identity(job: dict) -> str:
+    return f"{job.get('kind')}:{job.get('id')}"
+
+
+@app.get("/api/jobs/events")
+async def api_jobs_events(request: Request):
+    async def stream():
+        seen: set[str] = set()
+        with SessionLocal() as session:
+            payload = jobs_status_payload(session)
+        for collection in ("pulls", "downloads", "kavita"):
+            seen.update(job_identity(job) for job in payload.get(collection, []))
+        yield sse_event("snapshot", payload)
+        while not await request.is_disconnected():
+            await asyncio.sleep(2)
+            with SessionLocal() as session:
+                payload = jobs_status_payload(session)
+            current: set[str] = set()
+            new_jobs: list[dict] = []
+            for collection in ("pulls", "downloads", "kavita"):
+                for job in payload.get(collection, []):
+                    identity = job_identity(job)
+                    current.add(identity)
+                    if identity not in seen:
+                        new_jobs.append(job)
+            for job in new_jobs:
+                yield sse_event("new-job", {"job": job})
+            seen.update(current)
+            yield sse_event("snapshot", payload)
+        yield sse_event("heartbeat", {"ok": True})
+
+    return StreamingResponse(
+        stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.post("/queue-downloads")
-def queue(session: Session = Depends(get_session)):
-    queue_downloads(session)
-    return RedirectResponse("/library", status_code=303)
+def queue(request: Request, session: Session = Depends(get_session)):
+    count = queue_downloads(session)
+    return json_or_redirect(
+        request,
+        {"ok": True, "queued": count, "message": f"Queued {count} downloads."},
+        "/info",
+    )
 
 
 @app.post("/run-download")
-async def run_download(session: Session = Depends(get_session)):
-    await run_next_download(session)
-    return RedirectResponse("/library", status_code=303)
+async def run_download(request: Request, session: Session = Depends(get_session)):
+    processed = await run_next_download(session)
+    return json_or_redirect(
+        request,
+        {"ok": True, "processed": processed, "message": "Download job processed." if processed else "No ready download job."},
+        "/info",
+    )
 
 
 @app.post("/drain-downloads")
-async def drain_downloads(session: Session = Depends(get_session)):
+async def drain_downloads(request: Request, session: Session = Depends(get_session)):
     count = await drain_download_queue(session)
-    return notice_redirect("/library", "download-drain", count=count)
+    return json_or_redirect(
+        request,
+        {"ok": True, "count": count, "message": f"Download drain processed {count} jobs."},
+        "/info",
+        "download-drain",
+        count=count,
+    )
 
 
 @app.post("/run-kavita-sync")
-async def run_kavita_sync(session: Session = Depends(get_session)):
+async def run_kavita_sync(request: Request, session: Session = Depends(get_session)):
     queue_pending_kavita_syncs(session)
-    await run_next_kavita_sync(session)
-    return RedirectResponse("/library", status_code=303)
+    processed = await run_next_kavita_sync(session)
+    return json_or_redirect(
+        request,
+        {"ok": True, "processed": processed, "message": "Kavita sync processed." if processed else "No ready Kavita sync job."},
+        "/info",
+    )
 
 
 @app.post("/drain-kavita-sync")
-async def drain_kavita_sync(session: Session = Depends(get_session)):
+async def drain_kavita_sync(request: Request, session: Session = Depends(get_session)):
     count = await drain_kavita_sync_queue(session)
-    return notice_redirect("/library", "kavita-drain", count=count)
+    return json_or_redirect(
+        request,
+        {"ok": True, "count": count, "message": f"Kavita drain processed {count} jobs."},
+        "/info",
+        "kavita-drain",
+        count=count,
+    )
 
 
 @app.post("/maintenance/cleanup-retention")
-def cleanup_retention(session: Session = Depends(get_session)):
+def cleanup_retention(request: Request, session: Session = Depends(get_session)):
     count = cleanup_replaced_files(session)
-    return notice_redirect("/library", "cleanup", count=count)
+    return json_or_redirect(
+        request,
+        {"ok": True, "count": count, "message": f"Retention cleanup removed {count} files."},
+        "/info",
+        "cleanup",
+        count=count,
+    )
+
+
+@app.post("/maintenance/refresh-missing-covers")
+async def refresh_covers(request: Request, session: Session = Depends(get_session)):
+    count = await refresh_missing_covers(session)
+    return json_or_redirect(
+        request,
+        {"ok": True, "count": count, "message": f"Refreshed {count} missing covers."},
+        "/info",
+        "covers",
+        count=count,
+    )
 
 
 @app.post("/kavita/want-to-read/sync")
-async def kavita_want_to_read_sync(session: Session = Depends(get_session)):
+async def kavita_want_to_read_sync(request: Request, session: Session = Depends(get_session)):
     count = await sync_kavita_want_to_read(session)
-    return notice_redirect("/library", "wtr", count=count)
+    return json_or_redirect(
+        request,
+        {"ok": True, "count": count, "message": f"Kavita Want to Read imported {count} series."},
+        "/info",
+        "wtr",
+        count=count,
+    )
 
 
 @app.post("/retry-failed")
-def retry_failed(session: Session = Depends(get_session)):
-    retry_failed_downloads(session)
-    retry_failed_kavita_syncs(session)
-    return RedirectResponse("/library", status_code=303)
+def retry_failed(request: Request, session: Session = Depends(get_session)):
+    downloads = retry_failed_downloads(session)
+    kavita = retry_failed_kavita_syncs(session)
+    if wants_json(request):
+        return JSONResponse(
+            {
+                "ok": True,
+                "downloads": downloads,
+                "kavita": kavita,
+                "message": f"Retried {downloads + kavita} failed jobs.",
+            }
+        )
+    return RedirectResponse("/info", status_code=303)
 
 
 @app.post("/download-jobs/{job_id}/retry")
-def retry_download(job_id: int, session: Session = Depends(get_session)):
-    retry_download_job(session, job_id)
-    return RedirectResponse("/library", status_code=303)
+def retry_download(job_id: int, request: Request, session: Session = Depends(get_session)):
+    ok = retry_download_job(session, job_id)
+    if wants_json(request):
+        job = session.get(DownloadJob, job_id)
+        return JSONResponse(
+            {
+                "ok": ok,
+                "job": download_job_payload(job, session) if job else None,
+                "message": "Download retry queued." if ok else "Download job was not retryable.",
+            }
+        )
+    return RedirectResponse("/info", status_code=303)
 
 
 @app.post("/kavita-sync-jobs/{job_id}/retry")
-def retry_kavita_sync(job_id: int, session: Session = Depends(get_session)):
-    retry_kavita_sync_job(session, job_id)
-    return RedirectResponse("/library", status_code=303)
+def retry_kavita_sync(job_id: int, request: Request, session: Session = Depends(get_session)):
+    ok = retry_kavita_sync_job(session, job_id)
+    if wants_json(request):
+        job = session.get(KavitaSyncJob, job_id)
+        return JSONResponse(
+            {
+                "ok": ok,
+                "job": kavita_job_payload(job) if job else None,
+                "message": "Kavita retry queued." if ok else "Kavita job was not retryable.",
+            }
+        )
+    return RedirectResponse("/info", status_code=303)
 
 
 @app.post("/source-series/{source_series_id}/rescan")
-async def rescan_source_detail(source_series_id: int, session: Session = Depends(get_session)):
+async def rescan_source_detail(
+    source_series_id: int,
+    request: Request,
+    session: Session = Depends(get_session),
+):
     try:
         count = await rescan_source_series(session, source_series_id)
     except Exception as exc:
         logger.warning("source series rescan failed for %s: %s", source_series_id, exc)
+        if wants_json(request):
+            return JSONResponse(
+                {
+                    "ok": False,
+                    "source_series_id": source_series_id,
+                    "message": f"Source chapters rescan failed: {truncate_notice_error(str(exc))}",
+                },
+                status_code=500,
+            )
         return notice_redirect(
             "/library",
             "rescan-error",
             error=truncate_notice_error(str(exc)),
         )
-    return notice_redirect("/library", "rescan", count=count)
+    return json_or_redirect(
+        request,
+        {
+            "ok": True,
+            "source_series_id": source_series_id,
+            "count": count,
+            "message": f"Source chapters rescan found {count} chapters.",
+        },
+        "/library",
+        "rescan",
+        count=count,
+    )
 
 
 @app.post("/sources/{source}/enable")
@@ -742,7 +1281,7 @@ def enable_source(source: str, session: Session = Depends(get_session)):
     health.last_error = ""
     health.consecutive_failures = 0
     session.add(health)
-    session.commit()
+    commit_with_retry(session)
     return RedirectResponse("/", status_code=303)
 
 
@@ -755,7 +1294,7 @@ def disable_source(source: str, session: Session = Depends(get_session)):
     health.last_error = "manually disabled"
     health.consecutive_failures = 0
     session.add(health)
-    session.commit()
+    commit_with_retry(session)
     return RedirectResponse("/", status_code=303)
 
 
