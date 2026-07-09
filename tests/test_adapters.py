@@ -90,6 +90,7 @@ def test_asura_uses_chapter_url_when_label_has_no_number():
         """
         <a href="/comics/example/chapter/1">first chapter</a>
         <a href="/comics/example/chapter/128">latest chapter</a>
+        <div><a href="/comics/example/chapter/7">Chapter 7</a></div>
         """,
         "html.parser",
     )
@@ -102,7 +103,22 @@ def test_asura_uses_chapter_url_when_label_has_no_number():
 
     chapters = AsuraAdapter().parse_chapters(soup, source)
 
-    assert [chapter.number for chapter in chapters] == ["1", "128"]
+    assert [chapter.number for chapter in chapters] == ["7"]
+
+
+def test_asura_accepts_astro_stitched_chapter_images():
+    soup = BeautifulSoup(
+        """
+        <astro-island props="{&quot;pages&quot;:[1,[[0,{&quot;url&quot;:[0,&quot;https://cdn.asurascans.com/asura-images/chapters-stitched/example/1/001.webp?v=1&quot;]}],[0,{&quot;url&quot;:[0,&quot;https://cdn.asurascans.com/asura-images/chapters-stitched/example/1/002.webp?v=1&quot;]}]]]}"></astro-island>
+        <img src="https://cdn.asurascans.com/asura-images/covers/example.webp">
+        """,
+        "html.parser",
+    )
+
+    assert AsuraAdapter().parse_chapter_image_urls(soup) == [
+        "https://cdn.asurascans.com/asura-images/chapters-stitched/example/1/001.webp?v=1",
+        "https://cdn.asurascans.com/asura-images/chapters-stitched/example/1/002.webp?v=1",
+    ]
 
 
 def test_kingofshojo_filters_template_chapters_and_non_reader_images():

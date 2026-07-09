@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from html import unescape
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin
 
@@ -89,6 +90,7 @@ def clean_chapter_title(number: str, title: str, published_at: datetime | None =
                 continue
     title = re.sub(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b", "", title)
     title = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "", title)
+    title = re.sub(r"\b(?:just now|today|yesterday|last week|\d+\s+\w+\s+ago)\b", "", title, flags=re.I)
     title = " ".join(title.split("·")).strip()
     title = " ".join(title.split())
     return title or f"Chapter {number}"
@@ -115,13 +117,20 @@ def extract_image_urls(soup: BeautifulSoup, base_url: str) -> list[str]:
             continue
         urls.extend(extract_urls_from_script(text, base_url))
 
+    for island in soup.select("astro-island[props]"):
+        props = island.get("props")
+        if props:
+            urls.extend(extract_urls_from_script(str(props), base_url))
+
+    urls.extend(extract_urls_from_script(soup.decode(), base_url))
     return dedupe_preserving_order(urls)
 
 
 def extract_urls_from_script(text: str, base_url: str) -> list[str]:
     urls: list[str] = []
-    for raw in re.findall(r"https?://[^'\"\\\s]+", text):
-        cleaned = raw.replace("\\/", "/")
+    text = unescape(text).replace("\\/", "/")
+    for raw in re.findall(r"https?://[^'\"<>\s]+", text):
+        cleaned = raw.rstrip("),];")
         if is_probable_page_image(cleaned):
             urls.append(cleaned)
 
@@ -151,6 +160,7 @@ def extract_urls_from_json(payload, base_url: str) -> list[str]:
 def is_probable_page_image(url: str) -> bool:
     if not url:
         return False
+    url = unescape(str(url)).replace("\\/", "/").strip()
     lowered = url.lower().split("?")[0]
     if not lowered.endswith(IMAGE_EXTENSIONS):
         return False

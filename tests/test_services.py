@@ -1082,8 +1082,9 @@ async def test_run_next_download_rejects_streamed_too_few_pages(tmp_path, monkey
     assert await services.run_next_download(session)
 
     job = session.query(DownloadJob).one()
-    assert job.status == "queued"
+    assert job.status == "delayed"
     assert "only 2 chapter images" in job.error
+    assert job.attempts == 0
     assert not list((tmp_path / "library").rglob("*.tmp"))
 
 
@@ -1094,7 +1095,6 @@ async def test_run_next_download_rejects_corrupt_page_bytes(tmp_path, monkeypatc
 
     session = make_session()
     monkeypatch.setattr(services.settings, "library_root", tmp_path / "library")
-    monkeypatch.setattr(services.settings, "max_download_attempts", 1)
     monkeypatch.setattr(services, "adapter_for_source", lambda source: CorruptAdapter())
     source_series = merge_series_item(
         session,
@@ -1122,10 +1122,11 @@ async def test_run_next_download_rejects_corrupt_page_bytes(tmp_path, monkeypatc
     assert await services.run_next_download(session)
 
     job = session.query(DownloadJob).one()
-    assert job.status == "failed"
+    assert job.status == "delayed"
     assert "invalid image page" in job.error
+    assert job.attempts == 0
     assert any(f"download job started job_id={job.id}" in record for record in records)
-    assert any(f"download job failed job_id={job.id}" in record for record in records)
+    assert any(f"download job delayed by temporary failure job_id={job.id}" in record for record in records)
     assert not list((tmp_path / "library").rglob("*.cbz"))
     assert not list((tmp_path / "library").rglob("*.tmp"))
 
@@ -1903,6 +1904,7 @@ async def test_rate_limited_download_sets_source_cooldown_and_queues_fallback(mo
         ChapterItem("asura", asura.source_id, "1", "Chapter 1", "a", None),
     )
     asura_release.downloadable_after = None
+    asura_release.downloadable_after = None
     fallback_release = upsert_release(
         session,
         mangafire,
@@ -1920,6 +1922,45 @@ async def test_rate_limited_download_sets_source_cooldown_and_queues_fallback(mo
     assert jobs[fallback_release.id].status == "queued"
     health = session.get(SourceHealth, "asura")
     assert services.ensure_aware(health.download_cooldown_until) == retry_at
+
+
+async def test_temporary_content_failure_delays_job_and_queues_fallback(monkeypatch):
+    class TemporaryFailingAdapter:
+        async def download_chapter_pages(self, chapter):
+            raise RuntimeError("only 0 chapter images found; minimum is 3")
+
+    session = make_session()
+    monkeypatch.setattr(services.settings, "download_retry_base_minutes", 15)
+    monkeypatch.setattr(services, "adapter_for_source", lambda source: TemporaryFailingAdapter())
+    asura = merge_series_item(
+        session,
+        SeriesItem(source="asura", source_id="asura/example", title="Example", url="a"),
+    )
+    mangafire = merge_series_item(
+        session,
+        SeriesItem(source="mangafire", source_id="mf/example", title="Example", url="m"),
+    )
+    asura_release = upsert_release(
+        session,
+        asura,
+        ChapterItem("asura", asura.source_id, "1", "Chapter 1", "a", None),
+    )
+    asura_release.downloadable_after = None
+    fallback_release = upsert_release(
+        session,
+        mangafire,
+        ChapterItem("mangafire", mangafire.source_id, "1", "Chapter 1", "m", None),
+    )
+    session.add(DownloadJob(chapter_release_id=asura_release.id))
+    session.commit()
+
+    assert await services.run_next_download(session)
+
+    jobs = {job.chapter_release_id: job for job in session.query(DownloadJob).all()}
+    assert jobs[asura_release.id].status == "delayed"
+    assert jobs[asura_release.id].attempts == 0
+    assert jobs[asura_release.id].retry_after is not None
+    assert jobs[fallback_release.id].status == "queued"
 
 
 async def test_terminal_download_failure_queues_next_source(monkeypatch):

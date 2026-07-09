@@ -168,6 +168,7 @@ app.mount("/covers", StaticFiles(directory=cover_dir), name="covers")
 templates = Jinja2Templates(directory="app/templates")
 templates.env.filters["priority"] = source_priority_label
 templates.env.filters["relative_time"] = lambda value: relative_time(value)
+templates.env.filters["metadata"] = decode_metadata
 templates.env.globals["csrf_input"] = lambda: csrf_input()
 
 
@@ -713,6 +714,10 @@ def matches(request: Request, session: Session = Depends(get_session)):
     candidates = session.scalars(
         select(MatchCandidate)
         .where(MatchCandidate.status == "pending")
+        .options(
+            selectinload(MatchCandidate.source_series),
+            selectinload(MatchCandidate.candidate_series).selectinload(Series.sources),
+        )
         .order_by(MatchCandidate.confidence.desc())
         .limit(100)
     ).all()
@@ -958,6 +963,11 @@ def download_job_payload(job: DownloadJob, session: Session) -> dict:
 
 ACTIVE_JOB_STATUSES = {"queued", "running", "delayed"}
 PROCESSED_DOWNLOAD_STATUSES = {"complete", "failed", "skipped"}
+INFO_JOB_STATUSES = {
+    "active": ("queued", "running", "delayed"),
+    "failed": ("failed",),
+    "completed": ("complete", "skipped"),
+}
 
 
 def download_group_status(chapter_jobs: list[dict]) -> str:
@@ -1015,6 +1025,59 @@ def grouped_download_payloads(jobs: list[DownloadJob], session: Session) -> list
     )
 
 
+def paged_jobs(items: list[dict], page: int, page_size: int) -> dict:
+    total = len(items)
+    total_pages = max(1, (total + page_size - 1) // page_size)
+    page = min(max(page, 1), total_pages)
+    start = (page - 1) * page_size
+    return {
+        "jobs": items[start : start + page_size],
+        "page": page,
+        "page_size": page_size,
+        "total": total,
+        "total_pages": total_pages,
+    }
+
+
+def safe_positive_int(value: str | None, default: int) -> int:
+    try:
+        parsed = int(value or default)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
+
+
+def info_section_jobs(session: Session, section: str) -> list[dict]:
+    statuses = INFO_JOB_STATUSES[section]
+    downloads = session.scalars(
+        select(DownloadJob)
+        .where(DownloadJob.status.in_(statuses))
+        .order_by(DownloadJob.updated_at.desc(), DownloadJob.id.desc())
+    ).all()
+    download_groups = grouped_download_payloads(downloads, session)
+    kavita_jobs = [
+        kavita_job_payload(job)
+        for job in session.scalars(
+            select(KavitaSyncJob)
+            .where(KavitaSyncJob.status.in_(statuses))
+            .order_by(KavitaSyncJob.updated_at.desc(), KavitaSyncJob.id.desc())
+        ).all()
+    ]
+    pull_jobs = [
+        pull_job_payload(job)
+        for job in session.scalars(
+            select(SourcePullJob)
+            .where(SourcePullJob.status.in_(statuses))
+            .order_by(SourcePullJob.updated_at.desc(), SourcePullJob.id.desc())
+        ).all()
+    ]
+    return sorted(
+        [*download_groups, *kavita_jobs, *pull_jobs],
+        key=lambda job: job.get("updated_at", ""),
+        reverse=True,
+    )
+
+
 def kavita_job_payload(job: KavitaSyncJob) -> dict:
     series = job.series
     return {
@@ -1049,7 +1112,12 @@ def pull_job_payload(job: SourcePullJob) -> dict:
     }
 
 
-def jobs_status_payload(session: Session) -> dict:
+def jobs_status_payload(
+    session: Session,
+    *,
+    info_pages: dict[str, int] | None = None,
+    info_page_size: int | None = None,
+) -> dict:
     recover_stale_download_jobs(session)
     recover_stale_kavita_sync_jobs(session)
     group_limit = settings.job_status_group_limit
@@ -1093,7 +1161,7 @@ def jobs_status_payload(session: Session) -> dict:
     }
     active_downloads = sum(download_counts.get(status, 0) for status in ("queued", "running", "delayed"))
     active_kavita = sum(1 for job in kavita_jobs if job.status in {"queued", "running"})
-    return {
+    payload = {
         "overall": {
             "active": bool(active_pulls or active_downloads or active_kavita),
             "processed": pull_processed,
@@ -1120,11 +1188,28 @@ def jobs_status_payload(session: Session) -> dict:
             },
         },
     }
+    if info_pages is not None:
+        page_size = min(max(info_page_size or settings.job_status_group_limit, 1), 100)
+        payload["sections"] = {
+            section: paged_jobs(info_section_jobs(session, section), info_pages.get(section, 1), page_size)
+            for section in INFO_JOB_STATUSES
+        }
+    return payload
 
 
 @app.get("/api/jobs/status")
-def api_jobs_status(session: Session = Depends(get_session)):
-    return jobs_status_payload(session)
+def api_jobs_status(request: Request, session: Session = Depends(get_session)):
+    params = request.query_params
+    wants_sections = any(key in params for key in ("active_page", "failed_page", "completed_page", "page_size"))
+    info_pages = None
+    if wants_sections:
+        info_pages = {
+            "active": safe_positive_int(params.get("active_page"), 1),
+            "failed": safe_positive_int(params.get("failed_page"), 1),
+            "completed": safe_positive_int(params.get("completed_page"), 1),
+        }
+    page_size = safe_positive_int(params.get("page_size"), settings.job_status_group_limit)
+    return jobs_status_payload(session, info_pages=info_pages, info_page_size=page_size)
 
 
 def sse_event(event: str, data: dict) -> str:
@@ -1394,9 +1479,29 @@ def merge_candidate(candidate_id: int, request: Request, session: Session = Depe
     except Exception as exc:
         logger.exception("match merge failed candidate_id=%s", candidate_id)
         session.rollback()
+        candidate = session.get(MatchCandidate, candidate_id)
+        session.add(
+            ActivityEvent(
+                kind="match_merge",
+                status="error",
+                message=f"Merge failed for candidate {candidate_id}: {truncate_notice_error(str(exc))}",
+                source=candidate.source_series.source if candidate and candidate.source_series else "",
+                series_id=candidate.candidate_series_id if candidate else None,
+                metadata_json=json.dumps(
+                    {
+                        "candidate_id": candidate_id,
+                        "source_series_id": candidate.source_series_id if candidate else None,
+                        "target_series_id": candidate.candidate_series_id if candidate else None,
+                        "error": str(exc),
+                    },
+                    sort_keys=True,
+                ),
+            )
+        )
+        commit_with_retry(session)
         if wants_json(request):
-            return JSONResponse({"ok": False, "message": str(exc)}, status_code=500)
-        return RedirectResponse("/matches?notice=merge-error", status_code=303)
+            return JSONResponse({"ok": False, "message": truncate_notice_error(str(exc))}, status_code=500)
+        return notice_redirect("/matches", "merge-error", error=truncate_notice_error(str(exc)))
     if wants_json(request):
         return JSONResponse({"ok": ok, "message": "Merged match." if ok else "Match was not mergeable."})
     return RedirectResponse("/matches", status_code=303)

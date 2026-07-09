@@ -62,6 +62,16 @@ TRACKED_STATUSES = {"reading", "interested"}
 FIRST_IMPORT_CHAPTERS = settings.first_import_chapters
 SERIES_PROGRESS_STATUSES = {"interested", "reading", "caught_up", "paused"}
 CHAPTER_PROGRESS_STATUSES = {"unread", "reading", "read"}
+TEMPORARY_DOWNLOAD_ERROR_MARKERS = (
+    "only 0 chapter images found",
+    "only 1 chapter images found",
+    "only 2 chapter images found",
+    "invalid image page",
+    "peer closed connection without sending complete message body",
+    "incomplete message body",
+    "remoteprotocolerror",
+    "readtimeout",
+)
 
 
 def is_sqlite_locked_error(exc: BaseException) -> bool:
@@ -228,6 +238,9 @@ def merge_series_item(session: Session, item: SeriesItem) -> SourceSeries:
 
 
 def refresh_series_metadata(series: Series, item: SeriesItem) -> None:
+    if should_refresh_series_title(series.title, item.title):
+        series.title = item.title
+        series.normalized_title = normalize_title(item.title)
     if item.cover_url:
         series.cover_url = item.cover_url
     if item.description:
@@ -237,6 +250,18 @@ def refresh_series_metadata(series: Series, item: SeriesItem) -> None:
     series.popularity = max(series.popularity, item.popularity)
     series.external_ids = merge_external_ids(series.external_ids, item.external_ids)
     series.updated_at = utcnow()
+
+
+def should_refresh_series_title(current: str, candidate: str) -> bool:
+    if not candidate:
+        return False
+    if re.match(r"^\s*\d+(?:\.\d+)?\s+", current or "") and not re.match(
+        r"^\s*\d+(?:\.\d+)?\s+", candidate
+    ):
+        return True
+    if "{{" in (current or "") and "{{" not in candidate:
+        return True
+    return False
 
 
 def encode_metadata(value: dict[str, object] | None) -> str:
@@ -361,6 +386,9 @@ def upsert_release(session: Session, source_series: SourceSeries, item: ChapterI
     elif should_replace(chapter.best_source, item.source):
         chapter.best_source = item.source
         chapter.updated_at = utcnow()
+    if should_refresh_chapter_title(chapter.title, item.title):
+        chapter.title = item.title
+        chapter.updated_at = utcnow()
 
     if release:
         release.title = item.title or release.title
@@ -384,6 +412,20 @@ def upsert_release(session: Session, source_series: SourceSeries, item: ChapterI
     )
     session.add(release)
     return release
+
+
+def should_refresh_chapter_title(current: str, candidate: str) -> bool:
+    if not candidate:
+        return False
+    current_lower = (current or "").lower()
+    candidate_lower = candidate.lower()
+    if "{{" in current_lower and "{{" not in candidate_lower:
+        return True
+    if current_lower in {"first chapter", "latest chapter", "chapter"}:
+        return True
+    if re.search(r"\b(?:just now|yesterday|last week|\d+\s+\w+\s+ago)\b", current_lower):
+        return not re.search(r"\b(?:just now|yesterday|last week|\d+\s+\w+\s+ago)\b", candidate_lower)
+    return False
 
 
 PullProgressCallback = Callable[[int, int], None]
@@ -422,6 +464,7 @@ async def poll_source(
             cover_cache_results: list[CoverCacheResult] = []
             for index, item in enumerate(items, start=1):
                 try:
+                    item = await enrich_source_item(adapter, item)
                     chapters = await adapter.get_chapters(item)
                     if source == "mangafire" and not chapters:
                         skipped_items += 1
@@ -1116,6 +1159,42 @@ async def run_next_download(session: Session) -> bool:
     except Exception as exc:
         if staging_path is not None:
             staging_path.unlink(missing_ok=True)
+        if is_temporary_download_error(exc):
+            retry_after = next_retry_after(max(job.attempts, 1))
+            job.attempts = max(job.attempts - 1, 0)
+            job.status = "delayed"
+            job.retry_after = retry_after
+            job.error = str(exc)
+            job.updated_at = utcnow()
+            queued_fallback = queue_next_chapter_download(
+                session,
+                release.chapter,
+                exclude_release_id=release.id,
+                priority=job.priority + 1,
+                job_type=job.job_type,
+            )
+            record_activity(
+                session,
+                "download",
+                "warning",
+                f"{release.source} temporary download failure; retry after {retry_after.isoformat()}: {exc}",
+                source=release.source,
+                series_id=release.chapter.series_id,
+                chapter_id=release.chapter.id,
+                download_job_id=job.id,
+                metadata={"fallback_queued": queued_fallback},
+            )
+            commit_with_retry(session)
+            logger.warning(
+                "download job delayed by temporary failure job_id=%s source=%s chapter_id=%s retry_after=%s fallback=%s reason=%s",
+                job.id,
+                release.source,
+                release.chapter.id,
+                retry_after,
+                queued_fallback,
+                exc,
+            )
+            return True
         if job.attempts >= settings.max_download_attempts:
             job.status = "failed"
             job.retry_after = None
@@ -1387,6 +1466,17 @@ async def close_adapter(adapter: SourceAdapter) -> None:
         await close()
 
 
+async def enrich_source_item(adapter: SourceAdapter, item: SeriesItem) -> SeriesItem:
+    detail = getattr(adapter, "get_series_detail", None)
+    if detail is None:
+        return item
+    try:
+        return await detail(item)
+    except Exception as exc:
+        logger.warning("failed to refresh detail metadata for %s %s: %s", item.source, item.url, exc)
+        return item
+
+
 async def iter_adapter_pages(adapter: SourceAdapter, item: ChapterItem) -> AsyncIterator[bytes]:
     iter_pages = getattr(adapter, "iter_chapter_pages", None)
     if iter_pages is not None:
@@ -1425,11 +1515,18 @@ async def stage_cbz(
             raise RuntimeError(
                 f"only {image_count} chapter images found; "
                 f"minimum is {settings.min_pages_per_chapter}"
-            )
+        )
     except Exception:
         staging_path.unlink(missing_ok=True)
         raise
     return staging_path, final_path, image_count
+
+
+def is_temporary_download_error(exc: BaseException) -> bool:
+    if isinstance(exc, (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout, httpx.ConnectTimeout)):
+        return True
+    text = str(exc).lower()
+    return any(marker in text for marker in TEMPORARY_DOWNLOAD_ERROR_MARKERS)
 
 
 def claim_next_download_job(session: Session) -> DownloadJob | None:
@@ -1601,11 +1698,13 @@ async def refresh_missing_covers(session: Session, limit: int = 100) -> int:
     rows = session.scalars(
         select(SourceSeries)
         .where(SourceSeries.cover_url != "")
-        .where(SourceSeries.cover_path == "")
         .order_by(SourceSeries.id.asc())
-        .limit(limit)
     ).all()
     for source_series in rows:
+        if refreshed >= limit:
+            break
+        if cover_paths_usable(source_series):
+            continue
         result = await cache_cover_image(
             session,
             source_series,
@@ -1623,6 +1722,12 @@ async def refresh_missing_covers(session: Session, limit: int = 100) -> int:
     commit_with_retry(session)
     cleanup_stale_cover_images(results)
     return refreshed
+
+
+def cover_paths_usable(source_series: SourceSeries) -> bool:
+    source_path = Path(source_series.cover_path) if source_series.cover_path else None
+    series_path = Path(source_series.series.cover_path) if source_series.series.cover_path else None
+    return bool(source_path and source_path.exists() and series_path and series_path.exists())
 
 
 def cleanup_stale_cover_images(results: list[CoverCacheResult]) -> None:
@@ -1901,8 +2006,16 @@ async def rescan_source_series(session: Session, source_series_id: int) -> int:
         external_ids=decode_external_ids(source_series.external_ids),
     )
     try:
+        item = await enrich_source_item(adapter, item)
         chapters = await adapter.get_chapters(item)
         with session.begin_nested():
+            refreshed_source = merge_series_item(session, item)
+            source_series.title = refreshed_source.title
+            source_series.cover_url = refreshed_source.cover_url
+            source_series.description = refreshed_source.description
+            source_series.genres = refreshed_source.genres
+            source_series.aliases = refreshed_source.aliases
+            source_series.metadata_json = refreshed_source.metadata_json
             for chapter in chapters:
                 upsert_release(session, source_series, chapter)
             source_series.detail_fetched_at = utcnow()

@@ -198,7 +198,25 @@ h3 {
 .match-row {
   align-items: center;
   display: grid;
-  grid-template-columns: minmax(120px, 180px) 1fr auto;
+  grid-template-columns: minmax(120px, 180px) minmax(90px, 140px) 1fr auto;
+}
+
+.match-pair {
+  display: grid;
+  gap: 10px;
+  grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+}
+
+.match-card {
+  align-items: center;
+  display: grid;
+  gap: 10px;
+  grid-template-columns: auto minmax(0, 1fr);
+}
+
+.match-card h2 {
+  font-size: 16px;
+  margin: 0 0 4px;
 }
 
 .health em {
@@ -865,6 +883,19 @@ button.secondary:hover,
 .job-list {
   display: grid;
   gap: 8px;
+}
+
+.job-pager {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 10px;
+}
+
+.job-pager .muted {
+  margin-left: auto;
 }
 
 .job-columns,

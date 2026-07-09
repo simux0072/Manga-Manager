@@ -143,13 +143,15 @@ The Library page includes operational controls and local reading state:
 - Manual queue drains, retry controls, source rescans, Want to Read sync, repair, and retention cleanup.
 - Activity history at `/activity` and an RSS feed at `/notifications/rss.xml`.
 
-`Repair known manga` rescans known source series, prioritizing tracked manga, removes legacy bad
-placeholder chapter rows that have no downloaded files, and refreshes missing covers. Use it after
-parser fixes or after importing data created by an older version.
+`Repair known manga` rescans known source series, prioritizing tracked manga, refreshes detail
+metadata, removes legacy bad placeholder chapter rows that have no downloaded files, normalizes
+obviously polluted titles, and refreshes missing or broken covers. Use it after parser fixes or
+after importing data created by an older version.
 
 The job drawer is intentionally compact and only shows recent grouped work. The Info page is the
 authoritative operations view: it shows true queued/running/delayed/failed/completed counts and a
-representative page of jobs for large queues.
+pageable in-place browser for active, failed, and completed job sections. Switching Info job pages
+uses JSON and does not refresh the page or jump back to the top.
 
 Source cooldowns appear in Info when a website or CDN rate-limits downloads. Rate-limited jobs are
 delayed until `Retry-After` when the source provides it, or until the configured fallback cooldown
@@ -195,9 +197,10 @@ interval because its CDN may return `429 Too Many Requests` during bursts. Relev
 - `ASURA_RATE_LIMIT_COOLDOWN_MINUTES`: default Asura cooldown when no `Retry-After` header exists.
 - `JOB_STATUS_GROUP_LIMIT`: number of grouped jobs shown per status slice in the live jobs API.
 
-Rate-limit errors do not consume normal download attempts. Content errors such as invalid image
-bytes, too few page images, or missing chapters still use the configured retry/backoff behavior and
-may fall back to another source after `MAX_DOWNLOAD_ATTEMPTS`.
+Rate-limit errors do not consume normal download attempts. Temporary content/CDN errors such as
+incomplete image bodies, invalid image bytes, or too few page images delay the current job and can
+queue a lower-priority fallback source for the same chapter. Asura reader extraction supports both
+`asura-images/chapters/` and older `asura-images/chapters-stitched/` page URLs.
 
 ## Local Testing
 

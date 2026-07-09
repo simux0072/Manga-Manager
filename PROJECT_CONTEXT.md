@@ -228,8 +228,9 @@ Current behavior:
 HTTP 429s are represented as source rate limits, not content failures. They do not consume normal
 download attempts. The source receives a cooldown from `Retry-After` or the configured fallback, the
 current job becomes `delayed`, and a lower-priority fallback release is queued when available.
-Content errors such as invalid image bytes or too few pages still use retry/backoff and terminal
-fallback behavior. Cover images are used for metadata/covers only, not as fake chapter pages.
+Temporary content/CDN errors such as incomplete image bodies, invalid image bytes, or too few pages
+also delay the current job without consuming a normal attempt and can queue a lower-priority
+fallback release. Cover images are used for metadata/covers only, not as fake chapter pages.
 
 The download workflow does not keep every page in memory at once. Each page is fetched, validated by
 size and image decodability, and written to the staged CBZ before the next page is fetched. Temporary
@@ -284,7 +285,8 @@ chapters are skipped during discovery.
 The top-bar jobs drawer is a compact status surface. It groups queued/running/delayed, completed,
 and failed work, preserves expanded section state across SSE refreshes, and caps completed/failed
 rows for readability. `/info` is the authoritative job view: it reports true status counts even when
-the rendered grouped rows are capped.
+the drawer rows are capped. Info job sections use in-place pagination for active, failed, and
+completed grouped jobs; page switches fetch JSON and do not refresh the browser page.
 
 `repair_known_series(session)` backs the Info `Repair known manga` action. It:
 
@@ -292,7 +294,7 @@ the rendered grouped rows are capped.
 2. Removes bad placeholder chapter rows such as template `{{number}}`, `first chapter`, or
    `latest chapter` when they have no downloaded files.
 3. Rescans known source-series rows, prioritizing tracked series.
-4. Refreshes missing covers.
+4. Refreshes source detail metadata, visibly polluted titles, and missing or broken covers.
 5. Records a repair activity event.
 
 Kavita behavior:
@@ -435,6 +437,7 @@ The latest robustness pass implemented:
 - Expanded `/healthz` scheduler and source health data.
 - Resilient `/poll-all` through `poll_all_sources()`.
 - More consistent metadata refresh for existing and newly matched source rows.
+- Asura reader extraction supports both normal `chapters/` and older `chapters-stitched/` CDN paths.
 - `MAX_PAGE_BYTES` enforcement for image downloads.
 - `MAX_COVER_BYTES` enforcement for cover downloads.
 - Strict downloaded-page image validation before CBZ writes.

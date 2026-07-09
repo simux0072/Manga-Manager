@@ -125,6 +125,17 @@
           </div>
           <div class="library-card-main">
             <h2>{{ item.title }}</h2>
+            <div class="sources">
+              {% for source in item.sources %}
+                {% set metadata = source.metadata_json|metadata %}
+                <span data-source="{{ source.source }}">
+                  {{ source.source }}
+                  {% if metadata.rating %} · rating {{ metadata.rating }}{% endif %}
+                  {% if metadata.follows %} · {{ metadata.follows }} bookmarks{% endif %}
+                  {% if metadata.chapters %} · {{ metadata.chapters }} chapters{% endif %}
+                </span>
+              {% endfor %}
+            </div>
             <p>Status: {{ item.status }} · Progress: {{ item.progress.status if item.progress else "unread" }}</p>
             <p>{{ item.chapters|length }} chapters known · {{ "Kavita ready" if item.kavita_series_id and item.kavita_library_id else "Pending Kavita sync" if state.downloaded_unmapped else "Not downloaded yet" }}</p>
           </div>

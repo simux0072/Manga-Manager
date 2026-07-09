@@ -763,7 +763,7 @@ def test_api_jobs_status_includes_all_job_types():
     session.add(SourcePullJob(source="mangafire", status="running", total_items=10, processed_items=4))
     session.commit()
     try:
-        payload = main.api_jobs_status(session)
+        payload = main.api_jobs_status(make_request("/api/jobs/status"), session)
     finally:
         session.close()
 
@@ -781,6 +781,41 @@ def test_api_jobs_status_includes_all_job_types():
     assert payload["kavita"][0]["status"] == "queued"
     assert payload["kavita"][0]["series_title"] == "Example"
     assert payload["pulls"][0]["source"] == "mangafire"
+
+
+def test_api_jobs_status_paginates_info_sections():
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    session = Session()
+    for number in range(1, 6):
+        source_series = merge_series_item(
+            session,
+            SeriesItem(source="mangafire", source_id=f"gl{number}", title=f"Example {number}", url=f"x/{number}"),
+        )
+        release = upsert_release(
+            session,
+            source_series,
+            ChapterItem("mangafire", source_series.source_id, str(number), f"Chapter {number}", f"x/{number}", None),
+        )
+        session.flush()
+        session.add(DownloadJob(chapter_release_id=release.id, status="queued"))
+    session.commit()
+    try:
+        payload = main.api_jobs_status(
+            make_request("/api/jobs/status?active_page=2&page_size=2"),
+            session,
+        )
+    finally:
+        session.close()
+
+    active = payload["sections"]["active"]
+    assert active["page"] == 2
+    assert active["page_size"] == 2
+    assert active["total"] == 5
+    assert active["total_pages"] == 3
+    assert len(active["jobs"]) == 2
+    assert active["jobs"][0]["kind"] == "download_series"
 
 
 async def test_jobs_events_returns_sse_stream():
@@ -936,8 +971,8 @@ def test_discovery_card_css_keeps_cover_left_and_content_right():
 def test_static_stylesheet_uses_layout_cache_buster():
     html = Path("app/templates/base.html").read_text()
 
-    assert "styles.css') }}?v=dynamic-1" in html
-    assert "app.js') }}?v=dynamic-1" in html
+    assert "styles.css') }}?v=dynamic-2" in html
+    assert "app.js') }}?v=dynamic-2" in html
 
 
 def test_app_js_has_source_filters_and_jobs_drawer():
@@ -951,13 +986,16 @@ def test_app_js_has_source_filters_and_jobs_drawer():
     assert "download_series" in script
     assert "drawerSections" in script
     assert "statusCounts" in script
+    assert "infoJobPages" in script
+    assert "renderInfoPager" in script
+    assert "active_page" in script
     assert 'renderSection("Queued"' in script
     assert 'renderSection("Completed"' in script
     assert 'renderSection("Failed"' in script
     assert ".slice(0, 10)" in script
     assert "data-jobs-status" in script
     assert "data-source-row" in script
-    assert ".update-card .sources [data-source]" in script
+    assert ".sources [data-source]" in script
     assert "showChapters: job.kind === \"download_series\"" in script
     assert "toast-stack" in Path("app/templates/base.html").read_text()
 

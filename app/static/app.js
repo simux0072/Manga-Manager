@@ -3,6 +3,8 @@ const state = {
   jobs: null,
   expandedJobs: new Set(),
   drawerSections: new Map(),
+  infoJobPages: {active: 1, failed: 1, completed: 1},
+  infoJobPageSize: 25,
   filter: new URLSearchParams(window.location.search).get("filter") || "all",
   view: new URLSearchParams(window.location.search).get("view") || "list",
 };
@@ -57,7 +59,12 @@ function cardMatchesSource(card, hidden) {
       });
     return sources.length === 0 || visibleRows.length > 0;
   }
-  return sources.length === 0 || sources.some((source) => !hidden.has(source));
+  const visibleRows = [...card.querySelectorAll("[data-source-row], .sources [data-source]")]
+    .filter((row) => {
+      const source = row.dataset.sourceRow || row.dataset.source || "";
+      return source && !hidden.has(source);
+    });
+  return sources.length === 0 || visibleRows.length > 0 || sources.some((source) => !hidden.has(source));
 }
 
 function cardMatchesLibraryFilter(card) {
@@ -76,7 +83,7 @@ function applyFilters() {
   document.querySelectorAll("[data-source-toggle]").forEach((toggle) => {
     toggle.checked = !hidden.has(toggle.value);
   });
-  document.querySelectorAll("[data-source-row], .update-card .sources [data-source]").forEach((row) => {
+  document.querySelectorAll("[data-source-row], .sources [data-source]").forEach((row) => {
     const source = row.dataset.sourceRow || row.dataset.source || "";
     row.hidden = Boolean(source && hidden.has(source));
   });
@@ -351,6 +358,16 @@ function renderSection(title, jobs, options = {}) {
   return section;
 }
 
+function jobsStatusUrl() {
+  if (!document.querySelector("[data-jobs-status]")) return "/api/jobs/status";
+  const params = new URLSearchParams();
+  params.set("active_page", String(state.infoJobPages.active || 1));
+  params.set("failed_page", String(state.infoJobPages.failed || 1));
+  params.set("completed_page", String(state.infoJobPages.completed || 1));
+  params.set("page_size", String(state.infoJobPageSize || 25));
+  return `/api/jobs/status?${params.toString()}`;
+}
+
 function allJobs(payload) {
   return [...(payload.pulls || []), ...(payload.downloads || []), ...(payload.kavita || [])];
 }
@@ -416,6 +433,11 @@ function renderOverall(payload) {
 
 function renderJobs(payload) {
   state.jobs = payload;
+  if (payload.sections) {
+    Object.entries(payload.sections).forEach(([status, page]) => {
+      state.infoJobPages[status] = page.page || state.infoJobPages[status] || 1;
+    });
+  }
   renderOverall(payload);
   const drawer = document.getElementById("jobs-drawer-content");
   if (drawer) {
@@ -431,21 +453,15 @@ function renderJobs(payload) {
   const counts = statusCounts(payload);
   Object.entries(byStatus).forEach(([status, jobs]) => {
     document.querySelectorAll(`[data-jobs-status="${status}"]`).forEach((target) => {
-      target.replaceChildren(
-        ...jobs.map((job) => renderJob(job, {showChapters: job.kind === "download_series"})),
-      );
-      if (counts[status] > jobs.length) {
-        const more = document.createElement("p");
-        more.className = "muted";
-        more.textContent = `Showing ${jobs.length} of ${counts[status]} jobs.`;
-        target.append(more);
-      }
-      if (!jobs.length) {
-        const empty = document.createElement("p");
-        empty.className = "empty";
-        empty.textContent = "No recent jobs.";
-        target.append(empty);
-      }
+      const sectionPage = payload.sections && payload.sections[status];
+      if (sectionPage) renderInfoJobSection(target, status, sectionPage);
+      else renderInfoJobSection(target, status, {
+        jobs,
+        page: 1,
+        page_size: jobs.length || state.infoJobPageSize,
+        total: counts[status],
+        total_pages: 1,
+      });
     });
   });
   ["pulls", "downloads", "kavita"].forEach((kind) => {
@@ -463,9 +479,56 @@ function renderJobs(payload) {
   });
 }
 
+function renderInfoJobSection(target, status, page) {
+  const jobs = page.jobs || [];
+  const list = document.createElement("div");
+  list.className = "job-list";
+  if (!jobs.length) {
+    const empty = document.createElement("p");
+    empty.className = "empty";
+    empty.textContent = "No recent jobs.";
+    list.append(empty);
+  } else {
+    jobs.forEach((job) => list.append(renderJob(job, {showChapters: job.kind === "download_series"})));
+  }
+  const pager = renderInfoPager(status, page);
+  target.replaceChildren(list, pager);
+}
+
+function renderInfoPager(status, page) {
+  const pager = document.createElement("div");
+  pager.className = "job-pager";
+  const current = page.page || 1;
+  const totalPages = page.total_pages || 1;
+  const total = page.total || 0;
+  const label = document.createElement("span");
+  label.className = "muted";
+  label.textContent = `Page ${current} of ${totalPages} · ${total} jobs`;
+  const buttons = [
+    ["First", 1],
+    ["Prev", Math.max(1, current - 1)],
+    ["Next", Math.min(totalPages, current + 1)],
+    ["Last", totalPages],
+  ];
+  buttons.forEach(([text, nextPage]) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "secondary";
+    button.textContent = text;
+    button.disabled = nextPage === current || totalPages <= 1;
+    button.addEventListener("click", () => {
+      state.infoJobPages[status] = nextPage;
+      refreshJobs().catch((error) => toast(error.message, "error"));
+    });
+    pager.append(button);
+  });
+  pager.append(label);
+  return pager;
+}
+
 async function refreshJobs() {
   try {
-    const response = await fetch("/api/jobs/status", {headers: {"Accept": "application/json"}});
+    const response = await fetch(jobsStatusUrl(), {headers: {"Accept": "application/json"}});
     if (!response.ok) return;
     renderJobs(await response.json());
   } catch {
@@ -495,7 +558,10 @@ function setupJobEvents() {
     return;
   }
   const events = new EventSource("/api/jobs/events");
-  events.addEventListener("snapshot", (event) => renderJobs(JSON.parse(event.data)));
+  events.addEventListener("snapshot", (event) => {
+    if (document.querySelector("[data-jobs-status]")) refreshJobs();
+    else renderJobs(JSON.parse(event.data));
+  });
   events.addEventListener("new-job", (event) => {
     const payload = JSON.parse(event.data);
     if (payload.job) toast(`New job: ${jobLabel(payload.job)}`);
@@ -519,6 +585,10 @@ function shouldRemoveFormCard(form, payload, submitter) {
 
 function updateCardAfterAction(form, payload, submitter) {
   const card = form.closest("[data-series-card]");
+  if (form.action.includes("/rescan") || form.action.includes("/caught-up")) {
+    window.location.reload();
+    return;
+  }
   if (!card) return;
   if (shouldRemoveFormCard(form, payload, submitter)) {
     card.classList.add("removing");
@@ -527,6 +597,11 @@ function updateCardAfterAction(form, payload, submitter) {
   }
   if (payload.status && form.action.includes("/progress")) {
     card.dataset.progress = payload.status;
+    card.querySelectorAll(".library-card-main p").forEach((line) => {
+      if (line.textContent.includes("Progress:")) {
+        line.textContent = line.textContent.replace(/Progress: [^ ·]+/, `Progress: ${payload.status}`);
+      }
+    });
     applyFilters();
   }
 }

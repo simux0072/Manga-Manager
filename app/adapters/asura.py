@@ -57,6 +57,53 @@ class AsuraAdapter(SourceAdapter):
         soup = await self.client.get_soup(source_series.url)
         return self.parse_chapters(soup, source_series)
 
+    async def get_series_detail(self, source_series: SeriesItem) -> SeriesItem:
+        soup = await self.client.get_soup(source_series.url)
+        return self.parse_series_detail(soup, source_series)
+
+    def parse_series_detail(self, soup, source_series: SeriesItem) -> SeriesItem:
+        title = clean_series_title(
+            (soup.select_one("h1") or soup.select_one("[class*='title']")).get_text(" ", strip=True)
+            if soup.select_one("h1") or soup.select_one("[class*='title']")
+            else source_series.title
+        )
+        description = ""
+        for selector in ("meta[name='description']", "meta[property='og:description']"):
+            tag = soup.select_one(selector)
+            if tag and tag.get("content"):
+                description = str(tag["content"]).strip()
+                break
+        cover = ""
+        image = soup.select_one("meta[property='og:image']")
+        if image and image.get("content"):
+            cover = str(image["content"])
+        page_text = soup.get_text(" ", strip=True)
+        metadata = compact_metadata(
+            {
+                "rating": first_number_after(page_text, "rating"),
+                "follows": first_count_after(page_text, "bookmark"),
+                "chapters": first_count_after(page_text, "chapter"),
+                "views": first_count_after(page_text, "views"),
+                "status": first_word_after(page_text, "status"),
+                "type": first_word_after(page_text, "type"),
+            }
+        )
+        genres = tuple(chip.get_text(" ", strip=True) for chip in soup.select("a[href*='genre'], a[href*='genres']") if chip.get_text(" ", strip=True))
+        aliases = parse_aliases(page_text, title)
+        return SeriesItem(
+            source=source_series.source,
+            source_id=source_series.source_id,
+            title=title or source_series.title,
+            url=source_series.url,
+            aliases=aliases or source_series.aliases,
+            description=description or source_series.description,
+            cover_url=urljoin(self.base_url, cover or source_series.cover_url),
+            genres=genres or source_series.genres,
+            popularity=source_series.popularity,
+            external_ids=source_series.external_ids,
+            metadata={**source_series.metadata, **metadata},
+        )
+
     def parse_chapters(self, soup, source_series: SeriesItem) -> list[ChapterItem]:
         chapters: list[ChapterItem] = []
         series_path = urlparse(source_series.url).path.rstrip("/")
@@ -65,6 +112,8 @@ class AsuraAdapter(SourceAdapter):
             href = link.get("href", "")
             path = urlparse(urljoin(self.base_url, href)).path.rstrip("/")
             if not href or not path.startswith(f"{series_path}/chapter/"):
+                continue
+            if is_helper_chapter_link(title):
                 continue
             number = normalize_chapter_number(title or href)
             if not re.search(r"\d", number):
@@ -101,7 +150,7 @@ class AsuraAdapter(SourceAdapter):
         return [
             url
             for url in extract_image_urls(soup, self.base_url)
-            if "cdn.asurascans.com/asura-images/chapters/" in url
+            if is_asura_chapter_image(url)
         ]
 
     @staticmethod
@@ -132,6 +181,7 @@ def dedupe_chapters(items: list[ChapterItem]) -> list[ChapterItem]:
 def clean_series_title(title: str) -> str:
     title = re.sub(r"\b(Just now|today|yesterday|last week|\d+\s+\w+\s+ago)\b.*", "", title, flags=re.I)
     title = re.sub(r"\b(Chapter|Ch\.)\s+\d+(?:\.\d+)?\b.*", "", title, flags=re.I)
+    title = re.sub(r"^\s*\d+(?:\.\d+)?\s+(?=[A-Z])", "", title)
     return " ".join(title.split())
 
 
@@ -145,3 +195,50 @@ def is_premium_or_locked(soup) -> bool:
         if part
     ).lower()
     return "premium" in text or "early access" in text or "locked" in text
+
+
+def is_helper_chapter_link(title: str) -> bool:
+    normalized = " ".join((title or "").split()).lower()
+    return normalized in {"first chapter", "latest chapter", "first", "latest"}
+
+
+def is_asura_chapter_image(url: str) -> bool:
+    return (
+        "cdn.asurascans.com/asura-images/chapters/" in url
+        or "cdn.asurascans.com/asura-images/chapters-stitched/" in url
+    )
+
+
+def compact_metadata(values: dict[str, object]) -> dict[str, object]:
+    return {key: value for key, value in values.items() if value not in (None, "", [], {})}
+
+
+def first_number_after(text: str, label: str) -> float | None:
+    match = re.search(rf"{label}\s+(\d+(?:\.\d+)?)", text, flags=re.I)
+    if not match:
+        match = re.search(rf"(\d+(?:\.\d+)?)\s+{label}", text, flags=re.I)
+    return float(match.group(1)) if match else None
+
+
+def first_count_after(text: str, label: str) -> str | None:
+    match = re.search(rf"(\d+(?:\.\d+)?[KMB]?)\s+{label}s?", text, flags=re.I)
+    if not match:
+        match = re.search(rf"{label}s?\s+(\d+(?:\.\d+)?[KMB]?)", text, flags=re.I)
+    return match.group(1) if match else None
+
+
+def first_word_after(text: str, label: str) -> str:
+    match = re.search(rf"{label}\s+([A-Za-z][A-Za-z -]{{1,30}})", text, flags=re.I)
+    return " ".join(match.group(1).split()[:3]) if match else ""
+
+
+def parse_aliases(text: str, title: str) -> tuple[str, ...]:
+    match = re.search(rf"{re.escape(title)}\s+(.{{10,220}}?)\s+(?:In a world|Read |Bookmark|First Chapter)", text)
+    if not match:
+        return ()
+    aliases = [
+        value.strip(" ·•")
+        for value in re.split(r"\s+[•·]\s+", match.group(1))
+        if value.strip(" ·•") and len(value.strip(" ·•")) > 2
+    ]
+    return tuple(aliases[:5])

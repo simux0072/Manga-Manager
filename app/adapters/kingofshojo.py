@@ -4,7 +4,7 @@ from collections.abc import AsyncIterator
 import re
 from urllib.parse import unquote, urljoin, urlparse
 
-from app.adapters.asura import dedupe_chapters, dedupe_series
+from app.adapters.asura import clean_series_title, dedupe_chapters, dedupe_series
 from app.adapters.base import SourceAdapter
 from app.adapters.http import HttpSourceClient
 from app.adapters.parsing import clean_chapter_title, extract_image_urls, nearby_cover_attr, parse_source_date
@@ -59,6 +59,44 @@ class KingOfShojoAdapter(SourceAdapter):
     async def get_chapters(self, source_series: SeriesItem) -> list[ChapterItem]:
         soup = await self.client.get_soup(source_series.url)
         return self.parse_chapters(soup, source_series)
+
+    async def get_series_detail(self, source_series: SeriesItem) -> SeriesItem:
+        soup = await self.client.get_soup(source_series.url)
+        return self.parse_series_detail(soup, source_series)
+
+    def parse_series_detail(self, soup, source_series: SeriesItem) -> SeriesItem:
+        title_tag = soup.select_one("h1, .post-title, .entry-title")
+        title = clean_series_title(title_tag.get_text(" ", strip=True)) if title_tag else source_series.title
+        description_tag = soup.select_one(".summary__content, .description, .entry-content")
+        description = description_tag.get_text(" ", strip=True) if description_tag else source_series.description
+        image = soup.select_one("meta[property='og:image']")
+        cover = str(image.get("content") or "") if image else ""
+        if not cover and soup.select_one("a[href*='/manga/']"):
+            cover = nearby_cover_attr(soup.select_one("a[href*='/manga/']"))
+        text = soup.get_text(" ", strip=True)
+        follows = ""
+        follow_match = re.search(r"followed by\s+([\d,.]+[KMB]?)", text, flags=re.I)
+        if follow_match:
+            follows = follow_match.group(1)
+        metadata = {key: value for key, value in {"follows": follows}.items() if value}
+        genres = tuple(
+            tag.get_text(" ", strip=True)
+            for tag in soup.select("a[href*='genre'], a[href*='genres']")
+            if tag.get_text(" ", strip=True)
+        )
+        return SeriesItem(
+            source=source_series.source,
+            source_id=source_series.source_id,
+            title=title or source_series.title,
+            url=source_series.url,
+            aliases=source_series.aliases,
+            description=description,
+            cover_url=urljoin(self.base_url, cover or source_series.cover_url),
+            genres=genres or source_series.genres,
+            popularity=source_series.popularity,
+            external_ids=source_series.external_ids,
+            metadata={**source_series.metadata, **metadata},
+        )
 
     def parse_chapters(self, soup, source_series: SeriesItem) -> list[ChapterItem]:
         chapters: list[ChapterItem] = []
