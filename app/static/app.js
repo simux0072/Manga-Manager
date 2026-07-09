@@ -401,20 +401,19 @@ function renderOverall(payload) {
     document.getElementById("info-jobs-overall"),
   ].filter(Boolean);
   const button = document.getElementById("jobs-toggle");
-  if (!button) return;
   const overall = payload.overall || {};
   const total = overall.total || 0;
   const processed = overall.processed || 0;
   const active = Boolean(overall.active);
-  button.classList.toggle("active", active);
+  if (button) button.classList.toggle("active", active);
   if (total) {
-    button.textContent = `Jobs ${processed}/${total}`;
+    if (button) button.textContent = `Jobs ${processed}/${total}`;
     targets.forEach((target) => {
       target.innerHTML = `<span>Overall ${processed}/${total}</span><progress max="${total}" value="${processed}"></progress>`;
     });
   } else {
     const count = (overall.active_downloads || 0) + (overall.active_kavita || 0);
-    button.textContent = active ? `Jobs ${count || "active"}` : "Jobs";
+    if (button) button.textContent = active ? `Jobs ${count || "active"}` : "Jobs";
     targets.forEach((target) => {
       target.textContent = active ? `${count} queue jobs active` : "No active jobs";
     });
@@ -559,6 +558,12 @@ function setupJobsDrawer() {
 }
 
 function setupJobEvents() {
+  const initial = document.getElementById("initial-jobs-payload");
+  if (initial && initial.textContent) {
+    try {
+      renderJobs(JSON.parse(initial.textContent));
+    } catch {}
+  }
   if (!window.EventSource) {
     refreshJobs();
     setInterval(refreshJobs, 3000);

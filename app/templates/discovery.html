@@ -15,6 +15,10 @@
 </section>
 
 <section class="source-filter" data-source-filter>
+  <a class="{{ 'button-link' if source_filter == 'all' else 'filter-link' }}" href="/?source=all">All ({{ source_counts.all }})</a>
+  {% for source in enabled_sources %}
+    <a class="{{ 'button-link' if source_filter == source else 'filter-link' }}" href="/?source={{ source }}">{{ source_labels.get(source, source) }} ({{ source_counts.get(source, 0) }})</a>
+  {% endfor %}
   <span class="muted">Visible websites</span>
   {% for source in enabled_sources %}
     <label><input type="checkbox" data-source-toggle value="{{ source }}" checked> {{ source_labels.get(source, source) }}</label>

@@ -113,7 +113,7 @@ logger = logging.getLogger(__name__)
 SOURCE_LABELS = {
     "asura": "Asura",
     "mangafire": "MangaFire",
-    "kingofshojo": "Kingofshojo",
+    "kingofshojo": "KingOfShojo",
 }
 
 
@@ -410,6 +410,8 @@ def operations_status(request: Request, session: Session) -> dict:
                 "last_poll_at": row.last_poll_at if row else None,
                 "last_error": row.last_error if row else "",
                 "consecutive_failures": row.consecutive_failures if row else 0,
+                "download_cooldown_until": row.download_cooldown_until if row else None,
+                "download_cooldown_reason": row.download_cooldown_reason if row else "",
             }
         )
     for source, row in sorted(health_rows.items()):
@@ -421,6 +423,8 @@ def operations_status(request: Request, session: Session) -> dict:
                     "last_poll_at": row.last_poll_at,
                     "last_error": row.last_error,
                     "consecutive_failures": row.consecutive_failures,
+                    "download_cooldown_until": row.download_cooldown_until,
+                    "download_cooldown_reason": row.download_cooldown_reason,
                 }
             )
     return {
@@ -452,6 +456,15 @@ def operations_status(request: Request, session: Session) -> dict:
             "configured": configured_kavita_client().configured,
             "pending_sync_series": pending_kavita_sync_series_count(session),
         },
+        "runtime": {
+            "download_concurrency": settings.download_concurrency,
+            "per_series_concurrency": settings.download_per_series_concurrency,
+            "source_caps": {
+                "asura": settings.asura_download_concurrency,
+                "mangafire": settings.mangafire_download_concurrency,
+                "kingofshojo": settings.kingofshojo_download_concurrency,
+            },
+        },
     }
 
 
@@ -476,6 +489,7 @@ def notice_context(request: Request) -> dict[str, str]:
         "covers": f"Refreshed {count or '0'} missing covers.",
         "wtr": f"Kavita Want to Read imported {count or '0'} series.",
         "bulk-matches": f"Updated {count or '0'} match candidates.",
+        "recover-downloads": f"Recovered {count or '0'} stale download jobs.",
     }
     return {"type": notice, "message": messages.get(notice, "")}
 
@@ -597,6 +611,10 @@ def random_mapped_series(series: list[Series]) -> Series | None:
 @app.get("/", response_class=HTMLResponse)
 def discovery(request: Request, session: Session = Depends(get_session)):
     page = max(1, int(request.query_params.get("page", "1") or "1"))
+    source_filter = request.query_params.get("source", "all")
+    enabled_sources = enabled_source_names()
+    if source_filter not in {"all", *enabled_sources}:
+        source_filter = "all"
     page_size = settings.discovery_page_size
     offset = (page - 1) * page_size
     series = session.scalars(
@@ -607,10 +625,12 @@ def discovery(request: Request, session: Session = Depends(get_session)):
             selectinload(Series.chapters).selectinload(Chapter.releases),
         )
     ).all()
-    series = sorted(series, key=series_latest_platform_release_time, reverse=True)
+    source_counts = discovery_source_counts(series, enabled_sources)
+    if source_filter != "all":
+        series = [item for item in series if any(source.source == source_filter for source in item.sources)]
+    series = discovery_order(series, source_filter)
     has_next = len(series) > offset + page_size
     series = series[offset : offset + page_size]
-    enabled_sources = enabled_source_names()
     health_rows = {row.source: row for row in session.scalars(select(SourceHealth)).all()}
     health = [
         health_rows.get(source) or SourceHealth(source=source, enabled=True)
@@ -625,6 +645,8 @@ def discovery(request: Request, session: Session = Depends(get_session)):
             "discovery_items": [discovery_item(item) for item in series],
             "health": health,
             "enabled_sources": enabled_sources,
+            "source_counts": source_counts,
+            "source_filter": source_filter,
             "source_labels": SOURCE_LABELS,
             "pending": request_query_value(request, "pending"),
             "page": page,
@@ -632,6 +654,32 @@ def discovery(request: Request, session: Session = Depends(get_session)):
             "active": "discovery",
         },
     )
+
+
+def discovery_source_counts(series: list[Series], enabled_sources: list[str]) -> dict[str, int]:
+    counts = {"all": len(series)}
+    for source in enabled_sources:
+        counts[source] = sum(1 for item in series if any(row.source == source for row in item.sources))
+    return counts
+
+
+def discovery_order(series: list[Series], source_filter: str) -> list[Series]:
+    ordered = sorted(series, key=series_latest_platform_release_time, reverse=True)
+    if source_filter != "all":
+        return ordered
+    buckets: dict[str, list[Series]] = {}
+    source_order: list[str] = []
+    for item in ordered:
+        primary = max((source.source for source in item.sources), default="unknown", key=source_priority_label)
+        if primary not in buckets:
+            source_order.append(primary)
+        buckets.setdefault(primary, []).append(item)
+    result: list[Series] = []
+    while any(buckets.values()):
+        for source in source_order:
+            if buckets[source]:
+                result.append(buckets[source].pop(0))
+    return result
 
 
 @app.get("/library", response_class=HTMLResponse)
@@ -1393,6 +1441,18 @@ async def repair_series(request: Request, session: Session = Depends(get_session
         "/info",
         "repair",
         count=result["rescanned"],
+    )
+
+
+@app.post("/maintenance/recover-stale-downloads")
+async def recover_stale_downloads(request: Request, session: Session = Depends(get_session)):
+    count = recover_stale_download_jobs(session)
+    return json_or_redirect(
+        request,
+        {"ok": True, "count": count, "message": f"Recovered {count} stale download jobs."},
+        "/info",
+        "recover-downloads",
+        count=count,
     )
 
 

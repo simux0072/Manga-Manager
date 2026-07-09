@@ -23,6 +23,7 @@ from app.models import (
     DownloadJob,
     DownloadedFile,
     KavitaSyncJob,
+    ManualMatchRule,
     MatchCandidate,
     Series,
     SeriesProgress,
@@ -2076,6 +2077,83 @@ def test_cross_source_sashimi_titles_create_manual_match_candidate():
     assert 0.70 <= candidate.confidence < 0.90
 
 
+def test_repair_regenerates_sashimi_candidate_from_existing_aliases():
+    session = make_session()
+    asura = merge_series_item(
+        session,
+        SeriesItem(
+            source="asura",
+            source_id="asura/sashimi",
+            title="The Academy's Sashimi Sword Master",
+            url="a",
+        ),
+    )
+    king = merge_series_item(
+        session,
+        SeriesItem(
+            source="kingofshojo",
+            source_id="king/sashimi",
+            title="Conquering the Academy with Just a Sashimi Knife",
+            url="k",
+        ),
+    )
+    king.aliases = "The Academy's Sashimi Sword Master"
+    session.query(MatchCandidate).delete()
+    session.commit()
+
+    changed = services.regenerate_match_candidates(session)
+
+    assert changed == 1
+    candidate = session.query(MatchCandidate).one()
+    assert candidate.source_series_id == king.id
+    assert candidate.candidate_series_id == asura.series_id
+
+
+def test_repair_keeps_exact_separate_rule_but_allows_other_candidates():
+    session = make_session()
+    target = merge_series_item(
+        session,
+        SeriesItem("asura", "asura/one", "The Academy's Sashimi Sword Master", "a"),
+    )
+    other = merge_series_item(
+        session,
+        SeriesItem("mangafire", "mf/one", "Sashimi Academy Sword Master", "m"),
+    )
+    source = merge_series_item(
+        session,
+        SeriesItem(
+            "kingofshojo",
+            "king/one",
+            "Conquering the Academy with Just a Sashimi Knife",
+            "k",
+        ),
+    )
+    source.aliases = "The Academy's Sashimi Sword Master"
+    session.query(MatchCandidate).delete()
+    session.add(
+        ManualMatchRule(
+            source_series_id=source.id,
+            target_series_id=target.series_id,
+            action="separate",
+        )
+    )
+    session.commit()
+
+    services.regenerate_match_candidates(session)
+
+    source_candidates = (
+        session.query(MatchCandidate)
+        .filter(MatchCandidate.source_series_id == source.id)
+        .all()
+    )
+    assert len(source_candidates) == 1
+    assert source_candidates[0].candidate_series_id == other.series_id
+    assert not session.query(MatchCandidate).filter(
+        MatchCandidate.source_series_id == source.id,
+        MatchCandidate.candidate_series_id == target.series_id,
+    ).first()
+
+
 def test_same_source_weak_title_match_does_not_create_candidate():
     session = make_session()
     merge_series_item(
@@ -2138,6 +2216,7 @@ def test_manual_merge_moves_series_and_duplicate_chapter_progress():
 def test_claim_next_download_job_skips_source_at_capacity(monkeypatch):
     session = make_session()
     monkeypatch.setattr(services.settings, "download_concurrency", 2)
+    monkeypatch.setattr(services.settings, "download_per_series_concurrency", 2)
     monkeypatch.setattr(services.settings, "asura_download_concurrency", 1)
     monkeypatch.setattr(services.settings, "mangafire_download_concurrency", 2)
     asura = merge_series_item(
@@ -2173,6 +2252,46 @@ def test_claim_next_download_job_skips_source_at_capacity(monkeypatch):
 
     assert job is not None
     assert job.chapter_release_id == mangafire_queued.id
+
+
+def test_claim_next_download_job_skips_series_at_capacity_and_clears_error(monkeypatch):
+    session = make_session()
+    monkeypatch.setattr(services.settings, "download_concurrency", 3)
+    monkeypatch.setattr(services.settings, "download_per_series_concurrency", 1)
+    first = merge_series_item(
+        session,
+        SeriesItem(source="kingofshojo", source_id="king/one", title="One", url="k1"),
+    )
+    second = merge_series_item(
+        session,
+        SeriesItem(source="kingofshojo", source_id="king/two", title="Two", url="k2"),
+    )
+    running_release = upsert_release(
+        session,
+        first,
+        ChapterItem("kingofshojo", first.source_id, "1", "Chapter 1", "k1", None),
+    )
+    blocked_release = upsert_release(
+        session,
+        first,
+        ChapterItem("kingofshojo", first.source_id, "2", "Chapter 2", "k2", None),
+    )
+    ready_release = upsert_release(
+        session,
+        second,
+        ChapterItem("kingofshojo", second.source_id, "1", "Chapter 1", "k3", None),
+    )
+    session.flush()
+    session.add(DownloadJob(chapter_release_id=running_release.id, status="running"))
+    session.add(DownloadJob(chapter_release_id=blocked_release.id, priority=1))
+    session.add(DownloadJob(chapter_release_id=ready_release.id, priority=2, error="old error"))
+    session.commit()
+
+    job = services.claim_next_download_job(session)
+
+    assert job is not None
+    assert job.chapter_release_id == ready_release.id
+    assert job.error == ""
 
 
 def test_manual_merge_moves_all_old_source_rows_and_deletes_old_series():

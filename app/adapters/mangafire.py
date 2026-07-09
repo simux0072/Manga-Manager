@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
+import re
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -9,6 +10,7 @@ from bs4 import BeautifulSoup
 from app.adapters.asura import dedupe_chapters, dedupe_series
 from app.adapters.base import SourceAdapter
 from app.adapters.http import HttpSourceClient, iter_ordered_bytes, page_concurrency_for_source
+from app.adapters.parsing import image_attr, parse_source_date
 from app.domain import ChapterItem, SeriesItem, normalize_chapter_number
 from app.settings import settings
 
@@ -27,20 +29,13 @@ class MangaFireAdapter(SourceAdapter):
         await self.client.aclose()
 
     async def list_recent(self) -> list[SeriesItem]:
-        query = self.recent_titles_query()
-        payload = await self.client.get_json(f"/api/titles?{query}")
         items: list[SeriesItem] = []
-        for entry in api_items(payload):
-            hid = entry.get("hid") or hid_from_url(entry.get("url", ""))
-            if hid:
-                try:
-                    detail = api_title(await self.client.get_json(f"/api/titles/{hid}"))
-                except Exception:
-                    detail = {}
-                entry = {**entry, **detail}
-            parsed = self.parse_series_entry(entry)
-            if parsed:
-                items.append(parsed)
+        for page in range(1, settings.mangafire_recent_pages + 1):
+            path = "/updated" if page == 1 else f"/updated?page={page}"
+            parsed = self.parse_updated_page(await self.client.get_soup(path))
+            if not parsed:
+                break
+            items.extend(parsed)
         return dedupe_series(items)
 
     def recent_titles_query(self) -> str:
@@ -62,6 +57,134 @@ class MangaFireAdapter(SourceAdapter):
 
     def parse_series_detail(self, payload) -> SeriesItem | None:
         return self.parse_series_entry(api_title(payload))
+
+    async def get_series_detail(self, source_series: SeriesItem) -> SeriesItem:
+        hid = source_series.source_id or hid_from_url(source_series.url)
+        try:
+            detail = self.parse_series_detail(await self.client.get_json(f"/api/titles/{hid}"))
+        except Exception:
+            detail = None
+        if detail:
+            return merge_series_items(source_series, detail)
+        return merge_series_items(
+            source_series,
+            self.parse_series_detail_html(await self.client.get_soup(source_series.url), source_series),
+        )
+
+    def parse_updated_page(self, soup: BeautifulSoup) -> list[SeriesItem]:
+        items: list[SeriesItem] = []
+        for link in soup.select("a[href*='/title/']"):
+            href = link.get("href", "")
+            source_id = hid_from_url(href)
+            if not source_id:
+                continue
+            title = clean_updated_title(link.get("title") or link.get_text(" ", strip=True))
+            if not title:
+                continue
+            cover = ""
+            image = link.select_one("img")
+            if image:
+                cover = image_attr(image)
+            if not cover and link.parent:
+                image = link.parent.select_one("img")
+                cover = image_attr(image) if image else ""
+            recent_chapters = self.parse_updated_chapters_for_link(link, source_id, href)
+            items.append(
+                SeriesItem(
+                    source=self.source,
+                    source_id=source_id,
+                    title=title,
+                    url=urljoin(self.base_url, href),
+                    cover_url=urljoin(self.base_url, cover) if cover else "",
+                    metadata={
+                        "recent_chapters": [
+                            {
+                                "number": chapter.number,
+                                "title": chapter.title,
+                                "url": chapter.url,
+                                "published_at": chapter.published_at.isoformat()
+                                if chapter.published_at
+                                else "",
+                            }
+                            for chapter in recent_chapters
+                        ]
+                    }
+                    if recent_chapters
+                    else {},
+                )
+            )
+        return dedupe_series(items)
+
+    def parse_updated_chapters_for_link(self, link, source_id: str, series_href: str) -> list[ChapterItem]:
+        container = link
+        for parent in link.parents:
+            if getattr(parent, "name", None) in {"article", "li", "div"}:
+                container = parent
+                break
+        series_url = urljoin(self.base_url, series_href)
+        chapters: list[ChapterItem] = []
+        for chapter_link in container.select("a[href*='/chapter/']"):
+            href = chapter_link.get("href", "")
+            chapter_id = urlparse(href).path.rstrip("/").split("/")[-1]
+            label = chapter_link.get_text(" ", strip=True) or href
+            if not is_english_chapter(chapter_language_text(chapter_link)):
+                continue
+            number = normalize_chapter_number(label)
+            if not chapter_id or not number:
+                continue
+            container_text = chapter_link.parent.get_text(" ", strip=True) if chapter_link.parent else label
+            chapters.append(
+                ChapterItem(
+                    source=self.source,
+                    source_series_id=source_id,
+                    number=number,
+                    title=label,
+                    url=f"{series_url.rstrip('/')}/chapter/{chapter_id}",
+                    published_at=parse_source_date(container_text),
+                )
+            )
+        return dedupe_chapters(chapters)
+
+    def parse_series_detail_html(self, soup: BeautifulSoup, source_series: SeriesItem) -> SeriesItem:
+        title_tag = soup.select_one("h1, [class*='title']")
+        title = clean_updated_title(title_tag.get_text(" ", strip=True)) if title_tag else source_series.title
+        description = ""
+        for selector in (
+            ".synopsis",
+            ".description",
+            "[class*='synopsis']",
+            "[class*='description']",
+            "meta[name='description']",
+            "meta[property='og:description']",
+        ):
+            tag = soup.select_one(selector)
+            if tag:
+                description = str(tag.get("content") or tag.get_text(" ", strip=True)).strip()
+            if description:
+                break
+        cover = ""
+        image = soup.select_one("meta[property='og:image']")
+        if image and image.get("content"):
+            cover = str(image["content"])
+        if not cover:
+            image = soup.select_one("img")
+            cover = image_attr(image) if image else ""
+        aliases = parse_html_aliases(soup.get_text(" ", strip=True), title)
+        genres = tuple(
+            tag.get_text(" ", strip=True)
+            for tag in soup.select("a[href*='genre'], a[href*='genres']")
+            if tag.get_text(" ", strip=True)
+        )
+        return SeriesItem(
+            source=self.source,
+            source_id=source_series.source_id,
+            title=title or source_series.title,
+            url=source_series.url,
+            aliases=aliases,
+            description=description,
+            cover_url=urljoin(self.base_url, cover) if cover else "",
+            genres=genres,
+        )
 
     def parse_series_entry(self, entry: dict) -> SeriesItem | None:
         title = entry.get("title") or entry.get("name") or ""
@@ -107,15 +230,21 @@ class MangaFireAdapter(SourceAdapter):
         hid = source_series.source_id or hid_from_url(source_series.url)
         chapters: list[ChapterItem] = []
         page = 1
-        while True:
-            payload = await self.client.get_json(
-                f"/api/titles/{hid}/chapters?limit=100&page={page}&sort=number&order=desc"
-            )
-            chapters.extend(self.parse_chapters(payload, source_series))
-            meta = api_meta(payload)
-            if not meta.get("hasNext"):
-                break
-            page += 1
+        try:
+            while True:
+                payload = await self.client.get_json(
+                    f"/api/titles/{hid}/chapters?limit=100&page={page}&sort=number&order=desc"
+                )
+                chapters.extend(self.parse_chapters(payload, source_series))
+                meta = api_meta(payload)
+                if not meta.get("hasNext"):
+                    break
+                page += 1
+        except Exception:
+            fallback = chapters_from_recent_metadata(source_series)
+            if fallback:
+                return fallback
+            raise
         return dedupe_chapters(chapters)
 
     def parse_chapters(self, payload, source_series: SeriesItem) -> list[ChapterItem]:
@@ -280,3 +409,78 @@ def html_text(value: str) -> str:
 
 def compact_metadata(values: dict[str, object]) -> dict[str, object]:
     return {key: value for key, value in values.items() if value not in (None, "", [], {})}
+
+
+def clean_updated_title(value: str) -> str:
+    value = re.sub(r"\bChapter\s+\d+(?:\.\d+)?\b.*", "", value or "", flags=re.I)
+    return " ".join(value.split())
+
+
+def chapter_language_text(tag) -> str:
+    text = tag.get_text(" ", strip=True)
+    match = re.search(r"\b(English|EN|ENG|Spanish|ES|French|FR|Portuguese|PT)\b", text, flags=re.I)
+    return match.group(1) if match else ""
+
+
+def parse_html_aliases(text: str, title: str) -> tuple[str, ...]:
+    for pattern in (
+        r"(?:Alternative|Other)\s+Titles?\s*[:\-]\s*(.{3,180}?)(?:\s+(?:Status|Author|Genre|Summary|Synopsis)\b|$)",
+        rf"{re.escape(title)}\s*/\s*(.{{3,160}}?)(?:\s+(?:Status|Author|Genre|Summary|Synopsis)\b|$)",
+    ):
+        match = re.search(pattern, text, flags=re.I)
+        if not match:
+            continue
+        aliases = [
+            alias.strip(" /,;·•")
+            for alias in re.split(r"\s*/\s*|[,;]\s*", match.group(1))
+            if alias.strip(" /,;·•") and alias.strip(" /,;·•").lower() != title.lower()
+        ]
+        return tuple(aliases[:6])
+    return ()
+
+
+def merge_series_items(base: SeriesItem, detail: SeriesItem) -> SeriesItem:
+    return SeriesItem(
+        source=base.source,
+        source_id=base.source_id,
+        title=detail.title or base.title,
+        url=base.url or detail.url,
+        aliases=detail.aliases or base.aliases,
+        description=detail.description or base.description,
+        cover_url=detail.cover_url or base.cover_url,
+        genres=detail.genres or base.genres,
+        popularity=max(base.popularity, detail.popularity),
+        external_ids=detail.external_ids or base.external_ids,
+        metadata={**base.metadata, **detail.metadata},
+    )
+
+
+def chapters_from_recent_metadata(source_series: SeriesItem) -> list[ChapterItem]:
+    rows = source_series.metadata.get("recent_chapters")
+    if not isinstance(rows, list):
+        return []
+    chapters: list[ChapterItem] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        published_at = None
+        if row.get("published_at"):
+            try:
+                published_at = datetime.fromisoformat(str(row["published_at"]))
+            except ValueError:
+                published_at = None
+        number = str(row.get("number") or "")
+        url = str(row.get("url") or "")
+        if not number or not url:
+            continue
+        chapters.append(
+            ChapterItem(
+                source=source_series.source,
+                source_series_id=source_series.source_id,
+                number=number,
+                title=str(row.get("title") or f"Chapter {number}"),
+                url=url,
+                published_at=published_at,
+            )
+        )
+    return dedupe_chapters(chapters)

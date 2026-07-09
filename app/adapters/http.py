@@ -11,6 +11,8 @@ from bs4 import BeautifulSoup
 from app.adapters.base import SourceRateLimited
 from app.settings import settings
 
+_page_semaphores: dict[str, asyncio.Semaphore] = {}
+
 
 class HttpSourceClient:
     def __init__(
@@ -46,6 +48,16 @@ class HttpSourceClient:
         return response.json()
 
     async def get_bytes(self, url: str, referer: str = "") -> bytes:
+        for attempt in range(1, 3):
+            try:
+                return await self._get_bytes_once(url, referer)
+            except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
+                if attempt == 2 or not is_partial_body_error(exc):
+                    raise
+                await asyncio.sleep(0.25 * attempt)
+        raise RuntimeError("unreachable")
+
+    async def _get_bytes_once(self, url: str, referer: str = "") -> bytes:
         headers = {}
         if referer:
             headers["Referer"] = referer
@@ -143,10 +155,12 @@ async def iter_ordered_bytes(
         return
 
     semaphore = asyncio.Semaphore(concurrency)
+    source_semaphore = page_semaphore_for_client(client)
 
     async def fetch(url: str) -> bytes:
         async with semaphore:
-            return await client.get_bytes(url, referer=referer)
+            async with source_semaphore:
+                return await client.get_bytes(url, referer=referer)
 
     tasks = [asyncio.create_task(fetch(url)) for url in urls]
     try:
@@ -156,6 +170,32 @@ async def iter_ordered_bytes(
         for task in tasks:
             task.cancel()
         raise
+
+
+def page_semaphore_for_client(client: HttpSourceClient) -> asyncio.Semaphore:
+    semaphore = _page_semaphores.get(client.base_url)
+    if semaphore is None:
+        semaphore = asyncio.Semaphore(page_concurrency_for_base_url(client.base_url))
+        _page_semaphores[client.base_url] = semaphore
+    return semaphore
+
+
+def page_concurrency_for_base_url(base_url: str) -> int:
+    if "asura" in base_url:
+        return settings.asura_page_concurrency
+    if "mangafire" in base_url:
+        return settings.mangafire_page_concurrency
+    if "kingofshojo" in base_url:
+        return settings.kingofshojo_page_concurrency
+    return 1
+
+
+def is_partial_body_error(exc: BaseException) -> bool:
+    text = str(exc).lower()
+    return (
+        "peer closed connection without sending complete message body" in text
+        or "incomplete message body" in text
+    )
 
 
 def retry_after_from_headers(headers: httpx.Headers) -> datetime | None:

@@ -69,8 +69,18 @@ class KingOfShojoAdapter(SourceAdapter):
         title = clean_series_title(title_tag.get_text(" ", strip=True)) if title_tag else source_series.title
         description_tag = soup.select_one(".summary__content, .description, .entry-content")
         description = description_tag.get_text(" ", strip=True) if description_tag else source_series.description
+        aliases, description = extract_description_aliases(description, title)
         image = soup.select_one("meta[property='og:image']")
         cover = str(image.get("content") or "") if image else ""
+        if not cover:
+            cover_image = soup.select_one(
+                ".summary_image img, .tab-summary img, .post-content_item img, "
+                "img.wp-post-image, img[data-src], img[data-lazy-src]"
+            )
+            if cover_image:
+                from app.adapters.parsing import image_attr
+
+                cover = image_attr(cover_image)
         if not cover and soup.select_one("a[href*='/manga/']"):
             cover = nearby_cover_attr(soup.select_one("a[href*='/manga/']"))
         text = soup.get_text(" ", strip=True)
@@ -89,7 +99,7 @@ class KingOfShojoAdapter(SourceAdapter):
             source_id=source_series.source_id,
             title=title or source_series.title,
             url=source_series.url,
-            aliases=source_series.aliases,
+            aliases=aliases or source_series.aliases,
             description=description,
             cover_url=urljoin(self.base_url, cover or source_series.cover_url),
             genres=genres or source_series.genres,
@@ -164,3 +174,18 @@ def is_non_series_link(url: str, title: str) -> bool:
     if re.search(r"\b(text mode|list mode|manhwa|manga|manhua|genres?|filter)\b", title):
         return True
     return False
+
+
+def extract_description_aliases(description: str, title: str) -> tuple[tuple[str, ...], str]:
+    text = " ".join((description or "").split())
+    match = re.match(r"Read\s+(?:manhwa|manga|manhua)\s+(.{3,260}?)(?:\s+(?:Plot|Summary|Synopsis|Description)\b|$)", text, flags=re.I)
+    if not match:
+        return (), description
+    prefix = match.group(1).strip()
+    aliases = [
+        value.strip(" /")
+        for value in re.split(r"\s*/\s*", prefix)
+        if value.strip(" /") and value.strip(" /").lower() != title.lower()
+    ]
+    cleaned = text[match.end() :].strip(" :-")
+    return tuple(aliases[:8]), cleaned or description

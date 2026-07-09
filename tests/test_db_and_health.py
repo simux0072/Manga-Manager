@@ -305,6 +305,8 @@ def test_healthz_includes_scheduler_and_source_health(monkeypatch):
             "last_poll_at": None,
             "last_error": "down",
             "consecutive_failures": 5,
+            "download_cooldown_until": None,
+            "download_cooldown_reason": "",
         }
     ]
 

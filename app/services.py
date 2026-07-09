@@ -333,7 +333,6 @@ def create_match_candidates(
     best_confidence: float,
     reason: str,
 ) -> None:
-    names = [item.title, *item.aliases]
     for candidate in session.scalars(select(Series).where(Series.id != source_series.series_id)).all():
         if source_series.source in {source.source for source in candidate.sources}:
             continue
@@ -346,8 +345,7 @@ def create_match_candidates(
         )
         if blocked:
             continue
-        candidate_names = [candidate.title, *(candidate.aliases or "").split("|")]
-        score = best_name_similarity(names, candidate_names)
+        score = manual_candidate_score(item, candidate)
         score = max(score, best_confidence if candidate.normalized_title == normalize_title(item.title) else 0)
         if 0.70 <= score < 0.90:
             existing = session.scalar(
@@ -365,6 +363,101 @@ def create_match_candidates(
                         reason=reason,
                     )
                 )
+
+
+def regenerate_match_candidates(session: Session) -> int:
+    changed = 0
+    for source_series in session.scalars(select(SourceSeries).order_by(SourceSeries.id.asc())).all():
+        item = series_item_from_source_series(source_series)
+        for candidate in session.scalars(select(Series).where(Series.id != source_series.series_id)).all():
+            if source_series.source in {source.source for source in candidate.sources}:
+                continue
+            if any(source.id > source_series.id for source in candidate.sources):
+                continue
+            blocked = session.scalar(
+                select(ManualMatchRule).where(
+                    ManualMatchRule.source_series_id == source_series.id,
+                    ManualMatchRule.target_series_id == candidate.id,
+                    ManualMatchRule.action == "separate",
+                )
+            )
+            existing = session.scalar(
+                select(MatchCandidate).where(
+                    MatchCandidate.source_series_id == source_series.id,
+                    MatchCandidate.candidate_series_id == candidate.id,
+                    MatchCandidate.status == "pending",
+                )
+            )
+            score = 0 if blocked else manual_candidate_score(item, candidate)
+            if 0.70 <= score < 0.90:
+                if existing is None:
+                    session.add(
+                        MatchCandidate(
+                            source_series_id=source_series.id,
+                            candidate_series_id=candidate.id,
+                            confidence=score,
+                            reason="repair candidate regeneration",
+                        )
+                    )
+                    changed += 1
+                elif abs(existing.confidence - score) >= 0.01:
+                    existing.confidence = score
+                    existing.reason = "repair candidate regeneration"
+                    changed += 1
+            elif existing is not None:
+                session.delete(existing)
+                changed += 1
+    if changed:
+        commit_with_retry(session)
+    return changed
+
+
+def series_item_from_source_series(source_series: SourceSeries) -> SeriesItem:
+    return SeriesItem(
+        source=source_series.source,
+        source_id=source_series.source_id,
+        title=source_series.title,
+        url=source_series.url,
+        aliases=tuple(alias for alias in (source_series.aliases or "").split("|") if alias),
+        description=source_series.description,
+        cover_url=source_series.cover_url,
+        genres=tuple(genre for genre in (source_series.genres or "").split(",") if genre),
+        popularity=source_series.popularity,
+        external_ids=decode_external_ids(source_series.external_ids),
+        metadata=decode_metadata(source_series.metadata_json),
+    )
+
+
+def score_match_candidate(item: SeriesItem, candidate: Series) -> float:
+    names = [item.title, *item.aliases]
+    candidate_names = [candidate.title, *(candidate.aliases or "").split("|")]
+    return max(best_name_similarity(names, candidate_names), description_keyword_overlap(item.description, candidate.description))
+
+
+def manual_candidate_score(item: SeriesItem, candidate: Series) -> float:
+    score = score_match_candidate(item, candidate)
+    return min(score, 0.89) if score >= 0.70 else score
+
+
+def description_keyword_overlap(left: str, right: str) -> float:
+    left_tokens = description_tokens(left)
+    right_tokens = description_tokens(right)
+    if not left_tokens or not right_tokens:
+        return 0
+    shared = left_tokens & right_tokens
+    if len(shared) >= 5:
+        return 0.76
+    if len(shared) >= 3 and any(token not in COMMON_MATCH_TOKENS for token in shared):
+        return 0.71
+    return 0
+
+
+def description_tokens(value: str) -> set[str]:
+    return {
+        token
+        for token in normalize_title(value).split()
+        if len(token) >= 5 and not token.isdigit()
+    }
 
 
 def best_name_similarity(names: list[str], candidate_names: list[str]) -> float:
@@ -555,6 +648,22 @@ async def poll_source(
                     f"{source} poll had {item_failures} item failures",
                     source=source,
                     metadata={"item_failures": item_failures, "samples": item_failure_samples},
+                )
+            elif item_failures:
+                health.last_poll_at = utcnow()
+                health.last_error = f"{item_failures} item failures"
+                record_activity(
+                    session,
+                    "source_poll",
+                    "warning",
+                    f"{source} poll found {count} series with {item_failures} item failures",
+                    source=source,
+                    metadata={
+                        "count": count,
+                        "item_failures": item_failures,
+                        "skipped_items": skipped_items,
+                        "failure_samples": item_failure_samples,
+                    },
                 )
             else:
                 record_source_success(health, item_failures)
@@ -782,6 +891,25 @@ def download_sources_at_capacity(session: Session) -> set[str]:
         source
         for source, count in counts.items()
         if count >= source_download_concurrency(source)
+    }
+
+
+def download_series_at_capacity(session: Session) -> set[int]:
+    rows = session.execute(
+        select(Chapter.series_id, DownloadJob.id)
+        .join(ChapterRelease, ChapterRelease.id == DownloadJob.chapter_release_id)
+        .join(Chapter, Chapter.id == ChapterRelease.chapter_id)
+        .where(DownloadJob.status == "running")
+    ).all()
+    counts: dict[int, int] = {}
+    for series_id, _job_id in rows:
+        if series_id is None:
+            continue
+        counts[series_id] = counts.get(series_id, 0) + 1
+    return {
+        series_id
+        for series_id, count in counts.items()
+        if count >= settings.download_per_series_concurrency
     }
 
 
@@ -1123,6 +1251,7 @@ async def run_next_download(session: Session) -> bool:
             job,
             release,
             iter_adapter_pages(adapter, item),
+            heartbeat=lambda: heartbeat_download_job(session, job),
         )
         old_path = Path(release.chapter.cbz_path) if release.chapter.cbz_path else None
         if old_path:
@@ -1590,6 +1719,7 @@ async def stage_cbz(
     job: DownloadJob,
     release: ChapterRelease,
     pages: AsyncIterator[bytes],
+    heartbeat: Callable[[], None] | None = None,
 ) -> tuple[Path, Path, int]:
     chapter = release.chapter
     if chapter is None:
@@ -1603,11 +1733,15 @@ async def stage_cbz(
         f".{final_path.stem}.job-{job.id}.release-{release.id}.tmp"
     )
     image_count = 0
+    last_heartbeat = time.monotonic()
     try:
         with zipfile.ZipFile(staging_path, "w", compression=zipfile.ZIP_DEFLATED) as cbz:
             cbz.writestr("ComicInfo.xml", comic_info_xml(series, chapter, release))
             async for page in pages:
                 image_count += 1
+                if heartbeat is not None and time.monotonic() - last_heartbeat >= 10:
+                    heartbeat()
+                    last_heartbeat = time.monotonic()
                 ext = image_extension(page)
                 cbz.writestr(f"{image_count:04d}.{ext}", page)
         if image_count < settings.min_pages_per_chapter:
@@ -1619,6 +1753,11 @@ async def stage_cbz(
         staging_path.unlink(missing_ok=True)
         raise
     return staging_path, final_path, image_count
+
+
+def heartbeat_download_job(session: Session, job: DownloadJob) -> None:
+    job.updated_at = utcnow()
+    commit_with_retry(session)
 
 
 def is_temporary_download_error(exc: BaseException) -> bool:
@@ -1638,11 +1777,13 @@ def claim_next_download_job(session: Session) -> DownloadJob | None:
     if running_total and running_total >= settings.download_concurrency:
         return None
     blocked_sources = download_sources_at_capacity(session)
+    blocked_series = download_series_at_capacity(session)
     ready_filter = or_(DownloadJob.retry_after.is_(None), DownloadJob.retry_after <= now)
     query = (
         select(DownloadJob.id)
         .join(ChapterRelease, ChapterRelease.id == DownloadJob.chapter_release_id)
         .join(SourceSeries, SourceSeries.id == ChapterRelease.source_series_id)
+        .join(Chapter, Chapter.id == ChapterRelease.chapter_id)
         .outerjoin(SourceHealth, SourceHealth.source == SourceSeries.source)
         .where(DownloadJob.status.in_(["queued", "delayed"]))
         .where(ready_filter)
@@ -1657,6 +1798,8 @@ def claim_next_download_job(session: Session) -> DownloadJob | None:
     )
     if blocked_sources:
         query = query.where(SourceSeries.source.not_in(blocked_sources))
+    if blocked_series:
+        query = query.where(Chapter.series_id.not_in(blocked_series))
     job_id = session.scalar(query)
     if job_id is None:
         return None
@@ -1669,6 +1812,7 @@ def claim_next_download_job(session: Session) -> DownloadJob | None:
         .values(
             status="running",
             attempts=DownloadJob.attempts + 1,
+            error="",
             retry_after=None,
             updated_at=utcnow(),
         )
@@ -2541,12 +2685,16 @@ async def repair_known_series(session: Session, limit: int = 100) -> dict[str, i
             refreshed += count
     covers = await refresh_missing_covers(session, limit=limit)
     removed_chapters += remove_legacy_bad_chapters(session)
+    matches = regenerate_match_candidates(session)
+    recovered_jobs = recover_stale_download_jobs(session)
     result = {
         "rescanned": rescanned,
         "chapters": refreshed,
         "removed_chapters": removed_chapters,
         "removed_series": cleanup["series"],
         "covers": covers,
+        "matches": matches,
+        "recovered_jobs": recovered_jobs,
     }
     record_activity(
         session,
@@ -2554,7 +2702,8 @@ async def repair_known_series(session: Session, limit: int = 100) -> dict[str, i
         "success",
         (
             f"Repair rescanned {rescanned} source series, refreshed {refreshed} chapters, "
-            f"removed {removed_chapters} bad chapters, refreshed {covers} covers"
+            f"removed {removed_chapters} bad chapters, refreshed {covers} covers, "
+            f"updated {matches} match candidates"
         ),
         metadata=result,
     )

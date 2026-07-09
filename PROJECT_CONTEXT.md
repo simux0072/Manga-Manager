@@ -1,6 +1,6 @@
 # Manga Manager Project Context
 
-Last updated: 2026-07-08
+Last updated: 2026-07-09
 
 ## Purpose
 
@@ -169,7 +169,14 @@ Important settings:
 - `KEEP_REPLACED_FILES`: archive old CBZs before replacement.
 - `MANGAFIRE_DISCOVERY_MODE`: defaults to `new`; set to `hot` only to request MangaFire's hot feed.
 - `MANGAFIRE_RECENT_LIMIT`: number of MangaFire recent titles to request.
+- `MANGAFIRE_RECENT_PAGES`: number of MangaFire `/updated` HTML pages to scan.
 - `KINGOFSHOJO_RECENT_PAGES`: number of King of Shojo recent pages to poll.
+- `DOWNLOAD_CONCURRENCY`: total running download job cap.
+- `DOWNLOAD_PER_SERIES_CONCURRENCY`: running download cap for one canonical series.
+- `ASURA_DOWNLOAD_CONCURRENCY`, `MANGAFIRE_DOWNLOAD_CONCURRENCY`,
+  `KINGOFSHOJO_DOWNLOAD_CONCURRENCY`: per-source running download caps.
+- `ASURA_PAGE_CONCURRENCY`, `MANGAFIRE_PAGE_CONCURRENCY`, `KINGOFSHOJO_PAGE_CONCURRENCY`:
+  source-wide page image request caps.
 
 `.env.example` includes the runtime safety settings currently defined in `app/settings.py`, but does
 not set an active `DATABASE_URL` by default.
@@ -254,7 +261,7 @@ Focused imports:
 4. Fetches recent source items.
 5. For each item, merges series metadata, caches cover image, fetches chapters, and upserts releases.
 6. Handles item-level failures without aborting the whole source poll.
-7. Updates `SourceHealth`.
+7. Records partial item failures as warning health/activity instead of clean success.
 8. Disables the source after five consecutive source-level or all-item failures.
 
 Configured sources can be manually disabled or re-enabled from the discovery health row. Disabling
@@ -277,8 +284,10 @@ Discovery is optimized for scanning recent updates:
 - Buttons for `Reading`, `Interested`, and `Ignore` remain separate form controls.
 
 The `Visible websites` toggles hide source badges and chapter rows first, then hide a card when no
-visible source rows remain. MangaFire remains English-only; MangaFire titles with no English
-chapters are skipped during discovery.
+visible source rows remain. Discovery also has server-side source tabs with counts, and the `All`
+view interleaves recent series by source while preserving recency for the first item from each
+source. MangaFire remains English-only; MangaFire titles with no English chapters are skipped during
+discovery.
 
 ## Operations And Repair
 
@@ -295,7 +304,13 @@ completed grouped jobs; page switches fetch JSON and do not refresh the browser 
    `latest chapter` when they have no downloaded files.
 3. Rescans known source-series rows, prioritizing tracked series.
 4. Refreshes source detail metadata, visibly polluted titles, and missing or broken covers.
-5. Records a repair activity event.
+5. Regenerates pending match candidates for existing source-series rows while preserving exact
+   keep-separate rules.
+6. Recovers stale running download jobs.
+7. Records a repair activity event.
+
+The Info page also exposes `Recover stale jobs`, which requeues old running download jobs without
+running the full repair pass.
 
 Kavita behavior:
 
@@ -309,8 +324,10 @@ Kavita behavior:
 
 MangaFire behavior:
 
-- Default discovery mode is `new`, implemented as latest chapter update ordering without `hot=1`.
-- `hot` is opt-in through `MANGAFIRE_DISCOVERY_MODE=hot`.
+- Default discovery uses paginated `/updated` HTML parsing controlled by `MANGAFIRE_RECENT_PAGES`.
+- Per-title detail API calls are not made during discovery; enrichment/rescan handles details later.
+- Updated-list chapter rows are kept as a fallback when chapter APIs are throttled or incomplete.
+- `hot` remains opt-in through `MANGAFIRE_DISCOVERY_MODE=hot` for legacy API parsing/tests.
 
 ## Kavita Integration
 
@@ -380,6 +397,9 @@ active. Cached cover bytes are validated as real images before the cover path is
 - Streams image downloads and enforces `MAX_PAGE_BYTES`.
 - Cover image downloads are streamed and enforce `MAX_COVER_BYTES`.
 - Rejects non-image content for page downloads.
+- Retries partial/incomplete page body failures once before surfacing a temporary download error.
+- Applies source-wide page semaphores so job concurrency multiplied by page concurrency does not
+  create unbounded CDN requests.
 - Exposes `aclose()`; service code closes adapter clients after poll/download use.
 
 Adapters currently implemented:
@@ -402,6 +422,7 @@ Adapters currently implemented:
 - `scheduler.jobs_error`
 - `enabled_sources[]`
 - `sources[]` with source name, enabled state, last poll time, last error, and consecutive failures.
+- `runtime` download caps for global, per-series, and per-source scheduling.
 - `download_jobs` with counts by job status.
 - `kavita_sync_jobs` with counts by job status.
 - `kavita.configured`
@@ -475,6 +496,11 @@ The latest robustness pass implemented:
 - MangaFire `new` vs `hot` discovery mode with `new` as the default.
 - Lower-priority source fallback after best-source max failures.
 - Raspberry Pi deployment assumptions documented for Docker Compose on external SSD.
+- MangaFire `/updated` pagination and HTML detail fallback.
+- KingOfShojo description-prefix alias extraction and cleanup.
+- Existing source-series match candidate regeneration during repair.
+- Per-series download concurrency caps and running job heartbeat updates.
+- Manual stale download job recovery from Info.
 
 ## Test Coverage
 

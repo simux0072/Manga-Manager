@@ -85,6 +85,25 @@ def test_asura_uses_parent_card_cover():
     assert recent[0].cover_url == "https://asurascans.com/covers/parent.webp"
 
 
+def test_asura_detail_prefers_visible_summary_and_filters_polluted_alias():
+    soup = BeautifulSoup(
+        """
+        <h1>Example Hero</h1>
+        <div class="summary__content">Visible series summary.</div>
+        <p>Example Hero Asura Scans Home First Chapter</p>
+        """,
+        "html.parser",
+    )
+
+    item = AsuraAdapter().parse_series_detail(
+        soup,
+        SeriesItem("asura", "comics/example", "Example Hero", "https://asurascans.com/comics/example"),
+    )
+
+    assert item.description == "Visible series summary."
+    assert "Asura Scans Home" not in item.aliases
+
+
 def test_asura_uses_chapter_url_when_label_has_no_number():
     soup = BeautifulSoup(
         """
@@ -197,6 +216,29 @@ def test_kingofshojo_uses_parent_card_cover():
     assert recent[0].cover_url == "https://kingofshojo.com/covers/card.jpg"
 
 
+def test_kingofshojo_extracts_aliases_from_description_prefix_and_cleans_cover():
+    soup = BeautifulSoup(
+        """
+        <h1>Sashimi Master</h1>
+        <div class="entry-content">
+          Read manhwa Sashimi Master / Conquering the Academy with Just a Sashimi Knife / Sashimi Blade
+          Synopsis A student survives with a sashimi knife.
+        </div>
+        <div class="summary_image"><img data-src="/wp-content/uploads/cover.webp"></div>
+        """,
+        "html.parser",
+    )
+
+    item = KingOfShojoAdapter().parse_series_detail(
+        soup,
+        SeriesItem("kingofshojo", "manga/sashimi", "Sashimi Master", "https://kingofshojo.com/manga/sashimi/"),
+    )
+
+    assert "Conquering the Academy with Just a Sashimi Knife" in item.aliases
+    assert not item.description.startswith("Read manhwa")
+    assert item.cover_url == "https://kingofshojo.com/wp-content/uploads/cover.webp"
+
+
 def test_mangafire_uses_api_payloads_for_titles_chapters_and_pages():
     adapter = MangaFireAdapter()
     recent = adapter.parse_recent_series(
@@ -237,6 +279,61 @@ def test_mangafire_uses_api_payloads_for_titles_chapters_and_pages():
     assert adapter.parse_chapter_image_urls(
         {"data": {"pages": [{"url": "https://m3z.mfcdn3.xyz/mf/page.jpg"}]}}
     ) == ["https://m3z.mfcdn3.xyz/mf/page.jpg"]
+
+
+def test_mangafire_parses_updated_html_and_filters_non_english_chapters():
+    soup = BeautifulSoup(
+        """
+        <div class="unit">
+          <a href="/title/gl3-gun-x-clover" title="Gun X Clover">
+            <img data-src="/covers/gun.webp">
+          </a>
+          <a href="/title/gl3-gun-x-clover/chapter/en61">Chapter 61 English Jul 09, 2026</a>
+          <a href="/title/gl3-gun-x-clover/chapter/es60">Chapter 60 Spanish Jul 09, 2026</a>
+        </div>
+        <div class="unit">
+          <a href="/title/ab1-other">Other Chapter 5</a>
+        </div>
+        """,
+        "html.parser",
+    )
+
+    adapter = MangaFireAdapter()
+    recent = adapter.parse_updated_page(soup)
+    chapters = adapter.parse_updated_chapters_for_link(
+        soup.select_one("a[href='/title/gl3-gun-x-clover']"),
+        "gl3",
+        "/title/gl3-gun-x-clover",
+    )
+
+    assert recent[0].source_id == "gl3"
+    assert recent[0].title == "Gun X Clover"
+    assert recent[0].cover_url == "https://mangafire.to/covers/gun.webp"
+    assert [chapter.number for chapter in chapters] == ["61"]
+    assert chapters[0].url == "https://mangafire.to/title/gl3-gun-x-clover/chapter/en61"
+
+
+def test_mangafire_html_detail_fallback_parses_metadata():
+    soup = BeautifulSoup(
+        """
+        <h1>Gun X Clover</h1>
+        <meta property="og:image" content="https://img.example/cover.webp">
+        <div class="synopsis">A school action series.</div>
+        <p>Alternative Titles: Gun Clover / Clover Gun Status Ongoing</p>
+        <a href="/genre/action">Action</a>
+        """,
+        "html.parser",
+    )
+
+    item = MangaFireAdapter().parse_series_detail_html(
+        soup,
+        SeriesItem("mangafire", "gl3", "Gun X Clover", "https://mangafire.to/title/gl3-gun-x-clover"),
+    )
+
+    assert item.description == "A school action series."
+    assert item.aliases == ("Gun Clover", "Clover Gun")
+    assert item.cover_url == "https://img.example/cover.webp"
+    assert item.genres == ("Action",)
 
 
 def test_mangafire_parses_current_chapter_payload_variants():

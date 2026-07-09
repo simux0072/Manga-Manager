@@ -68,10 +68,18 @@ class AsuraAdapter(SourceAdapter):
             else source_series.title
         )
         description = ""
-        for selector in ("meta[name='description']", "meta[property='og:description']"):
+        for selector in (
+            ".summary__content",
+            ".description",
+            ".entry-content",
+            "[class*='summary']",
+            "meta[name='description']",
+            "meta[property='og:description']",
+        ):
             tag = soup.select_one(selector)
-            if tag and tag.get("content"):
-                description = str(tag["content"]).strip()
+            if tag:
+                description = str(tag.get("content") or tag.get_text(" ", strip=True)).strip()
+            if description:
                 break
         cover = ""
         image = soup.select_one("meta[property='og:image']")
@@ -246,4 +254,5 @@ def parse_aliases(text: str, title: str) -> tuple[str, ...]:
         for value in re.split(r"\s+[•·]\s+", match.group(1))
         if value.strip(" ·•") and len(value.strip(" ·•")) > 2
     ]
-    return tuple(aliases[:5])
+    polluted = {"asura scans home", "asura scans", "home"}
+    return tuple(alias for alias in aliases[:5] if alias.lower() not in polluted)

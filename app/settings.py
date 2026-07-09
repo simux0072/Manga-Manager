@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     first_import_chapters: int = Field(default=5, ge=1)
     source_pull_concurrency: int = Field(default=4, ge=1)
     download_concurrency: int = Field(default=4, ge=1)
+    download_per_series_concurrency: int = Field(default=1, ge=1)
     download_drain_interval_minutes: int = Field(default=2, ge=1)
     asura_download_concurrency: int = Field(default=1, ge=1)
     mangafire_download_concurrency: int = Field(default=4, ge=1)
@@ -76,6 +77,7 @@ class Settings(BaseSettings):
     smtp_to: str = ""
     kingofshojo_timeout_seconds: float = Field(default=45.0, ge=10.0)
     kingofshojo_recent_pages: int = Field(default=3, ge=1)
+    mangafire_recent_pages: int = Field(default=3, ge=1)
     mangafire_recent_limit: int = Field(default=50, ge=1)
     mangafire_discovery_mode: Literal["new", "hot"] = "new"
 

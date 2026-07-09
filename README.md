@@ -143,10 +143,15 @@ The Library page includes operational controls and local reading state:
 - Manual queue drains, retry controls, source rescans, Want to Read sync, repair, and retention cleanup.
 - Activity history at `/activity` and an RSS feed at `/notifications/rss.xml`.
 
-`Repair known manga` rescans known source series, prioritizing tracked manga, refreshes detail
-metadata, removes legacy bad placeholder chapter rows that have no downloaded files, normalizes
-obviously polluted titles, and refreshes missing or broken covers. Use it after parser fixes or
-after importing data created by an older version.
+`Repair known manga` runs a non-destructive repair pass. It rescans known source series, prioritizing
+tracked manga, refreshes detail metadata and aliases, removes legacy bad placeholder chapter rows
+that have no downloaded files, normalizes obviously polluted titles, refreshes missing or broken
+covers, regenerates pending cross-source match candidates, and recovers stale download jobs. Use it
+after parser or matcher fixes, or after importing data created by an older version. It does not flush
+or rebuild the database.
+
+`Recover stale jobs` requeues old `running` download jobs whose heartbeat is older than
+`DOWNLOAD_STALE_MINUTES`. Use it when a worker was interrupted and jobs remain stuck as running.
 
 The job drawer is intentionally compact and only shows recent grouped work. The Info page is the
 authoritative operations view: it shows true queued/running/delayed/failed/completed counts and a
@@ -158,12 +163,15 @@ delayed until `Retry-After` when the source provides it, or until the configured
 expires. During cooldown, Manga Manager can temporarily download the same chapter from a lower
 priority source and later replace it with the higher-priority source.
 
-Download scheduling is source-aware. `DOWNLOAD_CONCURRENCY` limits total running download jobs,
-while `ASURA_DOWNLOAD_CONCURRENCY`, `MANGAFIRE_DOWNLOAD_CONCURRENCY`, and
+Download scheduling is source- and series-aware. `DOWNLOAD_CONCURRENCY` limits total running
+download jobs, `DOWNLOAD_PER_SERIES_CONCURRENCY` prevents one manga from occupying every worker, and
+`ASURA_DOWNLOAD_CONCURRENCY`, `MANGAFIRE_DOWNLOAD_CONCURRENCY`, and
 `KINGOFSHOJO_DOWNLOAD_CONCURRENCY` cap each website independently. Asura defaults to a conservative
 single job, while MangaFire and KingOfShojo can run more work in parallel. Page image fetching is
 also bounded per source with `ASURA_PAGE_CONCURRENCY`, `MANGAFIRE_PAGE_CONCURRENCY`, and
-`KINGOFSHOJO_PAGE_CONCURRENCY`; fetched images are still written to CBZ files in page order.
+`KINGOFSHOJO_PAGE_CONCURRENCY`; fetched images are still written to CBZ files in page order. Running
+downloads update a heartbeat while pages are staged so healthy long downloads are not treated as
+stale.
 `DOWNLOAD_DRAIN_INTERVAL_MINUTES` controls how often the scheduler drains queued downloads.
 
 Retention cleanup is disabled by default. Set `RETENTION_REPLACED_DAYS` or
@@ -184,8 +192,10 @@ opens the series; chapter rows open the specific chapter. Bookmark/follow counts
 merged sources. Rating uses the highest-priority source that has a rating rather than averaging
 different sites.
 
-The `Visible websites` checkboxes hide source badges, chapter rows, and any Discovery or Library
-card with no remaining visible source rows.
+Source tabs filter Discovery server-side and show counts for `All`, Asura, MangaFire, and
+KingOfShojo. `All` interleaves recent series by source so a very active source cannot dominate the
+first page. The `Visible websites` checkboxes still hide source badges, chapter rows, and any
+Discovery or Library card with no remaining visible source rows client-side.
 
 Potential Matches only suggests cross-source matches. Exact external IDs and exact normalized titles
 can still auto-match, but weak title matches are kept for manual review. The matcher also boosts
@@ -195,8 +205,11 @@ catch titles with different translations.
 Manual source refresh actions are labeled `Pull`. Pulls run in the background and the top bar shows
 pull progress. Discovery is paginated with a `Load more` control using `DISCOVERY_PAGE_SIZE`.
 
-MangaFire defaults to the latest/new updates feed via `MANGAFIRE_DISCOVERY_MODE=new`. Set
-`MANGAFIRE_DISCOVERY_MODE=hot` only if you explicitly want MangaFire's hot feed.
+MangaFire defaults to the latest/new updates feed via `MANGAFIRE_DISCOVERY_MODE=new`. Discovery uses
+paginated `/updated` HTML parsing controlled by `MANGAFIRE_RECENT_PAGES`; detail and chapter API
+calls happen later during enrichment/rescan so item-level MangaFire throttling does not hide the
+whole updated list. Set `MANGAFIRE_DISCOVERY_MODE=hot` only if you explicitly want MangaFire's hot
+feed for the legacy API parser/tests.
 
 MangaFire is treated as English-only. MangaFire series with no English chapters are skipped during
 Discovery so they do not appear as broken cards.
@@ -208,6 +221,7 @@ interval because its CDN may return `429 Too Many Requests` during bursts. Relev
 
 - `ASURA_REQUEST_INTERVAL_SECONDS`: delay between Asura HTTP requests.
 - `DOWNLOAD_CONCURRENCY`: maximum total running chapter download jobs.
+- `DOWNLOAD_PER_SERIES_CONCURRENCY`: maximum running download jobs for a single canonical series.
 - `DOWNLOAD_DRAIN_INTERVAL_MINUTES`: scheduler interval for draining queued download jobs.
 - `ASURA_DOWNLOAD_CONCURRENCY`, `MANGAFIRE_DOWNLOAD_CONCURRENCY`,
   `KINGOFSHOJO_DOWNLOAD_CONCURRENCY`: per-source running job caps.

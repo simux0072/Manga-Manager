@@ -10,6 +10,7 @@
     <form method="post" action="/kavita/want-to-read/sync" data-async-form>{{ csrf_input()|safe }}<button>Sync Want to Read</button></form>
     <form method="post" action="/maintenance/refresh-missing-covers" data-async-form>{{ csrf_input()|safe }}<button>Refresh missing covers</button></form>
     <form method="post" action="/maintenance/repair-known-series" data-async-form>{{ csrf_input()|safe }}<button>Repair known manga</button></form>
+    <form method="post" action="/maintenance/recover-stale-downloads" data-async-form>{{ csrf_input()|safe }}<button>Recover stale jobs</button></form>
     <form method="post" action="/maintenance/cleanup-retention" data-async-form>{{ csrf_input()|safe }}<button>Cleanup retention</button></form>
     <form method="post" action="/retry-failed" data-async-form>{{ csrf_input()|safe }}<button>Retry failed jobs</button></form>
   </div>
@@ -40,6 +41,11 @@
     <div class="ops-panel">
       <h3>Queues</h3>
       <dl>
+        <dt>Global downloads</dt><dd>{{ operations.runtime.download_concurrency }}</dd>
+        <dt>Per series</dt><dd>{{ operations.runtime.per_series_concurrency }}</dd>
+        {% for source, cap in operations.runtime.source_caps.items() %}
+          <dt>{{ source }} cap</dt><dd>{{ cap }}</dd>
+        {% endfor %}
         {% for status, count in operations.download_jobs.items() %}
           <dt>Downloads {{ status }}</dt><dd>{{ count }}</dd>
         {% else %}
@@ -104,4 +110,6 @@
     </section>
   </div>
 </section>
+
+<script id="initial-jobs-payload" type="application/json">{{ jobs_payload|tojson }}</script>
 {% endblock %}
