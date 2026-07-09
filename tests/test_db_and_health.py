@@ -424,8 +424,9 @@ def test_info_shows_retry_job_metadata_and_library_does_not():
     assert "Retry failed jobs" in info_html
     assert "Operations" in info_html
     assert "Run download drain" in info_html
-    assert 'data-jobs-list="downloads"' in info_html
-    assert 'data-jobs-list="kavita"' in info_html
+    assert 'data-jobs-status="active"' in info_html
+    assert 'data-jobs-status="failed"' in info_html
+    assert 'data-jobs-status="completed"' in info_html
 
 
 def test_library_renders_structured_notice_and_highlights():
@@ -461,6 +462,9 @@ def test_library_renders_structured_notice_and_highlights():
     assert "Pick something" in html
     assert f'href="/series/{source_series.series_id}/open"' in html
     assert "Rescan mangafire chapters" in html
+    assert '<details class="library-details">' in html
+    assert 'class="chapter-list latest-chapters"' in html
+    assert 'data-source-row="mangafire"' in html
 
 
 def test_library_pick_something_shows_pending_sync_for_downloaded_unmapped_series():
@@ -902,7 +906,9 @@ def test_app_js_has_source_filters_and_jobs_drawer():
     assert 'renderSection("Completed"' in script
     assert 'renderSection("Failed"' in script
     assert ".slice(0, 10)" in script
-    assert "showChapters: kind === \"downloads\"" in script
+    assert "data-jobs-status" in script
+    assert "data-source-row" in script
+    assert "showChapters: job.kind === \"download_series\"" in script
     assert "toast-stack" in Path("app/templates/base.html").read_text()
 
 

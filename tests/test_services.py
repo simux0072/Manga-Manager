@@ -2002,6 +2002,36 @@ async def test_poll_source_reports_total_and_processed_progress(monkeypatch):
     assert progress == [(0, 2), (1, 2), (2, 2)]
 
 
+async def test_poll_source_skips_mangafire_items_without_english_chapters(monkeypatch):
+    class Adapter:
+        async def list_recent(self):
+            return [
+                SeriesItem(source="mangafire", source_id="english", title="English", url="english"),
+                SeriesItem(source="mangafire", source_id="no-english", title="No English", url="no-english"),
+            ]
+
+        async def get_chapters(self, item):
+            if item.source_id == "no-english":
+                return []
+            return [ChapterItem("mangafire", item.source_id, "0", "Oneshot", item.url, None)]
+
+    session = make_session()
+    progress = []
+    monkeypatch.setattr(services, "adapter_for_source", lambda source: Adapter())
+
+    assert await services.poll_source(
+        session,
+        "mangafire",
+        progress=lambda processed, total: progress.append((processed, total)),
+    ) == 1
+
+    assert progress == [(0, 2), (1, 2), (2, 2)]
+    assert session.query(Series).filter_by(title="English").one()
+    assert session.query(Series).filter_by(title="No English").one_or_none() is None
+    health = session.get(SourceHealth, "mangafire")
+    assert health.consecutive_failures == 0
+
+
 async def test_poll_source_failed_item_does_not_leave_dangling_cover_path(tmp_path, monkeypatch):
     calls = 0
 

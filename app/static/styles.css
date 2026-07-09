@@ -471,20 +471,80 @@ h3 {
 }
 
 .library-item {
-  grid-template-columns: 76px minmax(200px, 1fr) minmax(240px, 1fr);
+  display: block;
 }
 
 .cover-card {
-  grid-template-columns: 112px minmax(0, 1fr);
+  display: block;
 }
 
-.cover-card .chapter-list {
-  grid-column: 1 / -1;
+.library-details {
+  display: block;
+}
+
+.library-summary {
+  align-items: center;
+  cursor: pointer;
+  display: grid;
+  gap: 14px;
+  grid-template-columns: 76px minmax(180px, 1fr) minmax(240px, 0.9fr) auto;
+  list-style: none;
+}
+
+.library-summary::-webkit-details-marker {
+  display: none;
+}
+
+.library-summary::after {
+  color: #778396;
+  content: "Expand";
+  font-size: 13px;
+  justify-self: end;
+}
+
+.library-details[open] .library-summary::after {
+  content: "Collapse";
+}
+
+.library-card-main {
+  display: grid;
+  gap: 5px;
+  min-width: 0;
+}
+
+.library-card-main h2,
+.library-card-main p {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.library-expanded {
+  border-top: 1px solid #e2e7ef;
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+  padding-top: 14px;
+}
+
+.library-controls {
+  display: grid;
+  gap: 8px;
+}
+
+.library-controls form {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
 }
 
 .chapter-list {
   display: grid;
   gap: 4px;
+}
+
+.latest-chapters {
+  min-width: 0;
 }
 
 .chapter-progress-row,
@@ -495,6 +555,16 @@ h3 {
   display: grid;
   gap: 8px;
   padding: 8px;
+}
+
+.chapter-progress-row {
+  align-items: center;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+
+.chapter-progress-row.compact {
+  font-size: 13px;
+  padding: 6px 8px;
 }
 
 .activity-row {
@@ -528,10 +598,14 @@ h3 {
 
   .manga-card,
   .update-grid,
-  .library-item,
+  .library-summary,
   .match-row,
   .ops-grid {
     grid-template-columns: 1fr;
+  }
+
+  .library-summary::after {
+    justify-self: start;
   }
 
   .update-card {
@@ -551,6 +625,11 @@ h3 {
 
   .chapter-row {
     grid-template-columns: minmax(0, 1fr);
+  }
+
+  .chapter-progress-row,
+  .job-chapter-row {
+    grid-template-columns: 1fr;
   }
 }
 
@@ -777,10 +856,15 @@ button.secondary:hover,
   gap: 8px;
 }
 
-.job-columns {
+.job-columns,
+.job-status-sections {
   display: grid;
   gap: 14px;
   grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+}
+
+.job-status-sections {
+  grid-template-columns: 1fr;
 }
 
 .drawer-section {
@@ -788,8 +872,15 @@ button.secondary:hover,
   gap: 8px;
 }
 
+.drawer-section summary {
+  color: #f2f6fc;
+  cursor: pointer;
+  font-weight: 700;
+}
+
 .drawer-job {
   cursor: pointer;
+  display: grid;
   grid-template-columns: minmax(80px, 1fr) auto minmax(0, 1.4fr) auto auto;
 }
 
@@ -833,7 +924,7 @@ button.secondary:hover,
   background: #111722;
   border: 1px solid #2b3546;
   border-radius: 6px;
-  grid-template-columns: 70px 80px 80px minmax(0, 1fr) auto;
+  grid-template-columns: 70px 80px 70px 50px minmax(120px, 1fr) minmax(0, 1.4fr) auto;
   padding: 6px 8px;
 }
 
@@ -848,6 +939,11 @@ button.secondary:hover,
 .job-panel {
   max-height: 360px;
   overflow: auto;
+}
+
+.job-panel-wide {
+  max-height: none;
+  overflow: visible;
 }
 
 .job-panel summary,

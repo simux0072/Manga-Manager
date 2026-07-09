@@ -70,6 +70,10 @@ function applyFilters() {
   document.querySelectorAll("[data-series-card]").forEach((card) => {
     card.hidden = !cardMatchesSource(card, hidden) || !cardMatchesLibraryFilter(card);
   });
+  document.querySelectorAll("[data-source-row]").forEach((row) => {
+    const source = row.dataset.sourceRow || "";
+    row.hidden = Boolean(source && hidden.has(source));
+  });
   document.querySelectorAll("[data-library-filter]").forEach((link) => {
     const active = link.dataset.libraryFilter === state.filter;
     link.classList.toggle("button-link", active);
@@ -139,8 +143,14 @@ function jobDetail(job) {
   if (job.kind === "pull" && job.total) parts.push(`${job.processed}/${job.total}`);
   if (job.job_type && job.job_type !== "normal") parts.push(job.job_type);
   if (job.retry_after) parts.push(`retry ${job.retry_after}`);
-  if (job.error) parts.push(job.error);
+  if (job.error) parts.push(shortText(job.error));
   return parts.join(" · ");
+}
+
+function shortText(value, max = 96) {
+  if (!value) return "";
+  const text = String(value);
+  return text.length > max ? `${text.slice(0, max - 1)}...` : text;
 }
 
 function retryUrl(job) {
@@ -229,9 +239,14 @@ function renderJobDetails(job, options = {}) {
       source.textContent = chapter.source || "";
       const status = document.createElement("span");
       status.textContent = chapter.status;
+      const attempts = document.createElement("span");
+      attempts.textContent = chapter.attempts ? `${chapter.attempts}x` : "";
+      const retry = document.createElement("span");
+      retry.textContent = chapter.retry_after || "";
       const error = document.createElement("span");
-      error.textContent = chapter.error || "";
-      chapterRow.append(label, source, status, error);
+      error.textContent = shortText(chapter.error);
+      error.title = chapter.error || "";
+      chapterRow.append(label, source, status, attempts, retry, error);
       if (chapter.retryable) {
         const button = document.createElement("button");
         button.type = "button";
@@ -300,9 +315,10 @@ function renderJob(job, options = {}) {
 }
 
 function renderSection(title, jobs, options = {}) {
-  const section = document.createElement("section");
+  const section = document.createElement("details");
   section.className = "drawer-section";
-  const heading = document.createElement("h3");
+  section.open = options.open !== false;
+  const heading = document.createElement("summary");
   heading.textContent = `${title} (${jobs.length})`;
   section.append(heading);
   const body = document.createElement("div");
@@ -317,6 +333,25 @@ function renderSection(title, jobs, options = {}) {
   }
   section.append(body);
   return section;
+}
+
+function allJobs(payload) {
+  return [...(payload.pulls || []), ...(payload.downloads || []), ...(payload.kavita || [])];
+}
+
+function splitJobsByStatus(payload) {
+  const jobs = allJobs(payload);
+  return {
+    active: jobs
+      .filter((job) => ["queued", "running", "delayed"].includes(job.status))
+      .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || "")),
+    failed: jobs
+      .filter((job) => job.status === "failed")
+      .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || "")),
+    completed: jobs
+      .filter((job) => ["complete", "skipped"].includes(job.status))
+      .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || "")),
+  };
 }
 
 function renderOverall(payload) {
@@ -350,22 +385,27 @@ function renderJobs(payload) {
   renderOverall(payload);
   const drawer = document.getElementById("jobs-drawer-content");
   if (drawer) {
-    const allJobs = [...(payload.pulls || []), ...(payload.downloads || []), ...(payload.kavita || [])];
-    const queued = allJobs.filter((job) => ["queued", "running", "delayed"].includes(job.status));
-    const completed = allJobs
-      .filter((job) => ["complete", "skipped"].includes(job.status))
-      .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""))
-      .slice(0, 10);
-    const failed = allJobs
-      .filter((job) => job.status === "failed")
-      .sort((a, b) => (b.updated_at || "").localeCompare(a.updated_at || ""))
-      .slice(0, 10);
+    const byStatus = splitJobsByStatus(payload);
     drawer.replaceChildren(
-      renderSection("Queued", queued),
-      renderSection("Completed", completed),
-      renderSection("Failed", failed),
+      renderSection("Queued", byStatus.active),
+      renderSection("Completed", byStatus.completed.slice(0, 10), {open: false}),
+      renderSection("Failed", byStatus.failed.slice(0, 10), {open: false}),
     );
   }
+  const byStatus = splitJobsByStatus(payload);
+  Object.entries(byStatus).forEach(([status, jobs]) => {
+    document.querySelectorAll(`[data-jobs-status="${status}"]`).forEach((target) => {
+      target.replaceChildren(
+        ...jobs.map((job) => renderJob(job, {showChapters: job.kind === "download_series"})),
+      );
+      if (!jobs.length) {
+        const empty = document.createElement("p");
+        empty.className = "empty";
+        empty.textContent = "No recent jobs.";
+        target.append(empty);
+      }
+    });
+  });
   ["pulls", "downloads", "kavita"].forEach((kind) => {
     document.querySelectorAll(`[data-jobs-list="${kind}"]`).forEach((target) => {
       target.replaceChildren(

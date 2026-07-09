@@ -401,10 +401,22 @@ async def poll_source(
                 commit_with_retry(session)
             count = 0
             item_failures = 0
+            skipped_items = 0
             cover_cache_results: list[CoverCacheResult] = []
             for index, item in enumerate(items, start=1):
                 try:
                     chapters = await adapter.get_chapters(item)
+                    if source == "mangafire" and not chapters:
+                        skipped_items += 1
+                        logger.info(
+                            "skipping %s item with no english chapters: %s",
+                            source,
+                            item.url,
+                        )
+                        if progress is not None:
+                            progress(index, len(items))
+                            commit_with_retry(session)
+                        continue
                     with session.begin_nested():
                         source_series = merge_series_item(session, item)
                         for chapter in chapters:
@@ -436,7 +448,11 @@ async def poll_source(
                     "success",
                     f"{source} poll found {count} series",
                     source=source,
-                    metadata={"count": count, "item_failures": item_failures},
+                    metadata={
+                        "count": count,
+                        "item_failures": item_failures,
+                        "skipped_items": skipped_items,
+                    },
                 )
             commit_with_retry(session)
             cleanup_stale_cover_images(cover_cache_results)

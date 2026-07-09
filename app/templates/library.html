@@ -116,48 +116,65 @@
       data-unread="{{ 'true' if state.unread_ready else 'false' }}"
       data-sources="{{ item.sources|map(attribute='source')|join(' ') }}"
     >
-      <div class="cover small">
-        {% if item.cover_path %}<img src="/covers/{{ item.cover_path.split('/')[-1] }}" alt="">
-        {% elif item.cover_url %}<img src="{{ item.cover_url }}" alt="">
-        {% else %}<span>No cover</span>{% endif %}
-      </div>
-      <div>
-        <h2>{{ item.title }}</h2>
-        <p>Status: {{ item.status }}</p>
-        <p>Progress: {{ item.progress.status if item.progress else "unread" }}</p>
-        <p>{{ item.chapters|length }} chapters known</p>
-        <form method="post" action="/series/{{ item.id }}/status" data-async-form data-remove-statuses="new ignored">{{ csrf_input()|safe }}
-          <button name="status" value="new">Back to discovery</button>
-          <button name="status" value="ignored">Ignore</button>
-        </form>
-        <form method="post" action="/series/{{ item.id }}/progress" class="actions compact" data-async-form>{{ csrf_input()|safe }}
-          <button name="status" value="interested" class="secondary">Interested</button>
-          <button name="status" value="reading" class="secondary">Reading</button>
-          <button name="status" value="paused" class="secondary">Paused</button>
-        </form>
-        <form method="post" action="/series/{{ item.id }}/caught-up" class="actions compact" data-async-form>{{ csrf_input()|safe }}
-          <button class="secondary">Caught up</button>
-        </form>
-        <div class="actions compact">
-          {% for source in item.sources %}
-            <form method="post" action="/source-series/{{ source.id }}/rescan" data-async-form>{{ csrf_input()|safe }}
-              <button class="secondary" data-source="{{ source.source }}">Rescan {{ source.source }} chapters</button>
-            </form>
-          {% endfor %}
-        </div>
-      </div>
-      <div class="chapter-list">
-        {% for chapter in item.chapters[:8] %}
-          <div class="chapter-progress-row">
-            <span data-source="{{ chapter.best_source or chapter.downloaded_source }}">Ch. {{ chapter.number }} · {{ chapter.progress.status if chapter.progress else "unread" }} · best {{ chapter.best_source or "unknown" }} · downloaded {{ chapter.downloaded_source or "no" }}</span>
-            <form method="post" action="/chapters/{{ chapter.id }}/progress" class="actions compact" data-async-form>{{ csrf_input()|safe }}
-              <button name="status" value="reading" class="secondary">Reading</button>
-              <button name="status" value="read" class="secondary">Read</button>
-              <button name="status" value="unread" class="secondary">Unread</button>
-            </form>
+      <details class="library-details">
+        <summary class="library-summary">
+          <div class="cover small">
+            {% if item.cover_path %}<img src="/covers/{{ item.cover_path.split('/')[-1] }}" alt="">
+            {% elif item.cover_url %}<img src="{{ item.cover_url }}" alt="">
+            {% else %}<span>No cover</span>{% endif %}
           </div>
-        {% endfor %}
-      </div>
+          <div class="library-card-main">
+            <h2>{{ item.title }}</h2>
+            <p>Status: {{ item.status }} · Progress: {{ item.progress.status if item.progress else "unread" }}</p>
+            <p>{{ item.chapters|length }} chapters known · {{ "Kavita ready" if item.kavita_series_id and item.kavita_library_id else "Pending Kavita sync" if state.downloaded_unmapped else "Not downloaded yet" }}</p>
+          </div>
+          <div class="chapter-list latest-chapters">
+            {% for chapter in item.chapters[:3] %}
+              <div class="chapter-progress-row compact" data-source-row="{{ chapter.best_source or chapter.downloaded_source }}">
+                <span>Ch. {{ chapter.number }} · {{ chapter.progress.status if chapter.progress else "unread" }}</span>
+                <span class="muted">{{ chapter.best_source or chapter.downloaded_source or "unknown" }}</span>
+              </div>
+            {% else %}
+              <p class="empty">No chapters known.</p>
+            {% endfor %}
+          </div>
+        </summary>
+        <div class="library-expanded">
+          <div class="library-controls">
+            <form method="post" action="/series/{{ item.id }}/status" data-async-form data-remove-statuses="new ignored">{{ csrf_input()|safe }}
+              <button name="status" value="new">Back to discovery</button>
+              <button name="status" value="ignored">Ignore</button>
+            </form>
+            <form method="post" action="/series/{{ item.id }}/progress" class="actions compact" data-async-form>{{ csrf_input()|safe }}
+              <button name="status" value="interested" class="secondary">Interested</button>
+              <button name="status" value="reading" class="secondary">Reading</button>
+              <button name="status" value="paused" class="secondary">Paused</button>
+            </form>
+            <form method="post" action="/series/{{ item.id }}/caught-up" class="actions compact" data-async-form>{{ csrf_input()|safe }}
+              <button class="secondary">Caught up</button>
+            </form>
+            <div class="actions compact">
+              {% for source in item.sources %}
+                <form method="post" action="/source-series/{{ source.id }}/rescan" data-async-form>{{ csrf_input()|safe }}
+                  <button class="secondary" data-source="{{ source.source }}">Rescan {{ source.source }} chapters</button>
+                </form>
+              {% endfor %}
+            </div>
+          </div>
+          <div class="chapter-list">
+            {% for chapter in item.chapters[:12] %}
+              <div class="chapter-progress-row" data-source-row="{{ chapter.best_source or chapter.downloaded_source }}">
+                <span>Ch. {{ chapter.number }} · {{ chapter.progress.status if chapter.progress else "unread" }} · best {{ chapter.best_source or "unknown" }} · downloaded {{ chapter.downloaded_source or "no" }}</span>
+                <form method="post" action="/chapters/{{ chapter.id }}/progress" class="actions compact" data-async-form>{{ csrf_input()|safe }}
+                  <button name="status" value="reading" class="secondary">Reading</button>
+                  <button name="status" value="read" class="secondary">Read</button>
+                  <button name="status" value="unread" class="secondary">Unread</button>
+                </form>
+              </div>
+            {% endfor %}
+          </div>
+        </div>
+      </details>
     </article>
   {% else %}
     <p class="empty">No tracked manga yet.</p>

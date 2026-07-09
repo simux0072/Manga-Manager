@@ -117,16 +117,18 @@ class MangaFireAdapter(SourceAdapter):
                 or entry.get("chapterId")
                 or entry.get("chapter_id")
             )
-            raw_number = (
-                entry.get("number")
-                or entry.get("chapter")
-                or entry.get("chapterNumber")
-                or entry.get("name")
-                or entry.get("title")
-                or ""
+            raw_number = first_present(
+                entry,
+                "number",
+                "chapter",
+                "chapterNumber",
+                "name",
+                "title",
             )
+            if raw_number is None:
+                raw_number = ""
             number = normalize_chapter_number(str(raw_number))
-            if not chapter_id or not number:
+            if not chapter_id or number == "":
                 continue
             title = entry.get("name") or entry.get("title") or f"Chapter {number}"
             created_at = unix_datetime(
@@ -200,6 +202,13 @@ def is_english_chapter(value) -> bool:
         value = value.get("code") or value.get("name") or value.get("language") or ""
     normalized = str(value).strip().lower().replace("_", "-")
     return normalized in {"en", "eng", "english", "en-us", "en-gb"}
+
+
+def first_present(entry: dict, *keys: str):
+    for key in keys:
+        if key in entry and entry[key] not in (None, ""):
+            return entry[key]
+    return None
 
 
 def api_title(payload) -> dict:

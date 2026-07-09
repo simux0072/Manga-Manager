@@ -240,6 +240,33 @@ def test_mangafire_parses_current_chapter_payload_variants():
     assert chapters[0].url == "https://mangafire.to/title/gl3-gun-x-clover/chapter/abc123"
 
 
+def test_mangafire_keeps_english_oneshot_chapter_zero_and_filters_non_english():
+    adapter = MangaFireAdapter()
+    source = SeriesItem(
+        source="mangafire",
+        source_id="one",
+        title="One Shot",
+        url="https://mangafire.to/title/one-one-shot",
+    )
+
+    chapters = adapter.parse_chapters(
+        {
+            "data": {
+                "items": [
+                    {"hid": "en0", "number": 0, "name": "Oneshot", "language": "English"},
+                    {"hid": "es0", "number": 0, "name": "Especial", "language": "es"},
+                    {"hid": "fr1", "number": 1, "name": "French", "language": {"name": "French"}},
+                ]
+            }
+        },
+        source,
+    )
+
+    assert [chapter.number for chapter in chapters] == ["0"]
+    assert chapters[0].title == "Oneshot"
+    assert chapters[0].url == "https://mangafire.to/title/one-one-shot/chapter/en0"
+
+
 def test_mangafire_parses_top_level_chapters_with_missing_language():
     adapter = MangaFireAdapter()
     source = SeriesItem(
