@@ -8,7 +8,7 @@ from bs4 import BeautifulSoup
 
 from app.adapters.asura import dedupe_chapters, dedupe_series
 from app.adapters.base import SourceAdapter
-from app.adapters.http import HttpSourceClient
+from app.adapters.http import HttpSourceClient, iter_ordered_bytes, page_concurrency_for_source
 from app.domain import ChapterItem, SeriesItem, normalize_chapter_number
 from app.settings import settings
 
@@ -168,8 +168,13 @@ class MangaFireAdapter(SourceAdapter):
         chapter_id = urlparse(chapter.url).path.rstrip("/").split("/")[-1]
         payload = await self.client.get_json(f"/api/chapters/{chapter_id}")
         urls = self.parse_chapter_image_urls(payload)
-        for url in urls:
-            yield await self.client.get_bytes(url, referer=chapter.url)
+        async for page in iter_ordered_bytes(
+            self.client,
+            urls,
+            referer=chapter.url,
+            concurrency=page_concurrency_for_source(self.source),
+        ):
+            yield page
 
     def parse_chapter_image_urls(self, payload) -> list[str]:
         pages = (payload.get("data") or {}).get("pages") or []

@@ -219,6 +219,12 @@ h3 {
   margin: 0 0 4px;
 }
 
+.source-links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .health em {
   color: #9c3b36;
   font-style: normal;
@@ -674,14 +680,12 @@ h3 {
 /* Dark operational theme */
 :root {
   color-scheme: dark;
-  background: #10141c;
-  color: #e6edf7;
+  background: #0b0f14;
+  color: #ecf3ff;
 }
 
 body {
-  background:
-    radial-gradient(circle at top right, rgba(37, 99, 162, 0.16), transparent 32rem),
-    #10141c;
+  background: #0b0f14;
 }
 
 .topbar,
@@ -700,11 +704,11 @@ body {
 .ops-table,
 .filter-link {
   background: #171d28;
-  border-color: #2b3546;
+  border-color: #2b3a4d;
 }
 
 .topbar {
-  border-bottom-color: #2b3546;
+  border-bottom-color: #2b3a4d;
 }
 
 .brand,
@@ -729,7 +733,7 @@ nav a.active,
 .button-link,
 button {
   background: #2c6fa8;
-  border-color: #3b83bd;
+  border-color: #4f8cff;
 }
 
 button:hover,
@@ -740,7 +744,7 @@ button:hover,
 button.secondary,
 .filter-link {
   background: #1c2431;
-  border-color: #3a4658;
+  border-color: #2b3a4d;
   color: #dce6f5;
 }
 
@@ -752,7 +756,7 @@ button.secondary:hover,
 
 .chapter-row {
   background: #141b26;
-  border-color: #2b3546;
+  border-color: #2b3a4d;
 }
 
 .muted,
@@ -763,6 +767,41 @@ button.secondary:hover,
 .chapter-row span:last-child,
 .empty {
   color: #91a3bb;
+}
+
+.stat-badges {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.stat-badge {
+  align-items: center;
+  background: #192231;
+  border: 1px solid #2b3a4d;
+  border-radius: 999px;
+  color: #cddbf0;
+  display: inline-flex;
+  font-size: 12px;
+  font-weight: 700;
+  gap: 4px;
+  line-height: 1;
+  padding: 5px 8px;
+  white-space: nowrap;
+}
+
+.stat-rating {
+  background: rgba(246, 200, 95, 0.14);
+  border-color: rgba(246, 200, 95, 0.48);
+  color: #f6c85f;
+}
+
+.stat-bookmarks {
+  background: rgba(167, 139, 250, 0.14);
+  border-color: rgba(167, 139, 250, 0.5);
+  color: #c4b5fd;
 }
 
 .notice {
@@ -835,8 +874,8 @@ button.secondary:hover,
 }
 
 .jobs-drawer {
-  background: #171d28;
-  border-left: 1px solid #2b3546;
+  background: #131a23;
+  border-left: 1px solid #2b3a4d;
   bottom: 0;
   box-shadow: -12px 0 30px rgba(0, 0, 0, 0.28);
   display: grid;
@@ -890,12 +929,13 @@ button.secondary:hover,
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
-  justify-content: flex-end;
+  justify-content: center;
   margin-top: 10px;
 }
 
 .job-pager .muted {
-  margin-left: auto;
+  min-width: 140px;
+  text-align: center;
 }
 
 .job-columns,
@@ -911,13 +951,14 @@ button.secondary:hover,
 
 .drawer-section {
   display: grid;
-  gap: 6px;
+  gap: 4px;
 }
 
 .drawer-section summary {
   color: #f2f6fc;
   cursor: pointer;
   font-weight: 700;
+  padding: 2px 0;
 }
 
 .drawer-job {
@@ -936,7 +977,7 @@ button.secondary:hover,
 }
 
 .job-details {
-  border-top: 1px solid #2b3546;
+  border-top: 1px solid #2b3a4d;
   display: grid;
   gap: 6px;
   grid-column: 1 / -1;
@@ -964,7 +1005,7 @@ button.secondary:hover,
 .job-chapter-row {
   align-items: center;
   background: #111722;
-  border: 1px solid #2b3546;
+  border: 1px solid #2b3a4d;
   border-radius: 6px;
   grid-template-columns: 70px 80px 70px 50px minmax(120px, 1fr) minmax(0, 1.4fr) auto;
   padding: 6px 8px;
@@ -973,7 +1014,7 @@ button.secondary:hover,
 .job-panel,
 .activity-group {
   background: #171d28;
-  border: 1px solid #2b3546;
+  border: 1px solid #2b3a4d;
   border-radius: 8px;
   padding: 10px;
 }

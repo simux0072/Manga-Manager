@@ -47,7 +47,11 @@
             <h2>{{ candidate.candidate_series.title }}</h2>
             {% if candidate.candidate_series.aliases %}<p class="muted">{{ candidate.candidate_series.aliases.replace("|", ", ") }}</p>{% endif %}
             {% if candidate.candidate_series.sources %}
-              <a href="{{ candidate.candidate_series.sources[0].url }}" target="_blank" rel="noreferrer">Open source</a>
+              <div class="source-links">
+                {% for source in candidate.candidate_series.sources %}
+                  <a href="{{ source.url }}" target="_blank" rel="noreferrer">Open {{ source.source }}</a>
+                {% endfor %}
+              </div>
             {% endif %}
           </div>
         </div>

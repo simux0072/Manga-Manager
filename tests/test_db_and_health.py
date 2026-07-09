@@ -954,9 +954,50 @@ def test_discovery_uses_update_cards_with_series_and_chapter_links(monkeypatch):
     assert 'data-source-row="mangafire"' in html
     assert "A useful description" in html
     assert "Alt Example" in html
-    assert "rating 9.1" in html
-    assert "123 bookmarks" in html
+    assert "stat-rating" in html
+    assert "> 9.1</span>" in html
+    assert "stat-bookmarks" in html
+    assert "> 123</span>" in html
     assert "Ch. 12" in html
+
+
+def test_discovery_combines_bookmarks_and_uses_priority_rating(monkeypatch):
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    session = Session()
+    merge_series_item(
+        session,
+        SeriesItem(
+            source="kingofshojo",
+            source_id="king/example",
+            title="Combined Example",
+            url="k",
+            metadata={"follows": "1.2K", "rating": 8.1},
+        ),
+    )
+    high = merge_series_item(
+        session,
+        SeriesItem(
+            source="asura",
+            source_id="asura/example",
+            title="Combined Example",
+            url="a",
+            metadata={"follows": 300, "rating": 9.4},
+        ),
+    )
+    upsert_release(session, high, ChapterItem("asura", high.source_id, "1", "Chapter 1", "a", None))
+    session.commit()
+    monkeypatch.setattr(main, "enabled_source_names", lambda: ["asura", "kingofshojo"])
+    try:
+        html = main.discovery(make_request(), session).body.decode()
+    finally:
+        session.close()
+
+    assert "stat-rating" in html
+    assert "> 9.4</span>" in html
+    assert "stat-bookmarks" in html
+    assert "> 1.5K</span>" in html
 
 
 def test_discovery_card_css_keeps_cover_left_and_content_right():

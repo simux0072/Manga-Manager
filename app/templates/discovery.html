@@ -78,6 +78,22 @@
                 <span data-source="{{ source.source }}">{{ source.source }}</span>
               {% endfor %}
             </div>
+            {% if row.stats.rating or row.stats.bookmarks or row.stats.chapter_count or row.stats.rank %}
+              <div class="stat-badges">
+                {% if row.stats.rating %}
+                  <span class="stat-badge stat-rating" title="Rating"><span aria-hidden="true">★</span> {{ row.stats.rating }}</span>
+                {% endif %}
+                {% if row.stats.bookmarks %}
+                  <span class="stat-badge stat-bookmarks" title="Bookmarks"><span aria-hidden="true">🔖</span> {{ row.stats.bookmarks_label }}</span>
+                {% endif %}
+                {% if row.stats.chapter_count %}
+                  <span class="stat-badge" title="Known chapters">Ch. {{ row.stats.chapter_count_label }}</span>
+                {% endif %}
+                {% if row.stats.rank %}
+                  <span class="stat-badge" title="Rank">#{{ row.stats.rank }}</span>
+                {% endif %}
+              </div>
+            {% endif %}
             {% if row.description %}
               <p class="update-description">{{ row.description }}</p>
             {% endif %}
@@ -86,13 +102,6 @@
             {% endif %}
             {% if row.genres %}
               <p class="muted">Genres: {{ row.genres|join(", ") }}</p>
-            {% endif %}
-            {% if row.source_metrics %}
-              <div class="sources">
-                {% for metric in row.source_metrics %}
-                  <span data-source="{{ metric.source }}">{{ metric.source }} · {{ metric.text }}</span>
-                {% endfor %}
-              </div>
             {% endif %}
           </div>
         </a>

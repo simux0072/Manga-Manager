@@ -5,6 +5,8 @@ const state = {
   drawerSections: new Map(),
   infoJobPages: {active: 1, failed: 1, completed: 1},
   infoJobPageSize: 25,
+  jobStatusErrors: 0,
+  unloading: false,
   filter: new URLSearchParams(window.location.search).get("filter") || "all",
   view: new URLSearchParams(window.location.search).get("view") || "list",
 };
@@ -51,20 +53,7 @@ function activeSources(card) {
 
 function cardMatchesSource(card, hidden) {
   const sources = activeSources(card);
-  if (card.matches(".update-card")) {
-    const visibleRows = [...card.querySelectorAll("[data-source-row], .sources [data-source]")]
-      .filter((row) => {
-        const source = row.dataset.sourceRow || row.dataset.source || "";
-        return source && !hidden.has(source);
-      });
-    return sources.length === 0 || visibleRows.length > 0;
-  }
-  const visibleRows = [...card.querySelectorAll("[data-source-row], .sources [data-source]")]
-    .filter((row) => {
-      const source = row.dataset.sourceRow || row.dataset.source || "";
-      return source && !hidden.has(source);
-    });
-  return sources.length === 0 || visibleRows.length > 0 || sources.some((source) => !hidden.has(source));
+  return sources.length === 0 || sources.some((source) => !hidden.has(source));
 }
 
 function cardMatchesLibraryFilter(card) {
@@ -342,6 +331,7 @@ function renderSection(title, jobs, options = {}) {
   heading.textContent = `${title} (${count})`;
   section.append(heading);
   section.addEventListener("toggle", () => {
+    if (!section.isConnected) return;
     state.drawerSections.set(key, section.open);
   });
   const body = document.createElement("div");
@@ -510,7 +500,7 @@ function renderInfoPager(status, page) {
     ["Next", Math.min(totalPages, current + 1)],
     ["Last", totalPages],
   ];
-  buttons.forEach(([text, nextPage]) => {
+  buttons.slice(0, 2).forEach(([text, nextPage]) => {
     const button = document.createElement("button");
     button.type = "button";
     button.className = "secondary";
@@ -523,6 +513,18 @@ function renderInfoPager(status, page) {
     pager.append(button);
   });
   pager.append(label);
+  buttons.slice(2).forEach(([text, nextPage]) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "secondary";
+    button.textContent = text;
+    button.disabled = nextPage === current || totalPages <= 1;
+    button.addEventListener("click", () => {
+      state.infoJobPages[status] = nextPage;
+      refreshJobs().catch((error) => toast(error.message, "error"));
+    });
+    pager.append(button);
+  });
   return pager;
 }
 
@@ -531,8 +533,13 @@ async function refreshJobs() {
     const response = await fetch(jobsStatusUrl(), {headers: {"Accept": "application/json"}});
     if (!response.ok) return;
     renderJobs(await response.json());
+    state.jobStatusErrors = 0;
   } catch {
-    toast("Job status unavailable.", "error");
+    state.jobStatusErrors += 1;
+    if (!state.unloading && document.visibilityState === "visible" && state.jobStatusErrors >= 3) {
+      toast("Job status unavailable.", "error");
+      state.jobStatusErrors = 0;
+    }
   }
 }
 
@@ -637,3 +644,7 @@ setupFilters();
 setupJobsDrawer();
 setupJobEvents();
 setupAsyncForms();
+
+window.addEventListener("beforeunload", () => {
+  state.unloading = true;
+});

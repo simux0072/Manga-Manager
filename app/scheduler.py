@@ -75,6 +75,6 @@ def create_scheduler() -> AsyncIOScheduler:
         scheduler.add_job(
             poll, "interval", minutes=settings.kingofshojo_poll_minutes, args=["kingofshojo"]
         )
-    scheduler.add_job(drain_downloads, "interval", minutes=10)
+    scheduler.add_job(drain_downloads, "interval", minutes=settings.download_drain_interval_minutes)
     scheduler.add_job(drain_kavita_sync, "interval", minutes=10)
     return scheduler

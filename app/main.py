@@ -169,6 +169,7 @@ templates = Jinja2Templates(directory="app/templates")
 templates.env.filters["priority"] = source_priority_label
 templates.env.filters["relative_time"] = lambda value: relative_time(value)
 templates.env.filters["metadata"] = decode_metadata
+templates.env.globals["series_stats"] = lambda series: combined_series_stats(series)
 templates.env.globals["csrf_input"] = lambda: csrf_input()
 
 
@@ -283,6 +284,65 @@ def relative_time(value) -> str:
     return value.date().isoformat()
 
 
+def parse_metric_count(value) -> int:
+    if value in (None, ""):
+        return 0
+    text = str(value).strip().replace(",", "")
+    multiplier = 1
+    suffix = text[-1:].lower()
+    if suffix == "k":
+        multiplier = 1_000
+        text = text[:-1]
+    elif suffix == "m":
+        multiplier = 1_000_000
+        text = text[:-1]
+    elif suffix == "b":
+        multiplier = 1_000_000_000
+        text = text[:-1]
+    try:
+        return int(float(text) * multiplier)
+    except ValueError:
+        return 0
+
+
+def compact_metric_count(value: int) -> str:
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M".rstrip("0").rstrip(".")
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}K".rstrip("0").rstrip(".")
+    return str(value)
+
+
+def combined_series_stats(series: Series) -> dict[str, object]:
+    bookmarks = 0
+    rating: object = None
+    rating_priority = -1
+    rating_count = 0
+    chapter_count = 0
+    rank: object = None
+    for source in series.sources:
+        metadata = decode_metadata(source.metadata_json)
+        bookmarks += parse_metric_count(metadata.get("follows"))
+        priority = source_priority_label(source.source)
+        if metadata.get("rating") not in (None, "") and priority > rating_priority:
+            rating = metadata.get("rating")
+            rating_priority = priority
+        rating_count += parse_metric_count(metadata.get("rating_count"))
+        chapter_count = max(chapter_count, parse_metric_count(metadata.get("chapters")))
+        if rank in (None, "") and metadata.get("rank"):
+            rank = metadata.get("rank")
+    return {
+        "rating": rating,
+        "bookmarks": bookmarks,
+        "bookmarks_label": compact_metric_count(bookmarks) if bookmarks else "",
+        "rating_count": rating_count,
+        "rating_count_label": compact_metric_count(rating_count) if rating_count else "",
+        "chapter_count": chapter_count,
+        "chapter_count_label": compact_metric_count(chapter_count) if chapter_count else "",
+        "rank": rank,
+    }
+
+
 def discovery_item(series: Series) -> dict:
     chapters = sorted(series.chapters, key=chapter_sort_key, reverse=True)
     chapter_rows = []
@@ -313,20 +373,6 @@ def discovery_item(series: Series) -> dict:
         )
         if len(chapter_rows) >= 3:
             break
-    source_metrics = []
-    for source in series.sources:
-        metadata = decode_metadata(source.metadata_json)
-        metrics = []
-        if metadata.get("rating"):
-            metrics.append(f"rating {metadata['rating']}")
-        if metadata.get("follows"):
-            metrics.append(f"{metadata['follows']} bookmarks")
-        if metadata.get("rating_count"):
-            metrics.append(f"{metadata['rating_count']} ratings")
-        if metadata.get("rank"):
-            metrics.append(f"rank {metadata['rank']}")
-        if metrics:
-            source_metrics.append({"source": source.source, "text": " · ".join(metrics)})
     aliases = [value for value in (series.aliases or "").split("|") if value][:3]
     genres = [value for value in (series.genres or "").split(",") if value][:4]
     return {
@@ -336,7 +382,7 @@ def discovery_item(series: Series) -> dict:
         "description": series.description,
         "aliases": aliases,
         "genres": genres,
-        "source_metrics": source_metrics,
+        "stats": combined_series_stats(series),
     }
 
 

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
 from app.adapters.base import ChapterTemporarilyUnavailable, SourceAdapter
-from app.adapters.http import HttpSourceClient
+from app.adapters.http import HttpSourceClient, iter_ordered_bytes, page_concurrency_for_source
 from app.adapters.parsing import clean_chapter_title, extract_image_urls, nearby_cover_attr, parse_source_date
 from app.domain import ChapterItem, SeriesItem, normalize_chapter_number
 from app.settings import settings
@@ -143,8 +143,13 @@ class AsuraAdapter(SourceAdapter):
         if not urls and is_premium_or_locked(soup):
             retry_after = datetime.now(timezone.utc) + timedelta(hours=settings.asura_delay_hours or 1)
             raise ChapterTemporarilyUnavailable("Asura chapter is still premium", retry_after)
-        for url in urls:
-            yield await self.client.get_bytes(url, referer=chapter.url)
+        async for page in iter_ordered_bytes(
+            self.client,
+            urls,
+            referer=chapter.url,
+            concurrency=page_concurrency_for_source(self.source),
+        ):
+            yield page
 
     def parse_chapter_image_urls(self, soup) -> list[str]:
         return [

@@ -120,6 +120,44 @@ class HttpSourceClient:
             self._client = None
 
 
+def page_concurrency_for_source(source: str) -> int:
+    if source == "asura":
+        return settings.asura_page_concurrency
+    if source == "mangafire":
+        return settings.mangafire_page_concurrency
+    if source == "kingofshojo":
+        return settings.kingofshojo_page_concurrency
+    return 1
+
+
+async def iter_ordered_bytes(
+    client: HttpSourceClient,
+    urls: list[str],
+    *,
+    referer: str = "",
+    concurrency: int = 1,
+):
+    if concurrency <= 1:
+        for url in urls:
+            yield await client.get_bytes(url, referer=referer)
+        return
+
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def fetch(url: str) -> bytes:
+        async with semaphore:
+            return await client.get_bytes(url, referer=referer)
+
+    tasks = [asyncio.create_task(fetch(url)) for url in urls]
+    try:
+        for task in tasks:
+            yield await task
+    except Exception:
+        for task in tasks:
+            task.cancel()
+        raise
+
+
 def retry_after_from_headers(headers: httpx.Headers) -> datetime | None:
     value = headers.get("retry-after")
     if not value:

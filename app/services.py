@@ -19,7 +19,7 @@ from pathlib import Path
 
 import httpx
 from PIL import Image
-from sqlalchemy import or_, select, update
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError, PendingRollbackError
 from sqlalchemy.orm import Session
 
@@ -71,7 +71,31 @@ TEMPORARY_DOWNLOAD_ERROR_MARKERS = (
     "incomplete message body",
     "remoteprotocolerror",
     "readtimeout",
+    "server error",
+    "bad gateway",
+    "gateway timeout",
 )
+COMMON_MATCH_TOKENS = {
+    "academy",
+    "adventure",
+    "chronicles",
+    "dungeon",
+    "hero",
+    "hunter",
+    "king",
+    "level",
+    "life",
+    "lord",
+    "magic",
+    "master",
+    "return",
+    "returned",
+    "reincarnated",
+    "sword",
+    "villain",
+    "world",
+}
+_download_drain_lock = asyncio.Lock()
 
 
 def is_sqlite_locked_error(exc: BaseException) -> bool:
@@ -294,12 +318,7 @@ def find_matching_series(session: Session, item: SeriesItem) -> tuple[Series | N
     names = [item.title, *item.aliases]
     for candidate in candidates:
         candidate_names = [candidate.title, *(candidate.aliases or "").split("|")]
-        score = max(
-            title_similarity(left, right)
-            for left in names
-            for right in candidate_names
-            if left and right
-        )
+        score = best_name_similarity(names, candidate_names)
         if best is None or score > best[0]:
             best = (score, candidate)
     if best and best[0] >= 0.90:
@@ -316,6 +335,8 @@ def create_match_candidates(
 ) -> None:
     names = [item.title, *item.aliases]
     for candidate in session.scalars(select(Series).where(Series.id != source_series.series_id)).all():
+        if source_series.source in {source.source for source in candidate.sources}:
+            continue
         blocked = session.scalar(
             select(ManualMatchRule).where(
                 ManualMatchRule.source_series_id == source_series.id,
@@ -326,12 +347,7 @@ def create_match_candidates(
         if blocked:
             continue
         candidate_names = [candidate.title, *(candidate.aliases or "").split("|")]
-        score = max(
-            title_similarity(left, right)
-            for left in names
-            for right in candidate_names
-            if left and right
-        )
+        score = best_name_similarity(names, candidate_names)
         score = max(score, best_confidence if candidate.normalized_title == normalize_title(item.title) else 0)
         if 0.70 <= score < 0.90:
             existing = session.scalar(
@@ -349,6 +365,36 @@ def create_match_candidates(
                         reason=reason,
                     )
                 )
+
+
+def best_name_similarity(names: list[str], candidate_names: list[str]) -> float:
+    scores = [
+        enhanced_title_similarity(left, right)
+        for left in names
+        for right in candidate_names
+        if left and right
+    ]
+    return max(scores, default=0)
+
+
+def enhanced_title_similarity(left: str, right: str) -> float:
+    score = title_similarity(left, right)
+    left_tokens = distinctive_title_tokens(left)
+    right_tokens = distinctive_title_tokens(right)
+    shared = left_tokens & right_tokens
+    if len(shared) >= 2 and any(token not in COMMON_MATCH_TOKENS for token in shared):
+        score = max(score, 0.72)
+    if len(shared) >= 3:
+        score = max(score, 0.78)
+    return score
+
+
+def distinctive_title_tokens(title: str) -> set[str]:
+    return {
+        token
+        for token in normalize_title(title).split()
+        if len(token) >= 4 and not token.isdigit()
+    }
 
 
 def upsert_release(session: Session, source_series: SourceSeries, item: ChapterItem) -> ChapterRelease:
@@ -461,6 +507,7 @@ async def poll_source(
             count = 0
             item_failures = 0
             skipped_items = 0
+            item_failure_samples: list[dict[str, str]] = []
             cover_cache_results: list[CoverCacheResult] = []
             for index, item in enumerate(items, start=1):
                 try:
@@ -487,6 +534,14 @@ async def poll_source(
                     count += 1
                 except Exception as exc:
                     item_failures += 1
+                    if len(item_failure_samples) < 5:
+                        item_failure_samples.append(
+                            {
+                                "title": item.title,
+                                "url": item.url,
+                                "error": str(exc),
+                            }
+                        )
                     logger.warning("failed to poll %s item %s: %s", source, item.url, exc)
                 if progress is not None:
                     progress(index, len(items))
@@ -499,6 +554,7 @@ async def poll_source(
                     "warning",
                     f"{source} poll had {item_failures} item failures",
                     source=source,
+                    metadata={"item_failures": item_failures, "samples": item_failure_samples},
                 )
             else:
                 record_source_success(health, item_failures)
@@ -512,6 +568,7 @@ async def poll_source(
                         "count": count,
                         "item_failures": item_failures,
                         "skipped_items": skipped_items,
+                        "failure_samples": item_failure_samples,
                     },
                 )
             commit_with_retry(session)
@@ -699,6 +756,33 @@ def source_is_download_ready(session: Session, source: str, now: datetime | None
         return True
     cooldown = ensure_aware(health.download_cooldown_until)
     return cooldown is None or cooldown <= (now or datetime.now(timezone.utc))
+
+
+def source_download_concurrency(source: str) -> int:
+    if source == "asura":
+        return settings.asura_download_concurrency
+    if source == "mangafire":
+        return settings.mangafire_download_concurrency
+    if source == "kingofshojo":
+        return settings.kingofshojo_download_concurrency
+    return settings.download_concurrency
+
+
+def download_sources_at_capacity(session: Session) -> set[str]:
+    rows = session.execute(
+        select(SourceSeries.source, DownloadJob.id)
+        .join(ChapterRelease, ChapterRelease.id == DownloadJob.chapter_release_id)
+        .join(SourceSeries, SourceSeries.id == ChapterRelease.source_series_id)
+        .where(DownloadJob.status == "running")
+    ).all()
+    counts: dict[str, int] = {}
+    for source, _job_id in rows:
+        counts[source] = counts.get(source, 0) + 1
+    return {
+        source
+        for source, count in counts.items()
+        if count >= source_download_concurrency(source)
+    }
 
 
 def set_source_download_cooldown(
@@ -1025,6 +1109,7 @@ async def run_next_download(session: Session) -> bool:
         return True
 
     staging_path: Path | None = None
+    started_at = time.monotonic()
     try:
         item = ChapterItem(
             source=release.source,
@@ -1043,6 +1128,8 @@ async def run_next_download(session: Session) -> bool:
         if old_path:
             archive_previous(old_path)
         staging_path.replace(final_path)
+        duration_seconds = max(time.monotonic() - started_at, 0.001)
+        size_bytes = final_path.stat().st_size
         chapter = release.chapter
         if old_path:
             deactivate_downloaded_files(session, chapter.id)
@@ -1086,6 +1173,12 @@ async def run_next_download(session: Session) -> bool:
             series_id=chapter.series_id,
             chapter_id=chapter.id,
             download_job_id=job.id,
+            metadata={
+                "pages": image_count,
+                "bytes": size_bytes,
+                "duration_seconds": round(duration_seconds, 3),
+                "pages_per_second": round(image_count / duration_seconds, 3),
+            },
         )
         commit_with_retry(session)
         queue_kavita_sync(session, chapter.series, final_path.parent)
@@ -1161,6 +1254,12 @@ async def run_next_download(session: Session) -> bool:
             staging_path.unlink(missing_ok=True)
         if is_temporary_download_error(exc):
             retry_after = next_retry_after(max(job.attempts, 1))
+            retry_after = set_source_download_cooldown(
+                session,
+                release.source,
+                retry_after,
+                str(exc),
+            )
             job.attempts = max(job.attempts - 1, 0)
             job.status = "delayed"
             job.retry_after = retry_after
@@ -1525,14 +1624,22 @@ async def stage_cbz(
 def is_temporary_download_error(exc: BaseException) -> bool:
     if isinstance(exc, (httpx.RemoteProtocolError, httpx.ReadError, httpx.ReadTimeout, httpx.ConnectTimeout)):
         return True
+    if isinstance(exc, httpx.HTTPStatusError) and 500 <= exc.response.status_code < 600:
+        return True
     text = str(exc).lower()
     return any(marker in text for marker in TEMPORARY_DOWNLOAD_ERROR_MARKERS)
 
 
 def claim_next_download_job(session: Session) -> DownloadJob | None:
     now = datetime.now(timezone.utc)
+    running_total = session.scalar(
+        select(func.count()).select_from(DownloadJob).where(DownloadJob.status == "running")
+    )
+    if running_total and running_total >= settings.download_concurrency:
+        return None
+    blocked_sources = download_sources_at_capacity(session)
     ready_filter = or_(DownloadJob.retry_after.is_(None), DownloadJob.retry_after <= now)
-    job_id = session.scalar(
+    query = (
         select(DownloadJob.id)
         .join(ChapterRelease, ChapterRelease.id == DownloadJob.chapter_release_id)
         .join(SourceSeries, SourceSeries.id == ChapterRelease.source_series_id)
@@ -1548,6 +1655,9 @@ def claim_next_download_job(session: Session) -> DownloadJob | None:
         .order_by(DownloadJob.priority.asc(), DownloadJob.created_at.asc())
         .limit(1)
     )
+    if blocked_sources:
+        query = query.where(SourceSeries.source.not_in(blocked_sources))
+    job_id = session.scalar(query)
     if job_id is None:
         return None
 
@@ -1952,28 +2062,32 @@ def retry_kavita_sync_job(session: Session, job_id: int) -> bool:
 
 
 async def drain_download_queue(session: Session) -> int:
-    if settings.download_concurrency <= 1:
-        count = 0
-        while await run_next_download(session):
-            count += 1
-        return count
-    from app.db import SessionLocal
-
-    lock = asyncio.Lock()
-    count = 0
-
-    async def worker() -> None:
-        nonlocal count
-        while True:
-            with SessionLocal() as worker_session:
-                processed = await run_next_download(worker_session)
-            if not processed:
-                return
-            async with lock:
+    if _download_drain_lock.locked():
+        logger.info("download drain skipped; drain already running")
+        return 0
+    async with _download_drain_lock:
+        if settings.download_concurrency <= 1:
+            count = 0
+            while await run_next_download(session):
                 count += 1
+            return count
+        from app.db import SessionLocal
 
-    await asyncio.gather(*(worker() for _ in range(settings.download_concurrency)))
-    return count
+        lock = asyncio.Lock()
+        count = 0
+
+        async def worker() -> None:
+            nonlocal count
+            while True:
+                with SessionLocal() as worker_session:
+                    processed = await run_next_download(worker_session)
+                if not processed:
+                    return
+                async with lock:
+                    count += 1
+
+        await asyncio.gather(*(worker() for _ in range(settings.download_concurrency)))
+        return count
 
 
 async def drain_kavita_sync_queue(session: Session) -> int:
@@ -2026,6 +2140,43 @@ async def rescan_source_series(session: Session, source_series_id: int) -> int:
         await close_adapter(adapter)
 
 
+def move_series_progress(session: Session, old_series_id: int, target_id: int) -> None:
+    old_progress = session.scalar(select(SeriesProgress).where(SeriesProgress.series_id == old_series_id))
+    if old_progress is None:
+        return
+    target_progress = session.scalar(select(SeriesProgress).where(SeriesProgress.series_id == target_id))
+    if target_progress is None:
+        old_progress.series_id = target_id
+        return
+    if not target_progress.note and old_progress.note:
+        target_progress.note = old_progress.note
+    if target_progress.rating is None and old_progress.rating is not None:
+        target_progress.rating = old_progress.rating
+    if target_progress.status == "interested" and old_progress.status != "interested":
+        target_progress.status = old_progress.status
+    target_progress.updated_at = utcnow()
+    session.delete(old_progress)
+
+
+def move_chapter_progress(session: Session, old_chapter: Chapter, target_chapter: Chapter) -> None:
+    old_progress = session.scalar(select(ChapterProgress).where(ChapterProgress.chapter_id == old_chapter.id))
+    if old_progress is None:
+        return
+    target_progress = session.scalar(select(ChapterProgress).where(ChapterProgress.chapter_id == target_chapter.id))
+    if target_progress is None:
+        old_progress.chapter = target_chapter
+        session.flush()
+        return
+    if target_progress.status != "read" and old_progress.status == "read":
+        target_progress.status = "read"
+        target_progress.read_at = old_progress.read_at
+    elif target_progress.status == "unread" and old_progress.status != "unread":
+        target_progress.status = old_progress.status
+    target_progress.updated_at = utcnow()
+    session.delete(old_progress)
+    session.flush()
+
+
 def merge_match_candidate(session: Session, candidate_id: int) -> bool:
     candidate = session.get(MatchCandidate, candidate_id)
     if candidate is None or candidate.status != "pending":
@@ -2036,6 +2187,7 @@ def merge_match_candidate(session: Session, candidate_id: int) -> bool:
         return False
     old_series_id = source_series.series_id
     old_series = session.get(Series, old_series_id)
+    move_series_progress(session, old_series_id, target.id)
     moving_source_ids = [
         row[0]
         for row in session.execute(
@@ -2045,12 +2197,13 @@ def merge_match_candidate(session: Session, candidate_id: int) -> bool:
     for source_row in session.scalars(
         select(SourceSeries).where(SourceSeries.series_id == old_series_id)
     ):
-        source_row.series_id = target.id
+        source_row.series = target
     for chapter in session.scalars(select(Chapter).where(Chapter.series_id == old_series_id)):
         existing = session.scalar(
             select(Chapter).where(Chapter.series_id == target.id, Chapter.number == chapter.number)
         )
         if existing:
+            move_chapter_progress(session, chapter, existing)
             for release in chapter.releases:
                 release.chapter_id = existing.id
                 release.chapter = existing

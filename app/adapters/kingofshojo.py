@@ -6,7 +6,7 @@ from urllib.parse import unquote, urljoin, urlparse
 
 from app.adapters.asura import clean_series_title, dedupe_chapters, dedupe_series
 from app.adapters.base import SourceAdapter
-from app.adapters.http import HttpSourceClient
+from app.adapters.http import HttpSourceClient, iter_ordered_bytes, page_concurrency_for_source
 from app.adapters.parsing import clean_chapter_title, extract_image_urls, nearby_cover_attr, parse_source_date
 from app.domain import ChapterItem, SeriesItem, normalize_chapter_number
 from app.settings import settings
@@ -128,8 +128,13 @@ class KingOfShojoAdapter(SourceAdapter):
     async def iter_chapter_pages(self, chapter: ChapterItem) -> AsyncIterator[bytes]:
         soup = await self.client.get_soup(chapter.url)
         urls = self.parse_chapter_image_urls(soup)
-        for url in urls:
-            yield await self.client.get_bytes(url, referer=chapter.url)
+        async for page in iter_ordered_bytes(
+            self.client,
+            urls,
+            referer=chapter.url,
+            concurrency=page_concurrency_for_source(self.source),
+        ):
+            yield page
 
     def parse_chapter_image_urls(self, soup) -> list[str]:
         return [

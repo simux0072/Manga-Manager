@@ -2047,6 +2047,134 @@ def test_manual_merge_recomputes_best_source_for_duplicate_chapter():
     assert session.query(Series).count() == 1
 
 
+def test_cross_source_sashimi_titles_create_manual_match_candidate():
+    session = make_session()
+    asura = merge_series_item(
+        session,
+        SeriesItem(
+            source="asura",
+            source_id="asura/sashimi",
+            title="The Academy's Sashimi Sword Master",
+            url="a",
+        ),
+    )
+    mangafire = merge_series_item(
+        session,
+        SeriesItem(
+            source="mangafire",
+            source_id="mf/sashimi",
+            title="Conquering the Academy with Just a Sashimi Knife",
+            url="m",
+        ),
+    )
+
+    assert asura.series_id != mangafire.series_id
+    session.flush()
+    candidate = session.query(MatchCandidate).one()
+    assert candidate.source_series_id == mangafire.id
+    assert candidate.candidate_series_id == asura.series_id
+    assert 0.70 <= candidate.confidence < 0.90
+
+
+def test_same_source_weak_title_match_does_not_create_candidate():
+    session = make_session()
+    merge_series_item(
+        session,
+        SeriesItem(
+            source="asura",
+            source_id="asura/sashimi-a",
+            title="The Academy's Sashimi Sword Master",
+            url="a",
+        ),
+    )
+    merge_series_item(
+        session,
+        SeriesItem(
+            source="asura",
+            source_id="asura/sashimi-b",
+            title="Conquering the Academy with Just a Sashimi Knife",
+            url="b",
+        ),
+    )
+
+    assert session.query(MatchCandidate).count() == 0
+
+
+def test_manual_merge_moves_series_and_duplicate_chapter_progress():
+    session = make_session()
+    target = merge_series_item(
+        session,
+        SeriesItem(source="kingofshojo", source_id="manga/example", title="Example", url="x"),
+    )
+    duplicate = merge_series_item(
+        session,
+        SeriesItem(source="asura", source_id="comics/example", title="Example Duplicate", url="y"),
+    )
+    target_release = upsert_release(
+        session,
+        target,
+        ChapterItem("kingofshojo", target.source_id, "1", "Chapter 1", "x", None),
+    )
+    duplicate_release = upsert_release(
+        session,
+        duplicate,
+        ChapterItem("asura", duplicate.source_id, "1", "Chapter 1", "y", None),
+    )
+    session.add(SeriesProgress(series_id=duplicate.series_id, status="reading", rating=4))
+    session.flush()
+    session.add(ChapterProgress(chapter_id=duplicate_release.chapter_id, status="read"))
+    candidate = MatchCandidate(source_series_id=duplicate.id, candidate_series_id=target.series_id)
+    session.add(candidate)
+    session.commit()
+
+    assert merge_match_candidate(session, candidate.id)
+
+    assert session.query(SeriesProgress).one().series_id == target.series_id
+    progress = session.query(ChapterProgress).one()
+    assert progress.chapter_id == target_release.chapter_id
+    assert progress.status == "read"
+
+
+def test_claim_next_download_job_skips_source_at_capacity(monkeypatch):
+    session = make_session()
+    monkeypatch.setattr(services.settings, "download_concurrency", 2)
+    monkeypatch.setattr(services.settings, "asura_download_concurrency", 1)
+    monkeypatch.setattr(services.settings, "mangafire_download_concurrency", 2)
+    asura = merge_series_item(
+        session,
+        SeriesItem(source="asura", source_id="asura/example", title="Example", url="a"),
+    )
+    mangafire = merge_series_item(
+        session,
+        SeriesItem(source="mangafire", source_id="mf/example", title="Example", url="m"),
+    )
+    asura_running = upsert_release(
+        session,
+        asura,
+        ChapterItem("asura", asura.source_id, "1", "Chapter 1", "a1", None),
+    )
+    asura_queued = upsert_release(
+        session,
+        asura,
+        ChapterItem("asura", asura.source_id, "2", "Chapter 2", "a2", None),
+    )
+    mangafire_queued = upsert_release(
+        session,
+        mangafire,
+        ChapterItem("mangafire", mangafire.source_id, "3", "Chapter 3", "m3", None),
+    )
+    session.flush()
+    session.add(DownloadJob(chapter_release_id=asura_running.id, status="running"))
+    session.add(DownloadJob(chapter_release_id=asura_queued.id, priority=1))
+    session.add(DownloadJob(chapter_release_id=mangafire_queued.id, priority=2))
+    session.commit()
+
+    job = services.claim_next_download_job(session)
+
+    assert job is not None
+    assert job.chapter_release_id == mangafire_queued.id
+
+
 def test_manual_merge_moves_all_old_source_rows_and_deletes_old_series():
     session = make_session()
     target = merge_series_item(

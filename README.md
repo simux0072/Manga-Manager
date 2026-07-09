@@ -158,6 +158,14 @@ delayed until `Retry-After` when the source provides it, or until the configured
 expires. During cooldown, Manga Manager can temporarily download the same chapter from a lower
 priority source and later replace it with the higher-priority source.
 
+Download scheduling is source-aware. `DOWNLOAD_CONCURRENCY` limits total running download jobs,
+while `ASURA_DOWNLOAD_CONCURRENCY`, `MANGAFIRE_DOWNLOAD_CONCURRENCY`, and
+`KINGOFSHOJO_DOWNLOAD_CONCURRENCY` cap each website independently. Asura defaults to a conservative
+single job, while MangaFire and KingOfShojo can run more work in parallel. Page image fetching is
+also bounded per source with `ASURA_PAGE_CONCURRENCY`, `MANGAFIRE_PAGE_CONCURRENCY`, and
+`KINGOFSHOJO_PAGE_CONCURRENCY`; fetched images are still written to CBZ files in page order.
+`DOWNLOAD_DRAIN_INTERVAL_MINUTES` controls how often the scheduler drains queued downloads.
+
 Retention cleanup is disabled by default. Set `RETENTION_REPLACED_DAYS` or
 `RETENTION_REPLACED_MAX_PER_CHAPTER` to remove inactive replaced files during manual cleanup.
 
@@ -170,12 +178,19 @@ external notification calls bounded.
 ## Discovery
 
 The Discovery page is a two-column update list on desktop and one column on mobile. Each item shows
-cover art, a truncated title, source badges, source metadata when available, a short description,
+cover art, a truncated title, source badges, combined stats when available, a short description,
 aliases/genres, and the newest 2-3 known chapter releases with relative ages. The cover/title area
-opens the series; chapter rows open the specific chapter.
+opens the series; chapter rows open the specific chapter. Bookmark/follow counts are summed across
+merged sources. Rating uses the highest-priority source that has a rating rather than averaging
+different sites.
 
 The `Visible websites` checkboxes hide source badges, chapter rows, and any Discovery or Library
 card with no remaining visible source rows.
+
+Potential Matches only suggests cross-source matches. Exact external IDs and exact normalized titles
+can still auto-match, but weak title matches are kept for manual review. The matcher also boosts
+manual candidates when different sources share distinctive title tokens or aliases, which helps
+catch titles with different translations.
 
 Manual source refresh actions are labeled `Pull`. Pulls run in the background and the top bar shows
 pull progress. Discovery is paginated with a `Load more` control using `DISCOVERY_PAGE_SIZE`.
@@ -192,6 +207,12 @@ Source adapters respect per-source request intervals. Asura defaults to a conser
 interval because its CDN may return `429 Too Many Requests` during bursts. Relevant settings:
 
 - `ASURA_REQUEST_INTERVAL_SECONDS`: delay between Asura HTTP requests.
+- `DOWNLOAD_CONCURRENCY`: maximum total running chapter download jobs.
+- `DOWNLOAD_DRAIN_INTERVAL_MINUTES`: scheduler interval for draining queued download jobs.
+- `ASURA_DOWNLOAD_CONCURRENCY`, `MANGAFIRE_DOWNLOAD_CONCURRENCY`,
+  `KINGOFSHOJO_DOWNLOAD_CONCURRENCY`: per-source running job caps.
+- `ASURA_PAGE_CONCURRENCY`, `MANGAFIRE_PAGE_CONCURRENCY`, `KINGOFSHOJO_PAGE_CONCURRENCY`: per-source
+  page image fetch caps.
 - `RATE_LIMIT_COOLDOWN_MINUTES`: default cooldown when a non-Asura source is rate-limited without a
   `Retry-After` header.
 - `ASURA_RATE_LIMIT_COOLDOWN_MINUTES`: default Asura cooldown when no `Retry-After` header exists.
@@ -199,8 +220,10 @@ interval because its CDN may return `429 Too Many Requests` during bursts. Relev
 
 Rate-limit errors do not consume normal download attempts. Temporary content/CDN errors such as
 incomplete image bodies, invalid image bytes, or too few page images delay the current job and can
-queue a lower-priority fallback source for the same chapter. Asura reader extraction supports both
-`asura-images/chapters/` and older `asura-images/chapters-stitched/` page URLs.
+queue a lower-priority fallback source for the same chapter. Temporary CDN/server failures also set a
+source download cooldown so other ready providers can use workers while the source recovers. Asura
+reader extraction supports both `asura-images/chapters/` and older
+`asura-images/chapters-stitched/` page URLs.
 
 ## Local Testing
 

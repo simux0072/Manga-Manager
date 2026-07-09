@@ -97,6 +97,7 @@
 
 <section class="library-list">
   {% for item in series %}
+    {% set stats = series_stats(item) %}
     {% set state = namespace(downloaded_unmapped=false, unread_ready=false) %}
     {% for chapter in item.chapters %}
       {% if chapter.downloaded_source and not chapter.kavita_chapter_id %}
@@ -127,15 +128,25 @@
             <h2>{{ item.title }}</h2>
             <div class="sources">
               {% for source in item.sources %}
-                {% set metadata = source.metadata_json|metadata %}
-                <span data-source="{{ source.source }}">
-                  {{ source.source }}
-                  {% if metadata.rating %} · rating {{ metadata.rating }}{% endif %}
-                  {% if metadata.follows %} · {{ metadata.follows }} bookmarks{% endif %}
-                  {% if metadata.chapters %} · {{ metadata.chapters }} chapters{% endif %}
-                </span>
+                <span data-source="{{ source.source }}">{{ source.source }}</span>
               {% endfor %}
             </div>
+            {% if stats.rating or stats.bookmarks or stats.chapter_count or stats.rank %}
+              <div class="stat-badges">
+                {% if stats.rating %}
+                  <span class="stat-badge stat-rating" title="Rating"><span aria-hidden="true">★</span> {{ stats.rating }}</span>
+                {% endif %}
+                {% if stats.bookmarks %}
+                  <span class="stat-badge stat-bookmarks" title="Bookmarks"><span aria-hidden="true">🔖</span> {{ stats.bookmarks_label }}</span>
+                {% endif %}
+                {% if stats.chapter_count %}
+                  <span class="stat-badge" title="Known chapters">Ch. {{ stats.chapter_count_label }}</span>
+                {% endif %}
+                {% if stats.rank %}
+                  <span class="stat-badge" title="Rank">#{{ stats.rank }}</span>
+                {% endif %}
+              </div>
+            {% endif %}
             <p>Status: {{ item.status }} · Progress: {{ item.progress.status if item.progress else "unread" }}</p>
             <p>{{ item.chapters|length }} chapters known · {{ "Kavita ready" if item.kavita_series_id and item.kavita_library_id else "Pending Kavita sync" if state.downloaded_unmapped else "Not downloaded yet" }}</p>
           </div>
