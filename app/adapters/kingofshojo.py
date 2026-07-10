@@ -5,7 +5,7 @@ import re
 from urllib.parse import unquote, urljoin, urlparse
 
 from app.adapters.asura import clean_series_title, dedupe_chapters, dedupe_series
-from app.adapters.base import SourceAdapter
+from app.adapters.base import FrontierSentinel, SourceAdapter
 from app.adapters.http import HttpSourceClient, iter_ordered_bytes, page_concurrency_for_source
 from app.adapters.parsing import clean_chapter_title, extract_image_urls, nearby_cover_attr, parse_source_date
 from app.domain import ChapterItem, SeriesItem, normalize_chapter_number
@@ -27,11 +27,26 @@ class KingOfShojoAdapter(SourceAdapter):
         await self.client.aclose()
 
     async def list_recent(self) -> list[SeriesItem]:
+        return await self.list_recent_frontier([])
+
+    async def list_recent_frontier(self, sentinels: list[FrontierSentinel]) -> list[SeriesItem]:
         items: list[SeriesItem] = []
-        for page in range(1, settings.kingofshojo_recent_pages + 1):
+        sentinel_map = {sentinel.source_id: sentinel.latest_chapter for sentinel in sentinels}
+        required_hits = min(settings.source_frontier_required_hits, len(sentinel_map))
+        hits = 0
+        max_pages = (
+            settings.kingofshojo_recent_pages if sentinels else min(3, settings.kingofshojo_recent_pages)
+        )
+        for page in range(1, max_pages + 1):
             path = "/" if page == 1 else f"/page/{page}/"
             soup = await self.client.get_soup(path)
-            items.extend(self.parse_recent_series(soup))
+            parsed = self.parse_recent_series(soup)
+            if not parsed:
+                break
+            items.extend(parsed)
+            hits += frontier_hits(parsed, sentinel_map)
+            if required_hits and hits >= required_hits:
+                break
         return dedupe_series(items)
 
     def parse_recent_series(self, soup) -> list[SeriesItem]:
@@ -45,16 +60,34 @@ class KingOfShojoAdapter(SourceAdapter):
             if is_non_series_link(url, title):
                 continue
             cover = nearby_cover_attr(link)
+            recent_chapters = self.parse_card_chapters(link, urlparse(url).path.strip("/"), url)
             items.append(
                 SeriesItem(
                     source=self.source,
                     source_id=urlparse(url).path.strip("/"),
                     title=title,
                     url=url,
-                    cover_url=urljoin(self.base_url, cover) if cover else "",
+                    cover_url=urljoin(self.base_url, cover) if valid_kingofshojo_cover(cover) else "",
+                    metadata={
+                        "recent_chapters": [
+                            {"number": chapter.number, "title": chapter.title, "url": chapter.url}
+                            for chapter in recent_chapters
+                        ]
+                    }
+                    if recent_chapters
+                    else {},
                 )
             )
         return dedupe_series(items)
+
+    def parse_card_chapters(self, link, source_id: str, series_url: str) -> list[ChapterItem]:
+        container = link
+        for parent in link.parents:
+            if getattr(parent, "name", None) in {"article", "li", "div"}:
+                container = parent
+                break
+        source = SeriesItem(self.source, source_id, link.get_text(" ", strip=True), series_url)
+        return self.parse_chapters(container, source)
 
     async def get_chapters(self, source_series: SeriesItem) -> list[ChapterItem]:
         soup = await self.client.get_soup(source_series.url)
@@ -70,19 +103,31 @@ class KingOfShojoAdapter(SourceAdapter):
         description_tag = soup.select_one(".summary__content, .description, .entry-content")
         description = description_tag.get_text(" ", strip=True) if description_tag else source_series.description
         aliases, description = extract_description_aliases(description, title)
-        image = soup.select_one("meta[property='og:image']")
-        cover = str(image.get("content") or "") if image else ""
-        if not cover:
-            cover_image = soup.select_one(
-                ".summary_image img, .tab-summary img, .post-content_item img, "
-                "img.wp-post-image, img[data-src], img[data-lazy-src]"
-            )
-            if cover_image:
-                from app.adapters.parsing import image_attr
+        cover = ""
+        from app.adapters.parsing import image_attr
 
-                cover = image_attr(cover_image)
+        for selector in (
+            ".summary_image img",
+            ".tab-summary img",
+            ".post-content_item img",
+            "img.wp-post-image",
+            "img[data-src*='king-bucket/images']",
+            "img[data-lazy-src*='king-bucket/images']",
+        ):
+            cover_image = soup.select_one(selector)
+            candidate = image_attr(cover_image) if cover_image else ""
+            if valid_kingofshojo_cover(candidate):
+                cover = candidate
+                break
+        if not cover:
+            image = soup.select_one("meta[property='og:image']")
+            candidate = str(image.get("content") or "") if image else ""
+            if valid_kingofshojo_cover(candidate):
+                cover = candidate
         if not cover and soup.select_one("a[href*='/manga/']"):
-            cover = nearby_cover_attr(soup.select_one("a[href*='/manga/']"))
+            candidate = nearby_cover_attr(soup.select_one("a[href*='/manga/']"))
+            if valid_kingofshojo_cover(candidate):
+                cover = candidate
         text = soup.get_text(" ", strip=True)
         follows = ""
         follow_match = re.search(r"followed by\s+([\d,.]+[KMB]?)", text, flags=re.I)
@@ -101,7 +146,9 @@ class KingOfShojoAdapter(SourceAdapter):
             url=source_series.url,
             aliases=aliases or source_series.aliases,
             description=description,
-            cover_url=urljoin(self.base_url, cover or source_series.cover_url),
+            cover_url=urljoin(self.base_url, cover or source_series.cover_url)
+            if valid_kingofshojo_cover(cover or source_series.cover_url)
+            else "",
             genres=genres or source_series.genres,
             popularity=source_series.popularity,
             external_ids=source_series.external_ids,
@@ -160,8 +207,47 @@ def is_template_or_empty_link(href: str, title: str) -> bool:
         return True
     if href.startswith("#") or "{{" in combined or "number" in combined and "date" in combined:
         return True
+    if "first chapter" in combined or "latest chapter" in combined:
+        return True
     path = urlparse(urljoin(KingOfShojoAdapter.base_url, href)).path.strip("/")
     return not path or "chapter" not in path
+
+
+def valid_kingofshojo_cover(url: str) -> bool:
+    value = (url or "").lower()
+    if not value:
+        return False
+    if any(token in value for token in ("wewtwt.png", "logo", "favicon", "banner", "default")):
+        return False
+    if "cdn.kingofshojo.com/king-bucket/images/" in value:
+        return True
+    return any(token in value for token in ("/wp-content/uploads/", "/covers/", "king-bucket"))
+
+
+def frontier_hits(items: list[SeriesItem], sentinels: dict[str, str]) -> int:
+    hits = 0
+    for item in items:
+        known = sentinels.get(item.source_id)
+        latest = latest_recent_chapter(item)
+        if known is not None and latest is not None and chapter_number_key(latest) <= chapter_number_key(known):
+            hits += 1
+    return hits
+
+
+def latest_recent_chapter(item: SeriesItem) -> str | None:
+    rows = item.metadata.get("recent_chapters")
+    if not isinstance(rows, list):
+        return None
+    numbers = [str(row.get("number") or "") for row in rows if isinstance(row, dict)]
+    numbers = [number for number in numbers if number]
+    return max(numbers, key=chapter_number_key) if numbers else None
+
+
+def chapter_number_key(value: str) -> tuple[int, float, str]:
+    try:
+        return (1, float(normalize_chapter_number(value)), "")
+    except ValueError:
+        return (0, 0.0, value)
 
 
 def is_non_series_link(url: str, title: str) -> bool:

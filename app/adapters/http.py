@@ -48,11 +48,11 @@ class HttpSourceClient:
         return response.json()
 
     async def get_bytes(self, url: str, referer: str = "") -> bytes:
-        for attempt in range(1, 3):
+        for attempt in range(1, 4):
             try:
                 return await self._get_bytes_once(url, referer)
             except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
-                if attempt == 2 or not is_partial_body_error(exc):
+                if attempt == 3 or not is_partial_body_error(exc):
                     raise
                 await asyncio.sleep(0.25 * attempt)
         raise RuntimeError("unreachable")

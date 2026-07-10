@@ -2,17 +2,26 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from datetime import datetime, timezone
+import logging
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urlencode, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
 from app.adapters.asura import dedupe_chapters, dedupe_series
-from app.adapters.base import SourceAdapter
+from app.adapters.base import FrontierSentinel, SourceAdapter
 from app.adapters.http import HttpSourceClient, iter_ordered_bytes, page_concurrency_for_source
 from app.adapters.parsing import image_attr, parse_source_date
 from app.domain import ChapterItem, SeriesItem, normalize_chapter_number
 from app.settings import settings
+
+
+logger = logging.getLogger(__name__)
+
+MANGAFIRE_USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+)
 
 
 class MangaFireAdapter(SourceAdapter):
@@ -29,23 +38,70 @@ class MangaFireAdapter(SourceAdapter):
         await self.client.aclose()
 
     async def list_recent(self) -> list[SeriesItem]:
+        return await self.list_recent_frontier([])
+
+    async def list_recent_frontier(self, sentinels: list[FrontierSentinel]) -> list[SeriesItem]:
+        try:
+            items = await self.list_recent_frontier_api(sentinels)
+        except Exception as exc:
+            logger.warning("failed to fetch MangaFire latest updates from API: %s", exc)
+            return await self.list_recent_frontier_html(sentinels)
+        if items:
+            return items
+        return await self.list_recent_frontier_html(sentinels)
+
+    async def list_recent_frontier_api(self, sentinels: list[FrontierSentinel]) -> list[SeriesItem]:
         items: list[SeriesItem] = []
-        for page in range(1, settings.mangafire_recent_pages + 1):
-            path = "/updated" if page == 1 else f"/updated?page={page}"
+        sentinel_map = {sentinel.source_id: sentinel.latest_chapter for sentinel in sentinels}
+        required_hits = min(settings.source_frontier_required_hits, len(sentinel_map))
+        hits = 0
+        max_pages = settings.mangafire_recent_pages if sentinels else min(3, settings.mangafire_recent_pages)
+        for page in range(1, max_pages + 1):
+            parsed = self.parse_recent_series(
+                await self.fetch_recent_titles_page(page=page, limit=settings.mangafire_recent_limit)
+            )
+            if not parsed:
+                break
+            items.extend(parsed)
+            hits += frontier_hits(parsed, sentinel_map)
+            if required_hits and hits >= required_hits:
+                break
+        return dedupe_series(items)
+
+    async def list_recent_frontier_html(self, sentinels: list[FrontierSentinel]) -> list[SeriesItem]:
+        items: list[SeriesItem] = []
+        sentinel_map = {sentinel.source_id: sentinel.latest_chapter for sentinel in sentinels}
+        required_hits = min(settings.source_frontier_required_hits, len(sentinel_map))
+        hits = 0
+        max_pages = settings.mangafire_recent_pages if sentinels else min(3, settings.mangafire_recent_pages)
+        for page in range(1, max_pages + 1):
+            path = "/" if page == 1 else f"/latest-updates?page={page}"
             parsed = self.parse_updated_page(await self.client.get_soup(path))
             if not parsed:
                 break
             items.extend(parsed)
+            hits += frontier_hits(parsed, sentinel_map)
+            if required_hits and hits >= required_hits:
+                break
         return dedupe_series(items)
 
-    def recent_titles_query(self) -> str:
-        query = (
-            "sort=chapter_updated_at:desc"
-            f"&page=1&limit={settings.mangafire_recent_limit}"
+    async def fetch_recent_titles_page(self, *, page: int, limit: int):
+        response = await self.client.request(
+            "GET",
+            f"{self.base_url}/api/titles?{self.recent_titles_query(page=page, limit=limit)}",
+            headers=mangafire_api_headers(),
         )
+        return response.json()
+
+    def recent_titles_query(self, *, page: int = 1, limit: int | None = None) -> str:
+        params: dict[str, object] = {
+            "order[chapter_updated_at]": "desc",
+            "page": page,
+            "limit": limit or settings.mangafire_recent_limit,
+        }
         if settings.mangafire_discovery_mode == "hot":
-            query += "&hot=1"
-        return query
+            params["hot"] = 1
+        return urlencode(params)
 
     def parse_recent_series(self, payload) -> list[SeriesItem]:
         items: list[SeriesItem] = []
@@ -73,7 +129,7 @@ class MangaFireAdapter(SourceAdapter):
 
     def parse_updated_page(self, soup: BeautifulSoup) -> list[SeriesItem]:
         items: list[SeriesItem] = []
-        for link in soup.select("a[href*='/title/']"):
+        for link in soup.select("a[href*='/title/'], a[href*='/manga/']"):
             href = link.get("href", "")
             source_id = hid_from_url(href)
             if not source_id:
@@ -169,7 +225,7 @@ class MangaFireAdapter(SourceAdapter):
         if not cover:
             image = soup.select_one("img")
             cover = image_attr(image) if image else ""
-        aliases = parse_html_aliases(soup.get_text(" ", strip=True), title)
+        aliases = clean_aliases(parse_html_aliases(soup.get_text(" ", strip=True), title), title)
         genres = tuple(
             tag.get_text(" ", strip=True)
             for tag in soup.select("a[href*='genre'], a[href*='genres']")
@@ -194,13 +250,22 @@ class MangaFireAdapter(SourceAdapter):
         poster = entry.get("poster") or {}
         cover = poster.get("large") or poster.get("medium") or poster.get("small") or ""
         genres = names_from_terms(entry.get("genres") or [])
-        aliases = tuple(str(alias) for alias in entry.get("altTitles") or [] if alias)
+        aliases = clean_aliases((str(alias) for alias in entry.get("altTitles") or []), title)
         external_ids = {}
         if entry.get("malId"):
             external_ids["mal"] = str(entry["malId"])
         if entry.get("anilistId"):
             external_ids["anilist"] = str(entry["anilistId"])
         popularity = entry.get("follows") or entry.get("ratingCount") or entry.get("rank") or 0
+        latest = latest_chapter_number(entry)
+        chapter_updated_at = first_present(
+            entry,
+            "chapterUpdatedAt",
+            "chapter_updated_at",
+            "latestChapterUpdatedAt",
+            "updatedAt",
+            "updated_at",
+        )
         metadata = compact_metadata(
             {
                 "follows": entry.get("follows"),
@@ -210,6 +275,15 @@ class MangaFireAdapter(SourceAdapter):
                 "status": entry.get("status"),
                 "type": entry.get("type"),
                 "year": entry.get("year"),
+                "languages": entry.get("languages"),
+                "has_volumes": entry.get("hasVolumes"),
+                "themes": list(names_from_terms(entry.get("themes") or [])),
+                "demographics": list(names_from_terms(entry.get("demographics") or [])),
+                "authors": list(names_from_terms(entry.get("authors") or [])),
+                "artists": list(names_from_terms(entry.get("artists") or [])),
+                "latest_chapter": latest,
+                "chapter_updated_at": chapter_updated_at,
+                "recent_chapters": recent_chapters_metadata(latest, chapter_updated_at),
             }
         )
         return SeriesItem(
@@ -357,6 +431,56 @@ def first_present(entry: dict, *keys: str):
     return None
 
 
+def mangafire_api_headers() -> dict[str, str]:
+    return {
+        "Accept": "application/json",
+        "Referer": "https://mangafire.to/",
+        "User-Agent": MANGAFIRE_USER_AGENT,
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+
+def latest_chapter_number(entry: dict) -> object:
+    latest = first_present(
+        entry,
+        "latestChapter",
+        "latest_chapter",
+        "lastChapter",
+        "last_chapter",
+    )
+    if isinstance(latest, list):
+        latest = latest[0] if latest else None
+    if isinstance(latest, dict):
+        return first_present(
+            latest,
+            "number",
+            "chapter",
+            "chapterNumber",
+            "chapter_number",
+            "name",
+            "title",
+        )
+    return latest
+
+
+def recent_chapters_metadata(latest: object, updated_at: object) -> list[dict[str, object]]:
+    if latest in (None, ""):
+        return []
+    number = normalize_chapter_number(str(latest))
+    if not number:
+        return []
+    return [
+        compact_metadata(
+            {
+                "number": number,
+                "title": f"Chapter {number}",
+                "updated_at_text": updated_at,
+                "url": "",
+            }
+        )
+    ]
+
+
 def api_title(payload) -> dict:
     if not isinstance(payload, dict):
         return {}
@@ -376,10 +500,49 @@ def api_meta(payload) -> dict:
 
 def hid_from_url(url: str) -> str:
     path = urlparse(url).path.strip("/")
+    if path.startswith("manga/"):
+        slug = path.split("/", 1)[1].strip("/")
+        if "." in slug:
+            return slug.rsplit(".", 1)[-1]
+        return slug
     if not path.startswith("title/"):
         return ""
     slug = path.split("/", 1)[1]
     return slug.split("-", 1)[0]
+
+
+def frontier_hits(items: list[SeriesItem], sentinels: dict[str, str]) -> int:
+    hits = 0
+    for item in items:
+        latest = latest_recent_chapter(item)
+        known = sentinels.get(item.source_id)
+        if known is None or latest is None:
+            continue
+        if chapter_not_newer(latest, known):
+            hits += 1
+    return hits
+
+
+def latest_recent_chapter(item: SeriesItem) -> str | None:
+    rows = item.metadata.get("recent_chapters")
+    if not isinstance(rows, list):
+        return None
+    numbers = [str(row.get("number") or "") for row in rows if isinstance(row, dict)]
+    numbers = [number for number in numbers if number]
+    if not numbers:
+        return None
+    return max(numbers, key=chapter_number_key)
+
+
+def chapter_not_newer(left: str, right: str) -> bool:
+    return chapter_number_key(left) <= chapter_number_key(right)
+
+
+def chapter_number_key(value: str) -> tuple[int, float, str]:
+    try:
+        return (1, float(normalize_chapter_number(value)), "")
+    except ValueError:
+        return (0, 0.0, value)
 
 
 def unix_datetime(value) -> datetime | None:
@@ -430,13 +593,26 @@ def parse_html_aliases(text: str, title: str) -> tuple[str, ...]:
         match = re.search(pattern, text, flags=re.I)
         if not match:
             continue
-        aliases = [
-            alias.strip(" /,;·•")
-            for alias in re.split(r"\s*/\s*|[,;]\s*", match.group(1))
-            if alias.strip(" /,;·•") and alias.strip(" /,;·•").lower() != title.lower()
-        ]
-        return tuple(aliases[:6])
+        aliases = [alias.strip(" /,;·•") for alias in re.split(r"\s*/\s*|[;]\s*", match.group(1))]
+        return tuple(alias for alias in aliases if alias)
     return ()
+
+
+def clean_aliases(values, title: str) -> tuple[str, ...]:
+    cleaned: list[str] = []
+    seen = {normalize_alias_key(title)}
+    for value in values:
+        alias = " ".join(str(value or "").strip(" /,;·•").split())
+        key = normalize_alias_key(alias)
+        if not alias or not key or key in seen:
+            continue
+        cleaned.append(alias)
+        seen.add(key)
+    return tuple(cleaned[:8])
+
+
+def normalize_alias_key(value: str) -> str:
+    return re.sub(r"\s+", " ", (value or "").strip().casefold())
 
 
 def merge_series_items(base: SeriesItem, detail: SeriesItem) -> SeriesItem:

@@ -2,8 +2,15 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
+from dataclasses import dataclass
 
 from app.domain import ChapterItem, SeriesItem
+
+
+@dataclass(frozen=True)
+class FrontierSentinel:
+    source_id: str
+    latest_chapter: str
 
 
 class ChapterTemporarilyUnavailable(RuntimeError):
@@ -26,6 +33,9 @@ class SourceAdapter(ABC):
     @abstractmethod
     async def list_recent(self) -> list[SeriesItem]:
         raise NotImplementedError
+
+    async def list_recent_frontier(self, sentinels: list[FrontierSentinel]) -> list[SeriesItem]:
+        return await self.list_recent()
 
     @abstractmethod
     async def get_chapters(self, source_series: SeriesItem) -> list[ChapterItem]:

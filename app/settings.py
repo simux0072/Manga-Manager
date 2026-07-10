@@ -76,10 +76,21 @@ class Settings(BaseSettings):
     smtp_from: str = ""
     smtp_to: str = ""
     kingofshojo_timeout_seconds: float = Field(default=45.0, ge=10.0)
-    kingofshojo_recent_pages: int = Field(default=3, ge=1)
-    mangafire_recent_pages: int = Field(default=3, ge=1)
+    source_frontier_sentinels: int = Field(default=5, ge=1)
+    source_frontier_required_hits: int = Field(default=3, ge=1)
+    asura_recent_pages: int = Field(default=20, ge=1)
+    kingofshojo_recent_pages: int = Field(default=20, ge=1)
+    mangafire_recent_pages: int = Field(default=20, ge=1)
     mangafire_recent_limit: int = Field(default=50, ge=1)
     mangafire_discovery_mode: Literal["new", "hot"] = "new"
+    visual_match_enabled: bool = True
+    visual_match_max_pages: int = Field(default=6, ge=1)
+    visual_match_skip_first_pages: int = Field(default=2, ge=0)
+    visual_match_skip_last_pages: int = Field(default=1, ge=0)
+    visual_match_segment_height: int = Field(default=768, ge=64)
+    visual_match_segment_overlap: int = Field(default=128, ge=0)
+    visual_match_max_hamming_distance: int = Field(default=8, ge=0)
+    visual_match_min_segment_hits: int = Field(default=4, ge=1)
 
 
 settings = Settings()

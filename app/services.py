@@ -1,30 +1,30 @@
 from __future__ import annotations
 
-import io
 import asyncio
 import hashlib
+import io
 import json
 import logging
-import shutil
 import re
+import shutil
 import smtplib
 import time
 import zipfile
-from email.message import EmailMessage
 from collections.abc import AsyncIterator, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
+from email.message import EmailMessage
 from pathlib import Path
 
 import httpx
-from PIL import Image
+from PIL import Image, ImageOps, ImageStat
 from sqlalchemy import func, or_, select, update
 from sqlalchemy.exc import IntegrityError, OperationalError, PendingRollbackError
 from sqlalchemy.orm import Session
 
 from app.adapters import adapter_for_source, enabled_source_names
-from app.adapters.base import ChapterTemporarilyUnavailable, SourceAdapter, SourceRateLimited
+from app.adapters.base import ChapterTemporarilyUnavailable, FrontierSentinel, SourceAdapter, SourceRateLimited
 from app.domain import (
     ChapterItem,
     SOURCE_PRIORITY,
@@ -38,10 +38,12 @@ from app.kavita import configured_kavita_client
 from app.kavita import local_path_for_kavita
 from app.kavita import KavitaSeries
 from app.models import (
+    ActivityEvent,
     Chapter,
+    ChapterFingerprint,
     ChapterProgress,
     ChapterRelease,
-    ActivityEvent,
+    CoverFingerprint,
     DownloadedFile,
     DownloadJob,
     KavitaSyncJob,
@@ -63,10 +65,6 @@ FIRST_IMPORT_CHAPTERS = settings.first_import_chapters
 SERIES_PROGRESS_STATUSES = {"interested", "reading", "caught_up", "paused"}
 CHAPTER_PROGRESS_STATUSES = {"unread", "reading", "read"}
 TEMPORARY_DOWNLOAD_ERROR_MARKERS = (
-    "only 0 chapter images found",
-    "only 1 chapter images found",
-    "only 2 chapter images found",
-    "invalid image page",
     "peer closed connection without sending complete message body",
     "incomplete message body",
     "remoteprotocolerror",
@@ -74,6 +72,13 @@ TEMPORARY_DOWNLOAD_ERROR_MARKERS = (
     "server error",
     "bad gateway",
     "gateway timeout",
+)
+CONTENT_DOWNLOAD_ERROR_MARKERS = (
+    "only 0 chapter images found",
+    "only 1 chapter images found",
+    "only 2 chapter images found",
+    "invalid image page",
+    "page asset not found",
 )
 COMMON_MATCH_TOKENS = {
     "academy",
@@ -95,6 +100,13 @@ COMMON_MATCH_TOKENS = {
     "villain",
     "world",
 }
+PSEUDO_DISCOVERY_TITLES = {"manga", "manhwa", "manhua", "text mode", "list mode"}
+MANUAL_MATCH_THRESHOLD = 0.84
+TITLE_DESCRIPTION_TIE_BREAKER_THRESHOLD = 0.84
+CHAPTER_VISUAL_CONFIDENCE = 0.96
+COVER_VISUAL_STRONG_CONFIDENCE = 0.94
+COVER_VISUAL_WEAK_CONFIDENCE = 0.90
+COMBINED_VISUAL_CONFIDENCE = 0.98
 _download_drain_lock = asyncio.Lock()
 
 
@@ -197,6 +209,9 @@ def slugify(value: str) -> str:
 
 
 def merge_series_item(session: Session, item: SeriesItem) -> SourceSeries:
+    item = replace(item, aliases=clean_alias_values(item.aliases, item.title))
+    if is_bad_discovery_item(item):
+        raise ValueError(f"skipping pseudo discovery item {item.source}:{item.source_id}")
     normalized = normalize_title(item.title)
     external_ids = encode_external_ids(item.external_ids)
     source_series = session.scalar(
@@ -276,6 +291,19 @@ def refresh_series_metadata(series: Series, item: SeriesItem) -> None:
     series.updated_at = utcnow()
 
 
+def clean_alias_values(values, title: str = "") -> tuple[str, ...]:
+    cleaned: list[str] = []
+    seen = {normalize_title(title), (title or "").strip().casefold()}
+    for value in values:
+        alias = " ".join(str(value or "").strip().split())
+        keys = {normalize_title(alias), alias.casefold()}
+        if not alias or not any(keys) or seen & keys:
+            continue
+        cleaned.append(alias)
+        seen.update(keys)
+    return tuple(cleaned)
+
+
 def should_refresh_series_title(current: str, candidate: str) -> bool:
     if not candidate:
         return False
@@ -302,27 +330,70 @@ def decode_metadata(value: str) -> dict[str, object]:
     return payload if isinstance(payload, dict) else {}
 
 
+def target_accepts_source(session: Session, source_series: SourceSeries, target: Series) -> bool:
+    if source_series.series_id == target.id:
+        return False
+    source_names = source_names_for_series(session, source_series.series_id)
+    target_names = source_names_for_series(session, target.id)
+    return source_names.isdisjoint(target_names)
+
+
+def source_names_for_series(session: Session, series_id: int) -> set[str]:
+    return set(
+        session.scalars(
+            select(SourceSeries.source).where(SourceSeries.series_id == series_id)
+        ).all()
+    )
+
+
+def target_accepts_source_name(target: Series, source: str) -> bool:
+    return source not in {row.source for row in target.sources}
+
+
+def is_bad_discovery_item(item: SeriesItem) -> bool:
+    title = (item.title or "").strip().lower()
+    if title in PSEUDO_DISCOVERY_TITLES:
+        return True
+    source_id = (item.source_id or "").strip().lower().strip("/")
+    if source_id in PSEUDO_DISCOVERY_TITLES:
+        return True
+    url = (item.url or "").lower()
+    path = re.sub(r"https?://[^/]+", "", url).split("?", 1)[0].strip("/")
+    if path in PSEUDO_DISCOVERY_TITLES:
+        return True
+    if any(token in url for token in ("?genre=", "?type=", "?status=", "?sort=", "/filter", "/genres")):
+        return True
+    return False
+
+
+def is_pseudo_discovery_title(title: str) -> bool:
+    raw = " ".join((title or "").strip().casefold().split())
+    return raw in PSEUDO_DISCOVERY_TITLES or normalize_title(title or "") in PSEUDO_DISCOVERY_TITLES
+
+
 def find_matching_series(session: Session, item: SeriesItem) -> tuple[Series | None, float, str]:
     normalized = normalize_title(item.title)
     if item.external_ids:
         for candidate in session.scalars(select(Series)).all():
-            if shared_external_ids(item.external_ids, decode_external_ids(candidate.external_ids)):
+            if target_accepts_source_name(candidate, item.source) and shared_external_ids(
+                item.external_ids, decode_external_ids(candidate.external_ids)
+            ):
                 return candidate, 1.0, "shared external id"
 
     exact = session.scalar(select(Series).where(Series.normalized_title == normalized))
-    if exact:
+    if exact and target_accepts_source_name(exact, item.source):
         return exact, 1.0, "exact normalized title"
 
     candidates = session.scalars(select(Series).limit(500)).all()
     best: tuple[float, Series] | None = None
     names = [item.title, *item.aliases]
     for candidate in candidates:
+        if not target_accepts_source_name(candidate, item.source):
+            continue
         candidate_names = [candidate.title, *(candidate.aliases or "").split("|")]
         score = best_name_similarity(names, candidate_names)
         if best is None or score > best[0]:
             best = (score, candidate)
-    if best and best[0] >= 0.90:
-        return best[1], best[0], "title similarity"
     return None, best[0] if best else 0, "below auto-merge threshold"
 
 
@@ -334,7 +405,7 @@ def create_match_candidates(
     reason: str,
 ) -> None:
     for candidate in session.scalars(select(Series).where(Series.id != source_series.series_id)).all():
-        if source_series.source in {source.source for source in candidate.sources}:
+        if not target_accepts_source(session, source_series, candidate):
             continue
         blocked = session.scalar(
             select(ManualMatchRule).where(
@@ -347,7 +418,7 @@ def create_match_candidates(
             continue
         score = manual_candidate_score(item, candidate)
         score = max(score, best_confidence if candidate.normalized_title == normalize_title(item.title) else 0)
-        if 0.70 <= score < 0.90:
+        if MANUAL_MATCH_THRESHOLD <= score < 0.90:
             existing = session.scalar(
                 select(MatchCandidate).where(
                     MatchCandidate.source_series_id == source_series.id,
@@ -360,7 +431,7 @@ def create_match_candidates(
                         source_series_id=source_series.id,
                         candidate_series_id=candidate.id,
                         confidence=score,
-                        reason=reason,
+                        reason=match_candidate_reason(score, reason),
                     )
                 )
 
@@ -370,7 +441,18 @@ def regenerate_match_candidates(session: Session) -> int:
     for source_series in session.scalars(select(SourceSeries).order_by(SourceSeries.id.asc())).all():
         item = series_item_from_source_series(source_series)
         for candidate in session.scalars(select(Series).where(Series.id != source_series.series_id)).all():
-            if source_series.source in {source.source for source in candidate.sources}:
+            accepts_source = target_accepts_source(session, source_series, candidate)
+            existing = session.scalar(
+                select(MatchCandidate).where(
+                    MatchCandidate.source_series_id == source_series.id,
+                    MatchCandidate.candidate_series_id == candidate.id,
+                    MatchCandidate.status == "pending",
+                )
+            )
+            if not accepts_source:
+                if existing is not None:
+                    session.delete(existing)
+                    changed += 1
                 continue
             if any(source.id > source_series.id for source in candidate.sources):
                 continue
@@ -381,28 +463,25 @@ def regenerate_match_candidates(session: Session) -> int:
                     ManualMatchRule.action == "separate",
                 )
             )
-            existing = session.scalar(
-                select(MatchCandidate).where(
-                    MatchCandidate.source_series_id == source_series.id,
-                    MatchCandidate.candidate_series_id == candidate.id,
-                    MatchCandidate.status == "pending",
-                )
-            )
             score = 0 if blocked else manual_candidate_score(item, candidate)
-            if 0.70 <= score < 0.90:
+            if MANUAL_MATCH_THRESHOLD <= score < 0.90:
                 if existing is None:
                     session.add(
                         MatchCandidate(
                             source_series_id=source_series.id,
                             candidate_series_id=candidate.id,
                             confidence=score,
-                            reason="repair candidate regeneration",
+                            reason=match_candidate_reason(score, "repair candidate regeneration"),
                         )
                     )
                     changed += 1
-                elif abs(existing.confidence - score) >= 0.01:
+                elif (
+                    abs(existing.confidence - score) >= 0.01
+                    or existing.reason != match_candidate_reason(score, existing.reason)
+                ):
+                    target_reason = match_candidate_reason(score, existing.reason)
                     existing.confidence = score
-                    existing.reason = "repair candidate regeneration"
+                    existing.reason = target_reason
                     changed += 1
             elif existing is not None:
                 session.delete(existing)
@@ -431,12 +510,23 @@ def series_item_from_source_series(source_series: SourceSeries) -> SeriesItem:
 def score_match_candidate(item: SeriesItem, candidate: Series) -> float:
     names = [item.title, *item.aliases]
     candidate_names = [candidate.title, *(candidate.aliases or "").split("|")]
-    return max(best_name_similarity(names, candidate_names), description_keyword_overlap(item.description, candidate.description))
+    score = best_name_similarity(names, candidate_names)
+    if score >= TITLE_DESCRIPTION_TIE_BREAKER_THRESHOLD and description_keyword_overlap(
+        item.description, candidate.description
+    ):
+        score = min(0.89, score + 0.02)
+    return score
 
 
 def manual_candidate_score(item: SeriesItem, candidate: Series) -> float:
     score = score_match_candidate(item, candidate)
     return min(score, 0.89) if score >= 0.70 else score
+
+
+def match_candidate_reason(score: float, fallback: str) -> str:
+    if score >= MANUAL_MATCH_THRESHOLD:
+        return "title/alias similarity"
+    return fallback
 
 
 def description_keyword_overlap(left: str, right: str) -> float:
@@ -471,15 +561,7 @@ def best_name_similarity(names: list[str], candidate_names: list[str]) -> float:
 
 
 def enhanced_title_similarity(left: str, right: str) -> float:
-    score = title_similarity(left, right)
-    left_tokens = distinctive_title_tokens(left)
-    right_tokens = distinctive_title_tokens(right)
-    shared = left_tokens & right_tokens
-    if len(shared) >= 2 and any(token not in COMMON_MATCH_TOKENS for token in shared):
-        score = max(score, 0.72)
-    if len(shared) >= 3:
-        score = max(score, 0.78)
-    return score
+    return title_similarity(left, right)
 
 
 def distinctive_title_tokens(title: str) -> set[str]:
@@ -593,7 +675,7 @@ async def poll_source(
         raise RuntimeError(f"source {source} is disabled or unavailable")
     try:
         try:
-            items = await adapter.list_recent()
+            items = await list_recent_with_frontier(session, adapter, source)
             if progress is not None:
                 progress(0, len(items))
                 commit_with_retry(session)
@@ -690,6 +772,58 @@ async def poll_source(
             raise
     finally:
         await close_adapter(adapter)
+
+
+async def list_recent_with_frontier(
+    session: Session,
+    adapter: SourceAdapter,
+    source: str,
+) -> list[SeriesItem]:
+    sentinels = source_frontier_sentinels(session, source)
+    list_frontier = getattr(adapter, "list_recent_frontier", None)
+    if list_frontier is not None:
+        items = await list_frontier(sentinels)
+    else:
+        items = await adapter.list_recent()
+    return [item for item in items if not is_bad_discovery_item(item)]
+
+
+def source_frontier_sentinels(session: Session, source: str) -> list[FrontierSentinel]:
+    rows = session.execute(
+        select(SourceSeries.source_id, ChapterRelease.number, ChapterRelease.first_seen_at)
+        .join(ChapterRelease, ChapterRelease.source_series_id == SourceSeries.id)
+        .where(SourceSeries.source == source)
+    ).all()
+    latest_by_source: dict[str, tuple[str, datetime]] = {}
+    for source_id, number, seen_at in rows:
+        current = latest_by_source.get(source_id)
+        seen = ensure_aware(seen_at) or datetime.min.replace(tzinfo=timezone.utc)
+        if current is None:
+            latest_by_source[source_id] = (number, seen)
+            continue
+        current_number, current_seen = current
+        if compare_chapter_numbers(number, current_number) > 0 or (
+            compare_chapter_numbers(number, current_number) == 0 and seen > current_seen
+        ):
+            latest_by_source[source_id] = (number, seen)
+    ordered = sorted(latest_by_source.items(), key=lambda item: item[1][1], reverse=True)
+    return [
+        FrontierSentinel(source_id=source_id, latest_chapter=number)
+        for source_id, (number, _seen) in ordered[: settings.source_frontier_sentinels]
+    ]
+
+
+def compare_chapter_numbers(left: str, right: str) -> int:
+    try:
+        left_decimal = Decimal(normalize_chapter_number(left))
+        right_decimal = Decimal(normalize_chapter_number(right))
+    except InvalidOperation:
+        if left == right:
+            return 0
+        return 1 if left > right else -1
+    if left_decimal == right_decimal:
+        return 0
+    return 1 if left_decimal > right_decimal else -1
 
 
 def create_pull_job(session: Session, source: str) -> tuple[SourcePullJob, bool]:
@@ -1400,6 +1534,41 @@ async def run_next_download(session: Session) -> bool:
     except Exception as exc:
         if staging_path is not None:
             staging_path.unlink(missing_ok=True)
+        if is_content_download_error(exc):
+            retry_after = next_retry_after(max(job.attempts, 1))
+            job.status = "failed" if job.attempts >= settings.max_download_attempts else "delayed"
+            job.retry_after = None if job.status == "failed" else retry_after
+            job.error = str(exc)
+            job.updated_at = utcnow()
+            queued_fallback = queue_next_chapter_download(
+                session,
+                release.chapter,
+                exclude_release_id=release.id,
+                priority=job.priority + 1,
+                job_type=job.job_type,
+            )
+            record_activity(
+                session,
+                "download",
+                "error" if job.status == "failed" else "warning",
+                f"{release.source} page download failure; retry after {retry_after.isoformat()}: {exc}",
+                source=release.source,
+                series_id=release.chapter.series_id,
+                chapter_id=release.chapter.id,
+                download_job_id=job.id,
+                metadata={"fallback_queued": queued_fallback},
+            )
+            commit_with_retry(session)
+            logger.warning(
+                "download job delayed by temporary failure job_id=%s source=%s chapter_id=%s retry_after=%s fallback=%s reason=%s",
+                job.id,
+                release.source,
+                release.chapter.id,
+                retry_after,
+                queued_fallback,
+                exc,
+            )
+            return True
         if is_temporary_download_error(exc):
             retry_after = next_retry_after(max(job.attempts, 1))
             retry_after = set_source_download_cooldown(
@@ -1433,7 +1602,7 @@ async def run_next_download(session: Session) -> bool:
             )
             commit_with_retry(session)
             logger.warning(
-                "download job delayed by temporary failure job_id=%s source=%s chapter_id=%s retry_after=%s fallback=%s reason=%s",
+                "download job delayed by source failure job_id=%s source=%s chapter_id=%s retry_after=%s fallback=%s reason=%s",
                 job.id,
                 release.source,
                 release.chapter.id,
@@ -1446,7 +1615,7 @@ async def run_next_download(session: Session) -> bool:
             job.status = "failed"
             job.retry_after = None
         else:
-            job.status = "queued"
+            job.status = "delayed"
             job.retry_after = next_retry_after(job.attempts)
         job.error = str(exc)
         job.updated_at = utcnow()
@@ -1788,6 +1957,24 @@ def is_temporary_download_error(exc: BaseException) -> bool:
     return any(marker in text for marker in TEMPORARY_DOWNLOAD_ERROR_MARKERS)
 
 
+def is_content_download_error(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        request_url = str(exc.request.url) if exc.request else ""
+        if exc.response.status_code == 404 and is_page_asset_url(request_url):
+            return True
+    text = str(exc).lower()
+    return any(marker in text for marker in CONTENT_DOWNLOAD_ERROR_MARKERS)
+
+
+def is_page_asset_url(url: str) -> bool:
+    value = (url or "").lower()
+    if not value:
+        return False
+    return any(token in value for token in ("/uploads/manga/", "/chapter/", "/chapters/", "/pages/")) or any(
+        value.endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif")
+    )
+
+
 def claim_next_download_job(session: Session) -> DownloadJob | None:
     now = datetime.now(timezone.utc)
     running_total = session.scalar(
@@ -1912,6 +2099,392 @@ def file_checksum(path: Path) -> str:
     return digest.hexdigest()
 
 
+def build_visual_fingerprints(session: Session, limit: int | None = None) -> dict[str, int]:
+    if not settings.visual_match_enabled:
+        return {"chapters": 0, "fingerprints": 0, "cover_fingerprints": 0, "skipped": 0}
+    query = (
+        select(DownloadedFile)
+        .where(DownloadedFile.active.is_(True))
+        .order_by(DownloadedFile.created_at.desc(), DownloadedFile.id.desc())
+    )
+    if limit is not None:
+        query = query.limit(limit)
+    chapters = 0
+    fingerprints = 0
+    skipped = 0
+    for downloaded in session.scalars(query).all():
+        existing = session.scalar(
+            select(ChapterFingerprint.id)
+            .where(ChapterFingerprint.chapter_release_id == downloaded.chapter_release_id)
+            .limit(1)
+        )
+        if existing is not None:
+            skipped += 1
+            continue
+        release = session.get(ChapterRelease, downloaded.chapter_release_id)
+        if release is None:
+            skipped += 1
+            continue
+        try:
+            rows = chapter_fingerprints_from_cbz(Path(downloaded.path), release)
+        except Exception as exc:
+            logger.warning("fingerprint build failed for %s: %s", downloaded.path, exc)
+            skipped += 1
+            continue
+        for row in rows:
+            session.add(row)
+        chapters += 1
+        fingerprints += len(rows)
+        if chapters % 10 == 0:
+            commit_with_retry(session)
+    if chapters or fingerprints:
+        commit_with_retry(session)
+    cover_fingerprints = build_cover_fingerprints(session, limit=limit)
+    return {
+        "chapters": chapters,
+        "fingerprints": fingerprints,
+        "cover_fingerprints": cover_fingerprints,
+        "skipped": skipped,
+    }
+
+
+def build_cover_fingerprints(session: Session, limit: int | None = None) -> int:
+    query = (
+        select(SourceSeries)
+        .where(SourceSeries.cover_path != "")
+        .order_by(SourceSeries.id.asc())
+    )
+    if limit is not None:
+        query = query.limit(limit)
+    changed = 0
+    for source_series in session.scalars(query).all():
+        changed += int(upsert_cover_fingerprint(session, source_series))
+        if changed and changed % 25 == 0:
+            commit_with_retry(session)
+    if changed:
+        commit_with_retry(session)
+    return changed
+
+
+def upsert_cover_fingerprint(session: Session, source_series: SourceSeries) -> bool:
+    path = Path(source_series.cover_path) if source_series.cover_path else None
+    if path is None or not path.exists():
+        return False
+    try:
+        fingerprint = cover_image_hash(path)
+    except Exception as exc:
+        logger.warning("cover fingerprint build failed for %s: %s", path, exc)
+        return False
+    existing = session.scalar(
+        select(CoverFingerprint).where(
+            CoverFingerprint.source_series_id == source_series.id,
+            CoverFingerprint.algorithm == "cover-dhash-v1",
+        )
+    )
+    if existing is None:
+        session.add(
+            CoverFingerprint(
+                source_series_id=source_series.id,
+                source=source_series.source,
+                algorithm="cover-dhash-v1",
+                hash_hex=fingerprint["hash"],
+                width=fingerprint["width"],
+                height=fingerprint["height"],
+            )
+        )
+        return True
+    if (
+        existing.hash_hex == fingerprint["hash"]
+        and existing.width == fingerprint["width"]
+        and existing.height == fingerprint["height"]
+        and existing.source == source_series.source
+    ):
+        return False
+    existing.source = source_series.source
+    existing.hash_hex = str(fingerprint["hash"])
+    existing.width = int(fingerprint["width"])
+    existing.height = int(fingerprint["height"])
+    existing.created_at = utcnow()
+    return True
+
+
+def cover_image_hash(path: Path) -> dict[str, int | str]:
+    with Image.open(path) as image:
+        image = ImageOps.exif_transpose(image).convert("L")
+        width, height = image.size
+        if width <= 0 or height <= 0:
+            raise RuntimeError("invalid cover dimensions")
+        image.thumbnail((512, 768))
+        if is_low_detail_image(image):
+            raise RuntimeError("low detail cover")
+        return {"hash": dhash_hex(image), "width": width, "height": height}
+
+
+def chapter_fingerprints_from_cbz(path: Path, release: ChapterRelease) -> list[ChapterFingerprint]:
+    if not path.exists():
+        return []
+    rows: list[ChapterFingerprint] = []
+    with zipfile.ZipFile(path) as cbz:
+        names = [
+            name
+            for name in sorted(cbz.namelist())
+            if Path(name).suffix.lower() in {".jpg", ".jpeg", ".png", ".webp", ".gif"}
+        ]
+        total = len(names)
+        start = min(settings.visual_match_skip_first_pages, total)
+        end = max(start, total - settings.visual_match_skip_last_pages)
+        sample_names = names[start:end][: settings.visual_match_max_pages]
+        for offset, name in enumerate(sample_names, start=start):
+            with cbz.open(name) as handle:
+                data = handle.read(settings.max_page_bytes + 1)
+            for segment_index, fingerprint in enumerate(image_segment_hashes(data)):
+                rows.append(
+                    ChapterFingerprint(
+                        source_series_id=release.source_series_id,
+                        chapter_release_id=release.id,
+                        source=release.source,
+                        chapter_number=release.number,
+                        page_index=offset,
+                        segment_index=segment_index,
+                        algorithm="dhash-v1",
+                        hash_hex=fingerprint["hash"],
+                        width=fingerprint["width"],
+                        height=fingerprint["height"],
+                    )
+                )
+    return rows
+
+
+def image_segment_hashes(data: bytes) -> list[dict[str, int | str]]:
+    with Image.open(io.BytesIO(data)) as image:
+        image = ImageOps.exif_transpose(image).convert("L")
+        if is_low_detail_image(image):
+            return []
+        width, height = image.size
+        if width <= 0 or height <= 0 or height / max(width, 1) > 12 or width / max(height, 1) > 4:
+            return []
+        normalized_width = 512
+        normalized_height = max(1, int(height * (normalized_width / width)))
+        image = image.resize((normalized_width, normalized_height))
+        segment_height = min(settings.visual_match_segment_height, normalized_height)
+        step = max(1, segment_height - settings.visual_match_segment_overlap)
+        segments: list[dict[str, int | str]] = []
+        y = 0
+        while y < normalized_height:
+            bottom = min(normalized_height, y + segment_height)
+            if bottom - y < min(128, segment_height):
+                break
+            segment = image.crop((0, y, normalized_width, bottom))
+            if not is_low_detail_image(segment):
+                segments.append(
+                    {
+                        "hash": dhash_hex(segment),
+                        "width": normalized_width,
+                        "height": bottom - y,
+                    }
+                )
+            if bottom >= normalized_height:
+                break
+            y += step
+        return segments
+
+
+def is_low_detail_image(image: Image.Image) -> bool:
+    small = image.resize((64, 64))
+    stat = ImageStat.Stat(small)
+    extrema = small.getextrema()
+    contrast = (extrema[1] - extrema[0]) if isinstance(extrema, tuple) else 0
+    return (stat.var[0] if stat.var else 0) < 12 or contrast < 18
+
+
+def dhash_hex(image: Image.Image) -> str:
+    resized = image.resize((9, 8))
+    get_pixels = getattr(resized, "get_flattened_data", resized.getdata)
+    pixels = list(get_pixels())
+    value = 0
+    for row in range(8):
+        for column in range(8):
+            left = pixels[row * 9 + column]
+            right = pixels[row * 9 + column + 1]
+            value = (value << 1) | int(left > right)
+    return f"{value:016x}"
+
+
+def rebuild_visual_matches(session: Session) -> int:
+    if not settings.visual_match_enabled:
+        return 0
+    rows = session.scalars(select(ChapterFingerprint).order_by(ChapterFingerprint.id.asc())).all()
+    by_chapter: dict[tuple[int, int], list[ChapterFingerprint]] = {}
+    for row in rows:
+        by_chapter.setdefault((row.source_series_id, row.chapter_release_id), []).append(row)
+    changed = 0
+    keys = list(by_chapter)
+    for index, left_key in enumerate(keys):
+        left_source_series_id, _left_release_id = left_key
+        left_series = session.get(SourceSeries, left_source_series_id)
+        if left_series is None:
+            continue
+        for right_key in keys[index + 1 :]:
+            right_source_series_id, _right_release_id = right_key
+            right_series = session.get(SourceSeries, right_source_series_id)
+            if right_series is None or right_series.series_id == left_series.series_id:
+                continue
+            if right_series.source == left_series.source:
+                continue
+            if visual_segment_match_count(by_chapter[left_key], by_chapter[right_key]) < settings.visual_match_min_segment_hits:
+                continue
+            source_series, candidate_series = visual_candidate_pair(left_series, right_series)
+            if visual_match_blocked(session, source_series.id, candidate_series.id):
+                continue
+            changed += int(
+                upsert_visual_match_candidate(
+                    session,
+                    source_series,
+                    candidate_series,
+                    CHAPTER_VISUAL_CONFIDENCE,
+                    "visual chapter match",
+                )
+            )
+    changed += rebuild_cover_visual_matches(session)
+    if changed:
+        commit_with_retry(session)
+    return changed
+
+
+def rebuild_cover_visual_matches(session: Session) -> int:
+    rows = session.scalars(select(CoverFingerprint).order_by(CoverFingerprint.id.asc())).all()
+    changed = 0
+    for index, left in enumerate(rows):
+        left_series = session.get(SourceSeries, left.source_series_id)
+        if left_series is None:
+            continue
+        left_hash = int(left.hash_hex, 16)
+        for right in rows[index + 1 :]:
+            right_series = session.get(SourceSeries, right.source_series_id)
+            if right_series is None or right_series.series_id == left_series.series_id:
+                continue
+            if right_series.source == left_series.source:
+                continue
+            distance = hamming_distance(left_hash, int(right.hash_hex, 16))
+            if distance <= 4:
+                confidence = COVER_VISUAL_STRONG_CONFIDENCE
+            elif distance <= 10:
+                confidence = COVER_VISUAL_WEAK_CONFIDENCE
+            else:
+                continue
+            source_series, candidate_series = visual_candidate_pair(left_series, right_series)
+            if visual_match_blocked(session, source_series.id, candidate_series.id):
+                continue
+            changed += int(
+                upsert_visual_match_candidate(
+                    session,
+                    source_series,
+                    candidate_series,
+                    confidence,
+                    "visual cover match",
+                )
+            )
+    return changed
+
+
+def upsert_visual_match_candidate(
+    session: Session,
+    source_series: SourceSeries,
+    candidate_series: Series,
+    confidence: float,
+    reason: str,
+) -> bool:
+    if not target_accepts_source(session, source_series, candidate_series):
+        existing = session.scalar(
+            select(MatchCandidate).where(
+                MatchCandidate.source_series_id == source_series.id,
+                MatchCandidate.candidate_series_id == candidate_series.id,
+                MatchCandidate.status == "pending",
+            )
+        )
+        if existing is not None:
+            session.delete(existing)
+            return True
+        return False
+    existing = session.scalar(
+        select(MatchCandidate).where(
+            MatchCandidate.source_series_id == source_series.id,
+            MatchCandidate.candidate_series_id == candidate_series.id,
+            MatchCandidate.status == "pending",
+        )
+    )
+    if existing is None:
+        session.add(
+            MatchCandidate(
+                source_series_id=source_series.id,
+                candidate_series_id=candidate_series.id,
+                confidence=confidence,
+                reason=reason,
+            )
+        )
+        session.flush()
+        return True
+    combined_visual = (
+        (reason == "visual cover match" and existing.reason == "visual chapter match")
+        or (reason == "visual chapter match" and existing.reason == "visual cover match")
+        or existing.reason == "visual cover and chapter match"
+    )
+    target_confidence = COMBINED_VISUAL_CONFIDENCE if combined_visual else confidence
+    target_reason = "visual cover and chapter match" if combined_visual else reason
+    if existing.confidence < target_confidence or existing.reason != target_reason:
+        existing.confidence = target_confidence
+        existing.reason = target_reason
+        return True
+    return False
+
+
+def visual_segment_match_count(
+    left_rows: list[ChapterFingerprint],
+    right_rows: list[ChapterFingerprint],
+) -> int:
+    hits: set[tuple[int, int]] = set()
+    for left in left_rows:
+        left_hash = int(left.hash_hex, 16)
+        for right in right_rows:
+            if hamming_distance(left_hash, int(right.hash_hex, 16)) <= settings.visual_match_max_hamming_distance:
+                hits.add((left.page_index, left.segment_index))
+                break
+    if not has_non_adjacent_hits(hits):
+        return 0
+    return len(hits)
+
+
+def has_non_adjacent_hits(hits: set[tuple[int, int]]) -> bool:
+    ordered = sorted(hits)
+    for index, left in enumerate(ordered):
+        for right in ordered[index + 1 :]:
+            if abs(left[0] - right[0]) > 1 or abs(left[1] - right[1]) > 1:
+                return True
+    return False
+
+
+def hamming_distance(left: int, right: int) -> int:
+    return (left ^ right).bit_count()
+
+
+def visual_candidate_pair(left: SourceSeries, right: SourceSeries) -> tuple[SourceSeries, Series]:
+    if left.id <= right.id:
+        return right, left.series
+    return left, right.series
+
+
+def visual_match_blocked(session: Session, source_series_id: int, candidate_series_id: int) -> bool:
+    return bool(
+        session.scalar(
+            select(ManualMatchRule.id)
+            .where(ManualMatchRule.source_series_id == source_series_id)
+            .where(ManualMatchRule.target_series_id == candidate_series_id)
+            .where(ManualMatchRule.action == "separate")
+            .limit(1)
+        )
+    )
+
+
 async def cache_cover_image(
     session: Session, source_series: SourceSeries, item: SeriesItem
 ) -> CoverCacheResult | None:
@@ -1931,6 +2504,7 @@ async def cache_cover_image(
     if existing is not None:
         source_series.cover_path = str(existing)
         source_series.series.cover_path = str(existing)
+        upsert_cover_fingerprint(session, source_series)
         return CoverCacheResult(
             active_path=existing,
             stale_paths=frozenset(path for path in stale_paths if path != existing),
@@ -1947,6 +2521,7 @@ async def cache_cover_image(
         tmp_path.replace(path)
         source_series.cover_path = str(path)
         source_series.series.cover_path = str(path)
+        upsert_cover_fingerprint(session, source_series)
         return CoverCacheResult(
             active_path=path,
             stale_paths=frozenset(stale_path for stale_path in stale_paths if stale_path != path),
@@ -2349,17 +2924,20 @@ def merge_match_candidate(session: Session, candidate_id: int) -> bool:
     if source_series is None or target is None:
         return False
     old_series_id = source_series.series_id
+    moving_sources = session.scalars(
+        select(SourceSeries).where(SourceSeries.series_id == old_series_id)
+    ).all()
+    if not target_accepts_source(session, source_series, target):
+        session.delete(candidate)
+        commit_with_retry(session)
+        return False
     old_series = session.get(Series, old_series_id)
     move_series_progress(session, old_series_id, target.id)
     moving_source_ids = [
-        row[0]
-        for row in session.execute(
-            select(SourceSeries.id).where(SourceSeries.series_id == old_series_id)
-        )
+        row.id
+        for row in moving_sources
     ]
-    for source_row in session.scalars(
-        select(SourceSeries).where(SourceSeries.series_id == old_series_id)
-    ):
+    for source_row in moving_sources:
         source_row.series = target
     for chapter in session.scalars(select(Chapter).where(Chapter.series_id == old_series_id)):
         existing = session.scalar(
@@ -2592,6 +3170,7 @@ def cleanup_replaced_files(session: Session) -> int:
 def cleanup_bad_discovery_rows(session: Session) -> dict[str, int]:
     removed_chapters = 0
     removed_series = 0
+    repaired_titles = 0
     bad_chapters = session.scalars(
         select(Chapter).where(
             or_(
@@ -2611,9 +3190,8 @@ def cleanup_bad_discovery_rows(session: Session) -> dict[str, int]:
         session.delete(chapter)
         removed_chapters += 1
 
-    for source_series in session.scalars(select(SourceSeries).where(SourceSeries.source == "kingofshojo")).all():
-        title = source_series.title.strip().lower()
-        if title not in {"manhwa", "manga", "manhua", "text mode", "list mode"}:
+    for source_series in session.scalars(select(SourceSeries)).all():
+        if not is_bad_discovery_item(series_item_from_source_series(source_series)):
             continue
         series = source_series.series
         has_files = session.scalar(
@@ -2621,7 +3199,14 @@ def cleanup_bad_discovery_rows(session: Session) -> dict[str, int]:
         )
         if has_files or series.status != "new":
             continue
-        for candidate in session.scalars(select(MatchCandidate).where(MatchCandidate.source_series_id == source_series.id)):
+        for candidate in session.scalars(
+            select(MatchCandidate).where(
+                or_(
+                    MatchCandidate.source_series_id == source_series.id,
+                    MatchCandidate.candidate_series_id == series.id,
+                )
+            )
+        ):
             session.delete(candidate)
         session.delete(source_series)
         session.flush()
@@ -2634,15 +3219,135 @@ def cleanup_bad_discovery_rows(session: Session) -> dict[str, int]:
         if remaining_sources is None and remaining_chapters is None:
             session.delete(series)
         removed_series += 1
-    if removed_chapters or removed_series:
+    session.flush()
+    for series in session.scalars(select(Series).where(Series.status == "new")).all():
+        if not is_pseudo_discovery_title(series.title) and not is_pseudo_discovery_title(
+            series.normalized_title
+        ):
+            continue
+        if not series_is_orphan_without_files(session, series):
+            continue
+        for candidate in session.scalars(
+            select(MatchCandidate).where(MatchCandidate.candidate_series_id == series.id)
+        ):
+            session.delete(candidate)
+        session.delete(series)
+        removed_series += 1
+    for series in session.scalars(select(Series)).all():
+        clean_title = clean_source_title_for_series(series)
+        if not clean_title or not is_polluted_series_title(series.title, clean_title):
+            continue
+        series.title = clean_title
+        series.normalized_title = normalize_title(clean_title)
+        series.updated_at = utcnow()
+        repaired_titles += 1
+    if removed_chapters or removed_series or repaired_titles:
         record_activity(
             session,
             "cleanup",
             "success",
-            f"Removed {removed_chapters} bad chapters and {removed_series} pseudo-series",
+            f"Removed {removed_chapters} bad chapters and {removed_series} pseudo-series; repaired {repaired_titles} titles",
         )
         commit_with_retry(session)
-    return {"chapters": removed_chapters, "series": removed_series}
+    return {"chapters": removed_chapters, "series": removed_series, "titles": repaired_titles}
+
+
+def series_is_orphan_without_files(session: Session, series: Series) -> bool:
+    has_source = session.scalar(select(SourceSeries.id).where(SourceSeries.series_id == series.id).limit(1))
+    if has_source:
+        return False
+    has_chapter = session.scalar(select(Chapter.id).where(Chapter.series_id == series.id).limit(1))
+    if has_chapter:
+        return False
+    has_files = session.scalar(
+        select(DownloadedFile.id).join(Chapter).where(Chapter.series_id == series.id).limit(1)
+    )
+    return not bool(has_files)
+
+
+def clean_source_title_for_series(series: Series) -> str:
+    for source in sorted(series.sources, key=lambda row: SOURCE_PRIORITY.get(row.source, 0), reverse=True):
+        title = " ".join((source.title or "").split())
+        if title and not is_pseudo_discovery_title(title) and " read " not in title.lower():
+            return title
+    return ""
+
+
+def is_polluted_series_title(current: str, clean_title: str) -> bool:
+    current_norm = normalize_title(current or "")
+    clean_norm = normalize_title(clean_title or "")
+    if not current_norm or not clean_norm or current_norm == clean_norm:
+        return False
+    return bool(
+        re.search(r"\bread\s+(?:manga|manhwa|manhua)\b", current or "", flags=re.I)
+        or re.search(r"\b(?:text|list)\s+mode\b", current or "", flags=re.I)
+    )
+
+
+def cleanup_polluted_metadata(session: Session) -> dict[str, int]:
+    aliases = 0
+    covers = 0
+    polluted_aliases = {"asura scans home", "asura scans", "home"}
+    for row in session.scalars(select(SourceSeries)).all():
+        original_aliases = row.aliases or ""
+        cleaned_aliases = "|".join(
+            alias
+            for alias in original_aliases.split("|")
+            if alias and alias.strip().lower() not in polluted_aliases
+        )
+        if cleaned_aliases != original_aliases:
+            row.aliases = cleaned_aliases
+            aliases += 1
+        if row.source == "kingofshojo" and is_bad_kingofshojo_cover(row.cover_url):
+            row.cover_url = ""
+            row.cover_path = ""
+            covers += 1
+    for series in session.scalars(select(Series)).all():
+        original_aliases = series.aliases or ""
+        cleaned_aliases = "|".join(
+            alias
+            for alias in original_aliases.split("|")
+            if alias and alias.strip().lower() not in polluted_aliases
+        )
+        if cleaned_aliases != original_aliases:
+            series.aliases = cleaned_aliases
+            aliases += 1
+        if series.cover_url and is_bad_kingofshojo_cover(series.cover_url):
+            fallback = first_valid_source_cover(series)
+            series.cover_url = fallback or ""
+            if not fallback:
+                series.cover_path = ""
+            covers += 1
+    filled_covers = fill_missing_series_covers(session)
+    if aliases or covers or filled_covers:
+        commit_with_retry(session)
+    return {"aliases": aliases, "covers": covers + filled_covers}
+
+
+def is_bad_kingofshojo_cover(url: str) -> bool:
+    value = (url or "").lower()
+    if not value:
+        return False
+    return any(token in value for token in ("wewtwt.png", "logo", "favicon", "banner", "default"))
+
+
+def first_valid_source_cover(series: Series) -> str:
+    for source in sorted(series.sources, key=lambda row: SOURCE_PRIORITY.get(row.source, 0), reverse=True):
+        if source.cover_url and not is_bad_kingofshojo_cover(source.cover_url):
+            return source.cover_url
+    return ""
+
+
+def fill_missing_series_covers(session: Session) -> int:
+    updated = 0
+    for series in session.scalars(select(Series)).all():
+        if series.cover_url and not is_bad_kingofshojo_cover(series.cover_url):
+            continue
+        fallback = first_valid_source_cover(series)
+        if fallback:
+            series.cover_url = fallback
+            updated += 1
+    return updated
 
 
 def is_legacy_bad_chapter(chapter: Chapter) -> bool:
@@ -2678,12 +3383,13 @@ def remove_legacy_bad_chapters(session: Session) -> int:
     return removed
 
 
-async def repair_known_series(session: Session, limit: int = 100) -> dict[str, int]:
+async def repair_known_series(session: Session, limit: int | None = None) -> dict[str, int]:
     cleanup = cleanup_bad_discovery_rows(session)
+    metadata_cleanup = cleanup_polluted_metadata(session)
     removed_chapters = cleanup["chapters"] + remove_legacy_bad_chapters(session)
     refreshed = 0
     rescanned = 0
-    rows = session.scalars(
+    query = (
         select(SourceSeries)
         .join(Series)
         .order_by(
@@ -2691,8 +3397,10 @@ async def repair_known_series(session: Session, limit: int = 100) -> dict[str, i
             SourceSeries.last_checked_at.asc(),
             SourceSeries.id.asc(),
         )
-        .limit(limit)
-    ).all()
+    )
+    if limit is not None:
+        query = query.limit(limit)
+    rows = session.scalars(query).all()
     for source_series in rows:
         try:
             count = await rescan_source_series(session, source_series.id)
@@ -2702,7 +3410,7 @@ async def repair_known_series(session: Session, limit: int = 100) -> dict[str, i
         rescanned += 1
         if count:
             refreshed += count
-    covers = await refresh_missing_covers(session, limit=limit)
+    covers = await refresh_missing_covers(session, limit=limit or 10_000)
     removed_chapters += remove_legacy_bad_chapters(session)
     matches = regenerate_match_candidates(session)
     recovered_jobs = recover_stale_download_jobs(session)
@@ -2712,6 +3420,8 @@ async def repair_known_series(session: Session, limit: int = 100) -> dict[str, i
         "removed_chapters": removed_chapters,
         "removed_series": cleanup["series"],
         "covers": covers,
+        "metadata_aliases": metadata_cleanup["aliases"],
+        "metadata_covers": metadata_cleanup["covers"],
         "matches": matches,
         "recovered_jobs": recovered_jobs,
     }
@@ -2793,11 +3503,21 @@ def recover_stale_download_jobs(session: Session) -> int:
     for job in orphaned:
         session.delete(job)
         count += 1
+    for job in session.scalars(
+        select(DownloadJob)
+        .where(DownloadJob.status == "queued")
+        .where(DownloadJob.retry_after.is_not(None))
+    ):
+        job.status = "delayed"
+        job.updated_at = utcnow()
+        count += 1
     for job in session.scalars(select(DownloadJob).where(DownloadJob.status == "running")):
         updated_at = ensure_aware(job.updated_at)
-        if updated_at and updated_at <= cutoff:
+        error_text = (job.error or "").lower()
+        partial_body_failed = any(marker in error_text for marker in TEMPORARY_DOWNLOAD_ERROR_MARKERS)
+        if partial_body_failed or (updated_at and updated_at <= cutoff):
             job.status = "queued"
-            job.error = "recovered stale running job"
+            job.error = "recovered temporary running job" if partial_body_failed else "recovered stale running job"
             job.retry_after = None
             job.updated_at = utcnow()
             count += 1

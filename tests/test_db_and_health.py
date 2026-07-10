@@ -70,6 +70,7 @@ def test_fresh_sqlite_migrations_create_version_and_unique_job_constraint(tmp_pa
 
     inspector = inspect(engine)
     assert "alembic_version" in inspector.get_table_names()
+    assert "cover_fingerprint" in inspector.get_table_names()
     assert "uq_download_job_chapter_release" in {
         constraint["name"] for constraint in inspector.get_unique_constraints("download_job")
     }
@@ -254,8 +255,8 @@ def test_versioned_sqlite_upgrade_adds_download_job_unique_index(tmp_path, monke
         ).scalar_one() == 1
         assert (
             connection.execute(text("SELECT version_num FROM alembic_version")).scalar_one()
-            == "c41d7a2f5b80"
-        )
+                == "3e7b91a5c2d0"
+            )
         try:
             connection.execute(
                 text("INSERT INTO download_job (id, chapter_release_id) VALUES (3, 10)")
@@ -783,6 +784,84 @@ def test_api_jobs_status_includes_all_job_types():
     assert payload["kavita"][0]["status"] == "queued"
     assert payload["kavita"][0]["series_title"] == "Example"
     assert payload["pulls"][0]["source"] == "mangafire"
+
+
+def test_api_jobs_status_reports_cooldown_blocked_downloads():
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    session = Session()
+    source_series = merge_series_item(
+        session,
+        SeriesItem(source="mangafire", source_id="gl3", title="Example", url="x"),
+    )
+    release = upsert_release(
+        session,
+        source_series,
+        ChapterItem("mangafire", source_series.source_id, "12", "Chapter 12", "x", None),
+    )
+    session.flush()
+    session.add(DownloadJob(chapter_release_id=release.id, status="queued"))
+    session.add(
+        SourceHealth(
+            source="mangafire",
+            download_cooldown_until=datetime.now(timezone.utc) + timedelta(minutes=30),
+            download_cooldown_reason="rate limited",
+        )
+    )
+    session.commit()
+    try:
+        payload = main.api_jobs_status(make_request("/api/jobs/status"), session)
+    finally:
+        session.close()
+
+    group = payload["downloads"][0]
+    chapter = group["chapters"][0]
+    assert payload["counts"]["download_queue"] == {
+        "ready": 0,
+        "retry_delayed": 0,
+        "cooldown_blocked": 1,
+    }
+    assert payload["overall"]["cooldown_blocked_downloads"] == 1
+    assert group["cooldown_blocked"]
+    assert group["source_cooldown_reason"] == "rate limited"
+    assert chapter["cooldown_blocked"]
+
+
+def test_discovery_helpers_count_filter_and_interleave_without_chapter_graphs():
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    session = Session()
+    asura = merge_series_item(
+        session,
+        SeriesItem(source="asura", source_id="a", title="Asura Series", url="x"),
+    )
+    fire = merge_series_item(
+        session,
+        SeriesItem(source="mangafire", source_id="m", title="MangaFire Series", url="y"),
+    )
+    upsert_release(
+        session,
+        asura,
+        ChapterItem("asura", asura.source_id, "1", "Chapter 1", "x", datetime(2026, 7, 9, tzinfo=timezone.utc)),
+    )
+    upsert_release(
+        session,
+        fire,
+        ChapterItem("mangafire", fire.source_id, "1", "Chapter 1", "y", datetime(2026, 7, 10, tzinfo=timezone.utc)),
+    )
+    session.commit()
+    try:
+        counts = main.discovery_source_counts(session, ["asura", "mangafire"])
+        all_ids = main.discovery_ordered_series_ids(session, "all")
+        fire_ids = main.discovery_ordered_series_ids(session, "mangafire")
+    finally:
+        session.close()
+
+    assert counts == {"all": 2, "asura": 1, "mangafire": 1}
+    assert set(all_ids) == {asura.series_id, fire.series_id}
+    assert fire_ids == [fire.series_id]
 
 
 def test_api_jobs_status_paginates_info_sections():

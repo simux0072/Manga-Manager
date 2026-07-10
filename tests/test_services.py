@@ -4,6 +4,7 @@ import zipfile
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 from PIL import Image
 from sqlalchemy import create_engine
 from sqlalchemy.exc import OperationalError
@@ -18,8 +19,10 @@ from app.domain import ChapterItem, SeriesItem
 from app.models import (
     ActivityEvent,
     Chapter,
+    ChapterFingerprint,
     ChapterProgress,
     ChapterRelease,
+    CoverFingerprint,
     DownloadJob,
     DownloadedFile,
     KavitaSyncJob,
@@ -88,6 +91,26 @@ def image_bytes(image_format: str = "PNG") -> bytes:
     buffer = io.BytesIO()
     Image.new("RGB", (1, 1), color="white").save(buffer, format=image_format)
     return buffer.getvalue()
+
+
+def patterned_image_bytes(image_format: str = "PNG", size: tuple[int, int] = (320, 900)) -> bytes:
+    image = Image.new("RGB", size, color="white")
+    pixels = image.load()
+    for y in range(size[1]):
+        for x in range(size[0]):
+            if (x // 12 + y // 17) % 3 == 0:
+                pixels[x, y] = (20, 20, 20)
+            elif (x + y) % 29 == 0:
+                pixels[x, y] = (120, 120, 120)
+    buffer = io.BytesIO()
+    image.save(buffer, format=image_format)
+    return buffer.getvalue()
+
+
+def write_cbz(path: Path, pages: list[bytes]) -> None:
+    with zipfile.ZipFile(path, "w") as cbz:
+        for index, page in enumerate(pages, start=1):
+            cbz.writestr(f"{index:04d}.png", page)
 
 
 def test_merge_series_auto_matches_exact_normalized_title():
@@ -844,6 +867,34 @@ def test_claim_next_download_job_resumes_due_delayed_job():
     assert job.status == "running"
 
 
+def test_recover_stale_download_jobs_converts_queued_retry_to_delayed():
+    session = make_session()
+    source_series = merge_series_item(
+        session,
+        SeriesItem(source="mangafire", source_id="gl3", title="Example", url="x"),
+    )
+    release = upsert_release(
+        session,
+        source_series,
+        ChapterItem("mangafire", source_series.source_id, "1", "Chapter 1", "x", None),
+    )
+    session.flush()
+    session.add(
+        DownloadJob(
+            chapter_release_id=release.id,
+            status="queued",
+            retry_after=datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+    )
+    session.commit()
+
+    assert recover_stale_download_jobs(session) == 1
+
+    job = session.query(DownloadJob).one()
+    assert job.status == "delayed"
+    assert job.retry_after is not None
+
+
 async def test_run_next_download_marks_temporary_unavailable_as_delayed(monkeypatch):
     class DelayedAdapter:
         async def download_chapter_pages(self, chapter):
@@ -1141,7 +1192,8 @@ async def test_run_next_download_rejects_streamed_too_few_pages(tmp_path, monkey
     job = session.query(DownloadJob).one()
     assert job.status == "delayed"
     assert "only 2 chapter images" in job.error
-    assert job.attempts == 0
+    assert job.attempts == 1
+    assert session.get(SourceHealth, "mangafire") is None
     assert not list((tmp_path / "library").rglob("*.tmp"))
 
 
@@ -1181,11 +1233,91 @@ async def test_run_next_download_rejects_corrupt_page_bytes(tmp_path, monkeypatc
     job = session.query(DownloadJob).one()
     assert job.status == "delayed"
     assert "invalid image page" in job.error
-    assert job.attempts == 0
+    assert job.attempts == 1
     assert any(f"download job started job_id={job.id}" in record for record in records)
     assert any(f"download job delayed by temporary failure job_id={job.id}" in record for record in records)
     assert not list((tmp_path / "library").rglob("*.cbz"))
     assert not list((tmp_path / "library").rglob("*.tmp"))
+
+
+async def test_run_next_download_treats_page_asset_404_as_content_delay(monkeypatch):
+    class MissingPageAdapter:
+        async def iter_chapter_pages(self, chapter):
+            request = httpx.Request("GET", "https://static.mangafire.to/uploads/manga/example/1.jpg")
+            response = httpx.Response(404, request=request)
+            raise httpx.HTTPStatusError("not found", request=request, response=response)
+            yield b""
+
+    session = make_session()
+    monkeypatch.setattr(services, "adapter_for_source", lambda source: MissingPageAdapter())
+    source_series = merge_series_item(
+        session,
+        SeriesItem(source="mangafire", source_id="gl3", title="Example", url="x"),
+    )
+    release = upsert_release(
+        session,
+        source_series,
+        ChapterItem("mangafire", source_series.source_id, "1", "Chapter 1", "x", None),
+    )
+    session.flush()
+    session.add(DownloadJob(chapter_release_id=release.id))
+    session.commit()
+
+    assert await services.run_next_download(session)
+
+    job = session.query(DownloadJob).one()
+    assert job.status == "delayed"
+    assert job.retry_after is not None
+    assert job.attempts == 1
+    assert session.get(SourceHealth, "mangafire") is None
+
+
+async def test_run_next_download_content_failure_fails_after_max_and_queues_fallback(
+    tmp_path, monkeypatch
+):
+    class ShortAdapter:
+        async def iter_chapter_pages(self, chapter):
+            yield image_bytes()
+
+    session = make_session()
+    monkeypatch.setattr(services.settings, "library_root", tmp_path / "library")
+    monkeypatch.setattr(services, "adapter_for_source", lambda source: ShortAdapter())
+    high = merge_series_item(
+        session,
+        SeriesItem(source="asura", source_id="comics/example", title="Example", url="x"),
+    )
+    low = merge_series_item(
+        session,
+        SeriesItem(source="mangafire", source_id="gl3", title="Example", url="y"),
+    )
+    high_release = upsert_release(
+        session,
+        high,
+        ChapterItem("asura", high.source_id, "1", "Chapter 1", "x", None),
+    )
+    low_release = upsert_release(
+        session,
+        low,
+        ChapterItem("mangafire", low.source_id, "1", "Chapter 1", "y", None),
+    )
+    session.flush()
+    high_release.downloadable_after = None
+    session.add(
+        DownloadJob(
+            chapter_release_id=high_release.id,
+            attempts=services.settings.max_download_attempts - 1,
+        )
+    )
+    session.commit()
+
+    assert await services.run_next_download(session)
+
+    high_job = session.query(DownloadJob).filter_by(chapter_release_id=high_release.id).one()
+    fallback_job = session.query(DownloadJob).filter_by(chapter_release_id=low_release.id).one()
+    assert high_job.status == "failed"
+    assert high_job.retry_after is None
+    assert high_job.attempts == services.settings.max_download_attempts
+    assert fallback_job.status == "queued"
 
 
 async def test_kavita_scan_failure_keeps_download_complete(tmp_path, monkeypatch):
@@ -1869,6 +2001,33 @@ def test_recover_stale_running_jobs_requeues_old_job(monkeypatch):
     assert job.error == "recovered stale running job"
 
 
+def test_recover_running_job_with_partial_body_error_immediately(monkeypatch):
+    session = make_session()
+    monkeypatch.setattr(services.settings, "download_stale_minutes", 60)
+    source_series = merge_series_item(
+        session,
+        SeriesItem(source="mangafire", source_id="gl3", title="Example", url="x"),
+    )
+    release = upsert_release(
+        session,
+        source_series,
+        ChapterItem("mangafire", source_series.source_id, "1", "Chapter 1", "x", None),
+    )
+    session.flush()
+    job = DownloadJob(
+        chapter_release_id=release.id,
+        status="running",
+        error="peer closed connection without sending complete message body",
+        updated_at=datetime.now(timezone.utc),
+    )
+    session.add(job)
+    session.commit()
+
+    assert recover_stale_download_jobs(session) == 1
+    assert job.status == "queued"
+    assert job.error == "recovered temporary running job"
+
+
 def test_recover_stale_running_jobs_handles_reloaded_sqlite_datetime(tmp_path, monkeypatch):
     Session = make_file_session_factory(tmp_path / "stale.db")
     setup = Session()
@@ -1930,7 +2089,7 @@ async def test_failed_download_uses_backoff_and_is_not_immediately_retried(monke
 
     assert await services.run_next_download(session)
     job = session.query(DownloadJob).one()
-    assert job.status == "queued"
+    assert job.status == "delayed"
     assert job.retry_after is not None
     assert job.attempts == 1
 
@@ -2015,7 +2174,7 @@ async def test_temporary_content_failure_delays_job_and_queues_fallback(monkeypa
 
     jobs = {job.chapter_release_id: job for job in session.query(DownloadJob).all()}
     assert jobs[asura_release.id].status == "delayed"
-    assert jobs[asura_release.id].attempts == 0
+    assert jobs[asura_release.id].attempts == 1
     assert jobs[asura_release.id].retry_after is not None
     assert jobs[fallback_release.id].status == "queued"
 
@@ -2104,7 +2263,7 @@ def test_manual_merge_recomputes_best_source_for_duplicate_chapter():
     assert session.query(Series).count() == 1
 
 
-def test_cross_source_sashimi_titles_create_manual_match_candidate():
+def test_cross_source_sashimi_titles_do_not_create_weak_token_candidate():
     session = make_session()
     asura = merge_series_item(
         session,
@@ -2127,10 +2286,8 @@ def test_cross_source_sashimi_titles_create_manual_match_candidate():
 
     assert asura.series_id != mangafire.series_id
     session.flush()
-    candidate = session.query(MatchCandidate).one()
-    assert candidate.source_series_id == mangafire.id
-    assert candidate.candidate_series_id == asura.series_id
-    assert 0.70 <= candidate.confidence < 0.90
+    assert asura.series_id != mangafire.series_id
+    assert session.query(MatchCandidate).count() == 0
 
 
 def test_repair_regenerates_sashimi_candidate_from_existing_aliases():
@@ -2163,6 +2320,271 @@ def test_repair_regenerates_sashimi_candidate_from_existing_aliases():
     candidate = session.query(MatchCandidate).one()
     assert candidate.source_series_id == king.id
     assert candidate.candidate_series_id == asura.series_id
+    assert candidate.reason == "title/alias similarity"
+
+
+def test_mangafire_alias_exact_match_creates_pending_candidate_not_auto_merge():
+    session = make_session()
+    asura = merge_series_item(
+        session,
+        SeriesItem(
+            source="asura",
+            source_id="asura/escape",
+            title="I Can't Escape, He Won't Let Me Go",
+            url="a",
+        ),
+    )
+    mangafire = merge_series_item(
+        session,
+        SeriesItem(
+            source="mangafire",
+            source_id="oxr4y",
+            title="Escape Me If You Can",
+            url="m",
+            aliases=("I Can't Escape, He Won't Let Me Go",),
+        ),
+    )
+
+    assert asura.series_id != mangafire.series_id
+    session.flush()
+    candidate = session.query(MatchCandidate).one()
+    assert candidate.source_series_id == mangafire.id
+    assert candidate.candidate_series_id == asura.series_id
+    assert candidate.confidence == 0.89
+    assert candidate.reason == "title/alias similarity"
+
+
+def test_regenerate_recreates_mangafire_alias_candidate_from_persisted_aliases():
+    session = make_session()
+    asura = merge_series_item(
+        session,
+        SeriesItem("asura", "asura/escape", "I Can't Escape, He Won't Let Me Go", "a"),
+    )
+    mangafire = merge_series_item(
+        session,
+        SeriesItem("mangafire", "oxr4y", "Escape Me If You Can", "m"),
+    )
+    mangafire.aliases = "I Can't Escape, He Won't Let Me Go"
+    session.query(MatchCandidate).delete()
+    session.commit()
+
+    changed = services.regenerate_match_candidates(session)
+
+    assert changed == 1
+    candidate = session.query(MatchCandidate).one()
+    assert candidate.source_series_id == mangafire.id
+    assert candidate.candidate_series_id == asura.series_id
+    assert candidate.reason == "title/alias similarity"
+
+
+def test_description_overlap_does_not_create_manual_candidate():
+    session = make_session()
+    description = "academy hunter dungeon magic adventure villain world chronicles"
+    merge_series_item(
+        session,
+        SeriesItem(
+            source="asura",
+            source_id="asura/generic-a",
+            title="North Star Return",
+            url="a",
+            description=description,
+        ),
+    )
+    merge_series_item(
+        session,
+        SeriesItem(
+            source="kingofshojo",
+            source_id="king/generic-b",
+            title="Moon Blade Life",
+            url="k",
+            description=description,
+        ),
+    )
+
+    assert session.query(MatchCandidate).count() == 0
+
+
+def test_visual_fingerprints_create_pending_candidate(tmp_path, monkeypatch):
+    session = make_session()
+    monkeypatch.setattr(services.settings, "visual_match_skip_first_pages", 0)
+    monkeypatch.setattr(services.settings, "visual_match_skip_last_pages", 0)
+    monkeypatch.setattr(services.settings, "visual_match_max_pages", 1)
+    monkeypatch.setattr(services.settings, "visual_match_segment_height", 256)
+    monkeypatch.setattr(services.settings, "visual_match_segment_overlap", 0)
+    monkeypatch.setattr(services.settings, "visual_match_min_segment_hits", 2)
+    monkeypatch.setattr(services.settings, "visual_match_max_hamming_distance", 0)
+
+    left = merge_series_item(
+        session,
+        SeriesItem("asura", "asura/visual", "Visual Left", "a"),
+    )
+    right = merge_series_item(
+        session,
+        SeriesItem("kingofshojo", "king/visual", "Visual Right", "k"),
+    )
+    left_release = upsert_release(
+        session,
+        left,
+        ChapterItem("asura", left.source_id, "7", "Chapter 7", "a/7", None),
+    )
+    right_release = upsert_release(
+        session,
+        right,
+        ChapterItem("kingofshojo", right.source_id, "7", "Chapter 7", "k/7", None),
+    )
+    session.query(MatchCandidate).delete()
+    session.flush()
+    left_path = tmp_path / "left.cbz"
+    right_path = tmp_path / "right.cbz"
+    page = patterned_image_bytes(size=(320, 1800))
+    write_cbz(left_path, [page])
+    write_cbz(right_path, [page])
+    session.add_all(
+        [
+            DownloadedFile(
+                chapter_id=left_release.chapter_id,
+                chapter_release_id=left_release.id,
+                source="asura",
+                path=str(left_path),
+                active=True,
+            ),
+            DownloadedFile(
+                chapter_id=right_release.chapter_id,
+                chapter_release_id=right_release.id,
+                source="kingofshojo",
+                path=str(right_path),
+                active=True,
+            ),
+        ]
+    )
+    session.commit()
+
+    result = services.build_visual_fingerprints(session)
+    changed = services.rebuild_visual_matches(session)
+
+    assert result["fingerprints"] >= 4
+    assert session.query(ChapterFingerprint).count() == result["fingerprints"]
+    assert changed == 1
+    candidate = session.query(MatchCandidate).one()
+    assert candidate.reason == "visual chapter match"
+    assert candidate.confidence == 0.96
+    assert candidate.status == "pending"
+
+
+def test_cover_fingerprints_create_high_confidence_pending_candidate(tmp_path):
+    session = make_session()
+    left = merge_series_item(
+        session,
+        SeriesItem("asura", "asura/cover", "Cover Left", "a"),
+    )
+    right = merge_series_item(
+        session,
+        SeriesItem("kingofshojo", "king/cover", "Cover Right", "k"),
+    )
+    session.query(MatchCandidate).delete()
+    left_path = tmp_path / "left.png"
+    right_path = tmp_path / "right.png"
+    left_path.write_bytes(patterned_image_bytes(size=(360, 540)))
+    right_path.write_bytes(patterned_image_bytes(size=(360, 540)))
+    left.cover_path = str(left_path)
+    left.series.cover_path = str(left_path)
+    right.cover_path = str(right_path)
+    right.series.cover_path = str(right_path)
+    session.commit()
+
+    result = services.build_visual_fingerprints(session)
+    changed = services.rebuild_visual_matches(session)
+
+    assert result["cover_fingerprints"] == 2
+    assert session.query(CoverFingerprint).count() == 2
+    assert changed == 1
+    candidate = session.query(MatchCandidate).one()
+    assert candidate.reason == "visual cover match"
+    assert candidate.confidence == 0.94
+
+
+def test_cover_fingerprints_skip_duplicate_provider_from_source_parent(tmp_path):
+    session = make_session()
+    king = merge_series_item(session, SeriesItem("kingofshojo", "king/group", "Grouped King", "k"))
+    grouped_mangafire = merge_series_item(session, SeriesItem("mangafire", "mf/group", "Grouped Fire", "m1"))
+    session.add(MatchCandidate(source_series_id=grouped_mangafire.id, candidate_series_id=king.series_id))
+    session.commit()
+    assert merge_match_candidate(session, session.query(MatchCandidate.id).scalar())
+
+    other_mangafire = merge_series_item(session, SeriesItem("mangafire", "mf/other", "Other Fire", "m2"))
+    session.query(MatchCandidate).delete()
+    left_path = tmp_path / "left.png"
+    right_path = tmp_path / "right.png"
+    left_path.write_bytes(patterned_image_bytes(size=(360, 540)))
+    right_path.write_bytes(patterned_image_bytes(size=(360, 540)))
+    king.cover_path = str(left_path)
+    king.series.cover_path = str(left_path)
+    other_mangafire.cover_path = str(right_path)
+    other_mangafire.series.cover_path = str(right_path)
+    session.add(MatchCandidate(source_series_id=other_mangafire.id, candidate_series_id=king.series_id))
+    session.commit()
+
+    result = services.build_visual_fingerprints(session)
+    changed = services.rebuild_visual_matches(session)
+
+    assert result["cover_fingerprints"] == 2
+    assert changed == 1
+    assert session.query(MatchCandidate).count() == 0
+
+
+def test_visual_cover_and_chapter_evidence_combines_confidence(tmp_path, monkeypatch):
+    session = make_session()
+    monkeypatch.setattr(services.settings, "visual_match_skip_first_pages", 0)
+    monkeypatch.setattr(services.settings, "visual_match_skip_last_pages", 0)
+    monkeypatch.setattr(services.settings, "visual_match_max_pages", 1)
+    monkeypatch.setattr(services.settings, "visual_match_segment_height", 256)
+    monkeypatch.setattr(services.settings, "visual_match_segment_overlap", 0)
+    monkeypatch.setattr(services.settings, "visual_match_min_segment_hits", 2)
+    monkeypatch.setattr(services.settings, "visual_match_max_hamming_distance", 0)
+
+    left = merge_series_item(session, SeriesItem("asura", "asura/both", "Both Left", "a"))
+    right = merge_series_item(session, SeriesItem("kingofshojo", "king/both", "Both Right", "k"))
+    left_release = upsert_release(session, left, ChapterItem("asura", left.source_id, "1", "", "a/1", None))
+    right_release = upsert_release(session, right, ChapterItem("kingofshojo", right.source_id, "1", "", "k/1", None))
+    session.query(MatchCandidate).delete()
+    session.flush()
+    page = patterned_image_bytes(size=(320, 1800))
+    left_cbz = tmp_path / "left.cbz"
+    right_cbz = tmp_path / "right.cbz"
+    write_cbz(left_cbz, [page])
+    write_cbz(right_cbz, [page])
+    left_cover = tmp_path / "left.png"
+    right_cover = tmp_path / "right.png"
+    left_cover.write_bytes(patterned_image_bytes(size=(360, 540)))
+    right_cover.write_bytes(patterned_image_bytes(size=(360, 540)))
+    left.cover_path = str(left_cover)
+    right.cover_path = str(right_cover)
+    session.add_all(
+        [
+            DownloadedFile(
+                chapter_id=left_release.chapter_id,
+                chapter_release_id=left_release.id,
+                source="asura",
+                path=str(left_cbz),
+                active=True,
+            ),
+            DownloadedFile(
+                chapter_id=right_release.chapter_id,
+                chapter_release_id=right_release.id,
+                source="kingofshojo",
+                path=str(right_cbz),
+                active=True,
+            ),
+        ]
+    )
+    session.commit()
+
+    services.build_visual_fingerprints(session)
+    services.rebuild_visual_matches(session)
+
+    candidate = session.query(MatchCandidate).one()
+    assert candidate.reason == "visual cover and chapter match"
+    assert candidate.confidence == 0.98
 
 
 def test_repair_keeps_exact_separate_rule_but_allows_other_candidates():
@@ -2184,7 +2606,7 @@ def test_repair_keeps_exact_separate_rule_but_allows_other_candidates():
             "k",
         ),
     )
-    source.aliases = "The Academy's Sashimi Sword Master"
+    source.aliases = "The Academy's Sashimi Sword Master|Sashimi Academy Sword Master"
     session.query(MatchCandidate).delete()
     session.add(
         ManualMatchRule(
@@ -2231,6 +2653,75 @@ def test_same_source_weak_title_match_does_not_create_candidate():
         ),
     )
 
+    assert session.query(MatchCandidate).count() == 0
+
+
+def test_regenerate_removes_stale_same_source_candidate():
+    session = make_session()
+    target = merge_series_item(session, SeriesItem("asura", "asura/target", "Target", "a"))
+    duplicate = merge_series_item(session, SeriesItem("asura", "asura/duplicate", "Target Duplicate", "b"))
+    session.add(MatchCandidate(source_series_id=duplicate.id, candidate_series_id=target.series_id))
+    session.commit()
+
+    changed = services.regenerate_match_candidates(session)
+
+    assert changed == 1
+    assert session.query(MatchCandidate).count() == 0
+
+
+def test_regenerate_blocks_duplicate_provider_from_source_parent():
+    session = make_session()
+    king = merge_series_item(session, SeriesItem("kingofshojo", "king/group", "Grouped King", "k"))
+    grouped_mangafire = merge_series_item(session, SeriesItem("mangafire", "mf/group", "Grouped Fire", "m1"))
+    session.add(MatchCandidate(source_series_id=grouped_mangafire.id, candidate_series_id=king.series_id))
+    session.commit()
+    assert merge_match_candidate(session, session.query(MatchCandidate.id).scalar())
+    session.query(MatchCandidate).delete()
+
+    other_mangafire = merge_series_item(
+        session,
+        SeriesItem("mangafire", "mf/other", "Duplicate Provider Target", "m2"),
+    )
+    king.aliases = "Duplicate Provider Target"
+    session.add(MatchCandidate(source_series_id=king.id, candidate_series_id=other_mangafire.series_id))
+    session.commit()
+
+    changed = services.regenerate_match_candidates(session)
+
+    assert changed == 1
+    assert session.query(MatchCandidate).count() == 0
+
+
+def test_manual_merge_refuses_same_source_target():
+    session = make_session()
+    target = merge_series_item(session, SeriesItem("asura", "asura/target", "Target", "a"))
+    duplicate = merge_series_item(session, SeriesItem("asura", "asura/duplicate", "Target Duplicate", "b"))
+    session.add(MatchCandidate(source_series_id=duplicate.id, candidate_series_id=target.series_id))
+    session.commit()
+
+    candidate_id = session.query(MatchCandidate.id).scalar()
+
+    assert not merge_match_candidate(session, candidate_id)
+    assert session.query(Series).count() == 2
+    assert session.query(MatchCandidate).count() == 0
+
+
+def test_manual_merge_refuses_duplicate_provider_from_source_parent():
+    session = make_session()
+    king = merge_series_item(session, SeriesItem("kingofshojo", "king/group", "Grouped King", "k"))
+    grouped_mangafire = merge_series_item(session, SeriesItem("mangafire", "mf/group", "Grouped Fire", "m1"))
+    session.add(MatchCandidate(source_series_id=grouped_mangafire.id, candidate_series_id=king.series_id))
+    session.commit()
+    assert merge_match_candidate(session, session.query(MatchCandidate.id).scalar())
+    session.query(MatchCandidate).delete()
+
+    other_mangafire = merge_series_item(session, SeriesItem("mangafire", "mf/other", "Other Fire", "m2"))
+    session.add(MatchCandidate(source_series_id=king.id, candidate_series_id=other_mangafire.series_id))
+    session.commit()
+    candidate_id = session.query(MatchCandidate.id).scalar()
+
+    assert not merge_match_candidate(session, candidate_id)
+    assert session.query(Series).count() == 2
     assert session.query(MatchCandidate).count() == 0
 
 
@@ -2642,8 +3133,13 @@ def test_cleanup_bad_discovery_rows_removes_empty_pseudo_series():
     session = make_session()
     source_series = merge_series_item(
         session,
-        SeriesItem(source="kingofshojo", source_id="text-mode", title="Text Mode", url="x"),
+        SeriesItem(source="kingofshojo", source_id="legacy-text-mode", title="Legacy Text Mode", url="x"),
     )
+    source_series.title = "Text Mode"
+    source_series.normalized_title = "text mode"
+    source_series.source_id = "text-mode"
+    source_series.series.title = "Text Mode"
+    source_series.series.normalized_title = "text mode"
     upsert_release(
         session,
         source_series,
@@ -2666,8 +3162,13 @@ def test_cleanup_bad_discovery_rows_keeps_pseudo_series_with_files(tmp_path):
     session = make_session()
     source_series = merge_series_item(
         session,
-        SeriesItem(source="kingofshojo", source_id="manhwa", title="Manhwa", url="x"),
+        SeriesItem(source="kingofshojo", source_id="legacy-manhwa", title="Legacy Manhwa", url="x"),
     )
+    source_series.title = "Manhwa"
+    source_series.normalized_title = "manhwa"
+    source_series.source_id = "manhwa"
+    source_series.series.title = "Manhwa"
+    source_series.series.normalized_title = "manhwa"
     release = upsert_release(
         session,
         source_series,
@@ -2689,6 +3190,53 @@ def test_cleanup_bad_discovery_rows_keeps_pseudo_series_with_files(tmp_path):
     assert result["series"] == 0
     assert session.query(Series).count() == 1
     assert session.query(SourceSeries).count() == 1
+
+
+def test_cleanup_bad_discovery_rows_removes_orphan_pseudo_series():
+    session = make_session()
+    session.add(Series(title="Manhwa", normalized_title="manhwa", status="new"))
+    session.add(Series(title="Text Mode", normalized_title="text mode", status="new"))
+    session.commit()
+
+    result = services.cleanup_bad_discovery_rows(session)
+
+    assert result["series"] == 2
+    assert session.query(Series).count() == 0
+
+
+def test_cleanup_bad_discovery_rows_keeps_pseudo_series_if_tracked_or_sourced():
+    session = make_session()
+    tracked = Series(title="Manhwa", normalized_title="manhwa", status="interested")
+    session.add(tracked)
+    sourced = merge_series_item(
+        session,
+        SeriesItem(source="mangafire", source_id="gl3", title="Valid Title", url="x"),
+    ).series
+    sourced.title = "Text Mode"
+    sourced.normalized_title = "text mode"
+    session.commit()
+
+    result = services.cleanup_bad_discovery_rows(session)
+
+    assert result["series"] == 0
+    assert session.query(Series).count() == 2
+
+
+def test_cleanup_bad_discovery_rows_repairs_polluted_canonical_title():
+    session = make_session()
+    source_series = merge_series_item(
+        session,
+        SeriesItem(source="mangafire", source_id="gl3", title="Clean Title", url="x"),
+    )
+    source_series.series.title = "Clean Title Read manhwa online"
+    source_series.series.normalized_title = "clean title read manhwa online"
+    session.commit()
+
+    result = services.cleanup_bad_discovery_rows(session)
+
+    assert result["titles"] == 1
+    assert source_series.series.title == "Clean Title"
+    assert source_series.series.normalized_title == "clean title"
 
 
 def test_existing_source_refreshes_parent_metadata():

@@ -5,7 +5,7 @@ from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
-from app.adapters.base import ChapterTemporarilyUnavailable, SourceAdapter
+from app.adapters.base import ChapterTemporarilyUnavailable, FrontierSentinel, SourceAdapter
 from app.adapters.http import HttpSourceClient, iter_ordered_bytes, page_concurrency_for_source
 from app.adapters.parsing import clean_chapter_title, extract_image_urls, nearby_cover_attr, parse_source_date
 from app.domain import ChapterItem, SeriesItem, normalize_chapter_number
@@ -26,8 +26,24 @@ class AsuraAdapter(SourceAdapter):
         await self.client.aclose()
 
     async def list_recent(self) -> list[SeriesItem]:
-        soup = await self.client.get_soup("/")
-        return self.parse_recent_series(soup)
+        return await self.list_recent_frontier([])
+
+    async def list_recent_frontier(self, sentinels: list[FrontierSentinel]) -> list[SeriesItem]:
+        items: list[SeriesItem] = []
+        sentinel_map = {sentinel.source_id: sentinel.latest_chapter for sentinel in sentinels}
+        required_hits = min(settings.source_frontier_required_hits, len(sentinel_map))
+        hits = 0
+        max_pages = settings.asura_recent_pages if sentinels else min(3, settings.asura_recent_pages)
+        for page in range(1, max_pages + 1):
+            path = "/" if page == 1 else f"/page/{page}/"
+            parsed = self.parse_recent_series(await self.client.get_soup(path))
+            if not parsed:
+                break
+            items.extend(parsed)
+            hits += frontier_hits(parsed, sentinel_map)
+            if required_hits and hits >= required_hits:
+                break
+        return dedupe_series(items)
 
     def parse_recent_series(self, soup) -> list[SeriesItem]:
         items: list[SeriesItem] = []
@@ -42,6 +58,7 @@ class AsuraAdapter(SourceAdapter):
             url = urljoin(self.base_url, href)
             source_id = urlparse(url).path.strip("/")
             cover = nearby_cover_attr(link)
+            recent_chapters = self.parse_card_chapters(link, source_id, url)
             items.append(
                 SeriesItem(
                     source=self.source,
@@ -49,9 +66,26 @@ class AsuraAdapter(SourceAdapter):
                     title=title,
                     url=url,
                     cover_url=urljoin(self.base_url, cover) if cover else "",
+                    metadata={
+                        "recent_chapters": [
+                            {"number": chapter.number, "title": chapter.title, "url": chapter.url}
+                            for chapter in recent_chapters
+                        ]
+                    }
+                    if recent_chapters
+                    else {},
                 )
             )
         return dedupe_series(items)
+
+    def parse_card_chapters(self, link, source_id: str, series_url: str) -> list[ChapterItem]:
+        container = link
+        for parent in link.parents:
+            if getattr(parent, "name", None) in {"article", "li", "div"}:
+                container = parent
+                break
+        source = SeriesItem(self.source, source_id, link.get_text(" ", strip=True), series_url)
+        return self.parse_chapters(container, source)
 
     async def get_chapters(self, source_series: SeriesItem) -> list[ChapterItem]:
         soup = await self.client.get_soup(source_series.url)
@@ -82,9 +116,18 @@ class AsuraAdapter(SourceAdapter):
             if description:
                 break
         cover = ""
-        image = soup.select_one("meta[property='og:image']")
-        if image and image.get("content"):
-            cover = str(image["content"])
+        from app.adapters.parsing import image_attr
+
+        cover_image = soup.select_one(
+            ".summary_image img, .tab-summary img, .post-thumbnail img, "
+            "img.wp-post-image, img[data-src*='covers'], img[src*='covers']"
+        )
+        if cover_image:
+            cover = image_attr(cover_image)
+        if not cover:
+            image = soup.select_one("meta[property='og:image']")
+            if image and image.get("content"):
+                cover = str(image["content"])
         page_text = soup.get_text(" ", strip=True)
         metadata = compact_metadata(
             {
@@ -212,7 +255,33 @@ def is_premium_or_locked(soup) -> bool:
 
 def is_helper_chapter_link(title: str) -> bool:
     normalized = " ".join((title or "").split()).lower()
-    return normalized in {"first chapter", "latest chapter", "first", "latest"}
+    return normalized in {"first chapter", "latest chapter", "first", "latest", "manhwa", "text mode"}
+
+
+def frontier_hits(items: list[SeriesItem], sentinels: dict[str, str]) -> int:
+    hits = 0
+    for item in items:
+        known = sentinels.get(item.source_id)
+        latest = latest_recent_chapter(item)
+        if known is not None and latest is not None and chapter_number_key(latest) <= chapter_number_key(known):
+            hits += 1
+    return hits
+
+
+def latest_recent_chapter(item: SeriesItem) -> str | None:
+    rows = item.metadata.get("recent_chapters")
+    if not isinstance(rows, list):
+        return None
+    numbers = [str(row.get("number") or "") for row in rows if isinstance(row, dict)]
+    numbers = [number for number in numbers if number]
+    return max(numbers, key=chapter_number_key) if numbers else None
+
+
+def chapter_number_key(value: str) -> tuple[int, float, str]:
+    try:
+        return (1, float(normalize_chapter_number(value)), "")
+    except ValueError:
+        return (0, 0.0, value)
 
 
 def is_asura_chapter_image(url: str) -> bool:

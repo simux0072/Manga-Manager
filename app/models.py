@@ -134,6 +134,55 @@ class ChapterRelease(Base):
     source_series: Mapped[SourceSeries] = relationship(back_populates="releases")
 
 
+class ChapterFingerprint(Base):
+    __tablename__ = "chapter_fingerprint"
+    __table_args__ = (
+        UniqueConstraint(
+            "chapter_release_id",
+            "page_index",
+            "segment_index",
+            "algorithm",
+            name="uq_chapter_fingerprint_segment",
+        ),
+        Index("ix_chapter_fingerprint_lookup", "source", "chapter_number", "algorithm"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_series_id: Mapped[int] = mapped_column(ForeignKey("source_series.id"), index=True)
+    chapter_release_id: Mapped[int] = mapped_column(ForeignKey("chapter_release.id"), index=True)
+    source: Mapped[str] = mapped_column(String(50), index=True)
+    chapter_number: Mapped[str] = mapped_column(String(40), index=True)
+    page_index: Mapped[int] = mapped_column(Integer)
+    segment_index: Mapped[int] = mapped_column(Integer)
+    algorithm: Mapped[str] = mapped_column(String(40), default="dhash-v1")
+    hash_hex: Mapped[str] = mapped_column(String(32), index=True)
+    width: Mapped[int] = mapped_column(Integer, default=0)
+    height: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    source_series: Mapped[SourceSeries] = relationship()
+    chapter_release: Mapped[ChapterRelease] = relationship()
+
+
+class CoverFingerprint(Base):
+    __tablename__ = "cover_fingerprint"
+    __table_args__ = (
+        UniqueConstraint("source_series_id", "algorithm", name="uq_cover_fingerprint_source_algorithm"),
+        Index("ix_cover_fingerprint_lookup", "source", "algorithm"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_series_id: Mapped[int] = mapped_column(ForeignKey("source_series.id"), index=True)
+    source: Mapped[str] = mapped_column(String(50), index=True)
+    algorithm: Mapped[str] = mapped_column(String(40), default="cover-dhash-v1")
+    hash_hex: Mapped[str] = mapped_column(String(32), index=True)
+    width: Mapped[int] = mapped_column(Integer, default=0)
+    height: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    source_series: Mapped[SourceSeries] = relationship()
+
+
 class DownloadJob(Base):
     __tablename__ = "download_job"
     __table_args__ = (

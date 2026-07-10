@@ -126,10 +126,78 @@ def apply_compat_migrations() -> None:
     create_chapter_progress = "chapter_progress" not in columns_by_table
     create_activity_event = "activity_event" not in columns_by_table
     create_source_pull_job = "source_pull_job" not in columns_by_table
+    create_chapter_fingerprint = "chapter_fingerprint" not in columns_by_table
+    create_cover_fingerprint = "cover_fingerprint" not in columns_by_table
 
     with engine.begin() as connection:
         for statement in ddl:
             connection.execute(text(statement))
+        if create_chapter_fingerprint:
+            connection.execute(
+                text(
+                    "CREATE TABLE chapter_fingerprint ("
+                    "id INTEGER PRIMARY KEY, "
+                    "source_series_id INTEGER NOT NULL, "
+                    "chapter_release_id INTEGER NOT NULL, "
+                    "source VARCHAR(50) NOT NULL, "
+                    "chapter_number VARCHAR(40) NOT NULL, "
+                    "page_index INTEGER NOT NULL, "
+                    "segment_index INTEGER NOT NULL, "
+                    "algorithm VARCHAR(40) DEFAULT 'dhash-v1' NOT NULL, "
+                    "hash_hex VARCHAR(32) NOT NULL, "
+                    "width INTEGER DEFAULT 0 NOT NULL, "
+                    "height INTEGER DEFAULT 0 NOT NULL, "
+                    "created_at DATETIME NOT NULL, "
+                    "FOREIGN KEY(source_series_id) REFERENCES source_series (id), "
+                    "FOREIGN KEY(chapter_release_id) REFERENCES chapter_release (id), "
+                    "CONSTRAINT uq_chapter_fingerprint_segment UNIQUE "
+                    "(chapter_release_id, page_index, segment_index, algorithm)"
+                    ")"
+                )
+            )
+            connection.execute(
+                text("CREATE INDEX ix_chapter_fingerprint_chapter_number ON chapter_fingerprint (chapter_number)")
+            )
+            connection.execute(
+                text("CREATE INDEX ix_chapter_fingerprint_chapter_release_id ON chapter_fingerprint (chapter_release_id)")
+            )
+            connection.execute(text("CREATE INDEX ix_chapter_fingerprint_hash_hex ON chapter_fingerprint (hash_hex)"))
+            connection.execute(
+                text(
+                    "CREATE INDEX ix_chapter_fingerprint_lookup "
+                    "ON chapter_fingerprint (source, chapter_number, algorithm)"
+                )
+            )
+            connection.execute(text("CREATE INDEX ix_chapter_fingerprint_source ON chapter_fingerprint (source)"))
+            connection.execute(
+                text("CREATE INDEX ix_chapter_fingerprint_source_series_id ON chapter_fingerprint (source_series_id)")
+            )
+        if create_cover_fingerprint:
+            connection.execute(
+                text(
+                    "CREATE TABLE cover_fingerprint ("
+                    "id INTEGER PRIMARY KEY, "
+                    "source_series_id INTEGER NOT NULL, "
+                    "source VARCHAR(50) NOT NULL, "
+                    "algorithm VARCHAR(40) DEFAULT 'cover-dhash-v1' NOT NULL, "
+                    "hash_hex VARCHAR(32) NOT NULL, "
+                    "width INTEGER DEFAULT 0 NOT NULL, "
+                    "height INTEGER DEFAULT 0 NOT NULL, "
+                    "created_at DATETIME NOT NULL, "
+                    "FOREIGN KEY(source_series_id) REFERENCES source_series (id), "
+                    "CONSTRAINT uq_cover_fingerprint_source_algorithm UNIQUE "
+                    "(source_series_id, algorithm)"
+                    ")"
+                )
+            )
+            connection.execute(text("CREATE INDEX ix_cover_fingerprint_hash_hex ON cover_fingerprint (hash_hex)"))
+            connection.execute(
+                text("CREATE INDEX ix_cover_fingerprint_lookup ON cover_fingerprint (source, algorithm)")
+            )
+            connection.execute(text("CREATE INDEX ix_cover_fingerprint_source ON cover_fingerprint (source)"))
+            connection.execute(
+                text("CREATE INDEX ix_cover_fingerprint_source_series_id ON cover_fingerprint (source_series_id)")
+            )
         if create_kavita_sync_job:
             connection.execute(
                 text(
