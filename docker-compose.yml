@@ -98,6 +98,21 @@ services:
     mem_limit: 1g
     networks: [v2-internal]
 
+  maintenance-v2:
+    build: .
+    profiles: ["maintenance"]
+    environment:
+      V2_DATABASE_URL: postgresql+psycopg://manga_v2:manga_v2@postgres-v2:5432/manga_manager_v2
+      V2_STORAGE_ROOT: /data
+    command: ["uv", "run", "--frozen", "manga-manager", "reconcile-storage"]
+    depends_on:
+      migrate-v2:
+        condition: service_completed_successfully
+    volumes: ["./storage-v2:/data"]
+    mem_limit: 256m
+    restart: "no"
+    networks: [v2-internal]
+
 volumes:
   postgres-data:
   postgres-v2-data:

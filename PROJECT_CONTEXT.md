@@ -12,6 +12,11 @@ Last updated: 2026-07-10
   runs create a SQLite backup before deterministic changes.
 - `scripts/stage-local.sh` is the local rehearsal path when Compose is unavailable. Pi and Traefik
   cutover remains deferred.
+- PostgreSQL jobs carry indexed source, series, and pool routing. Renewable permit leases enforce
+  provider and global capacities across worker processes, while a partial unique index and advisory
+  lock enforce one leased chapter job per canonical series.
+- The v2 web application includes Discovery, Library, Updates, Matches, Activity, and Operations.
+  Match acceptance validates both complete provider sets before transactional reassignment.
 
 ## Purpose
 

@@ -46,6 +46,15 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands.add_parser("doctor", help="check v2 database connectivity and migration state")
     stage = subcommands.add_parser("stage-check", help="verify staged database and storage health")
     stage.add_argument("--json", action="store_true", dest="json_output")
+    benchmark = subcommands.add_parser(
+        "benchmark-workers", help="report safe worker-pool benchmark settings"
+    )
+    benchmark.add_argument("--asura-concurrency", type=int, choices=[1, 2], default=1)
+    cleanup = subcommands.add_parser(
+        "cleanup-repair-archives", help="delete repair archives older than the retention window"
+    )
+    cleanup.add_argument("storage_root", type=Path)
+    cleanup.add_argument("--retain-days", type=int, default=30)
     for name, help_text in (
         ("audit-legacy", "audit a legacy SQLite catalog without changing it"),
         ("repair-legacy", "repair safe legacy defects; defaults to dry-run"),
@@ -76,6 +85,10 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    if args.command == "cleanup-repair-archives":
+        removed = LegacyRepair.cleanup_archives(args.storage_root, retain_days=args.retain_days)
+        print(f"removed={len(removed)} retain_days={args.retain_days}")
+        return 0
     if args.command in {"audit-legacy", "repair-legacy"}:
         repair = LegacyRepair(args.database, storage_root=args.storage_root)
         apply = args.command == "repair-legacy" and args.apply
@@ -143,6 +156,29 @@ def main(argv: Sequence[str] | None = None) -> int:
         else:
             print(" ".join(f"{key}={value}" for key, value in payload.items()))
         return 0 if payload["ok"] else 1
+    if args.command == "benchmark-workers":
+        requested = args.asura_concurrency
+        with engine.connect() as connection:
+            row = connection.execute(
+                text(
+                    "SELECT health_status, cooldown_until > now() AS cooling FROM source_state_v2 "
+                    "WHERE source='asura'"
+                )
+            ).first()
+        effective = requested
+        abandoned = False
+        if requested == 2 and row is not None and (row.health_status == "cooldown" or row.cooling):
+            effective = 1
+            abandoned = True
+        payload = {
+            "requested_asura_concurrency": requested,
+            "effective_asura_concurrency": effective,
+            "abandoned_on_rate_limit": abandoned,
+            "global_chapter_ceiling": settings.global_chapter_concurrency,
+            "pool_limits": {**settings.pool_limits(), "download:asura": effective},
+        }
+        print(json.dumps(payload, sort_keys=True))
+        return 0
     if args.command == "enqueue-pull":
         sessions = create_session_factory(engine)
         with sessions() as session, session.begin():

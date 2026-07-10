@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sqlite3
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -149,6 +150,21 @@ class LegacyRepair:
                 }
             )
         return records
+
+    @staticmethod
+    def cleanup_archives(storage_root: Path, *, retain_days: int = 30) -> list[Path]:
+        if retain_days < 1:
+            raise ValueError("retain_days must be at least 1")
+        archive_root = storage_root.resolve() / "repair-archive"
+        if not archive_root.is_dir():
+            return []
+        cutoff = datetime.now(timezone.utc).timestamp() - retain_days * 86_400
+        removed: list[Path] = []
+        for directory in sorted(archive_root.iterdir()):
+            if directory.is_dir() and directory.stat().st_mtime < cutoff:
+                shutil.rmtree(directory)
+                removed.append(directory)
+        return removed
 
     def _backup(self, directory: Path) -> Path:
         directory.mkdir(parents=True, exist_ok=True)

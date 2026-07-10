@@ -41,6 +41,16 @@ done
 
 docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" "$image" \
   uv run --frozen manga-manager migrate
+
+if [ -n "${STAGE_IMPORT_ROOT:-}" ]; then
+  import_root=$(cd "$STAGE_IMPORT_ROOT" && pwd)
+  docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+    -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" -v "$import_root:/import:ro" "$image" \
+    uv run --frozen manga-manager import-cbz /import --report /data/stage-import-report.json
+  docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+    -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" \
+    uv run --frozen manga-manager reconcile-storage
+fi
 docker run -d --name "$web" --network "$network" --memory 256m -p "${STAGE_PORT:-18000}:8000" \
   -e "V2_DATABASE_URL=$database_url" -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" \
   uv run --frozen uvicorn manga_manager.web.app:app --host 0.0.0.0 --port 8000 >/dev/null
@@ -55,4 +65,27 @@ until docker exec "$web" uv run --frozen python -c "import json,urllib.request; 
 done
 docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
   -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" uv run --frozen manga-manager stage-check --json
+
+if [ -n "${STAGE_SMOKE_SOURCE:-}" ]; then
+  docker run --rm --network "$network" -e "V2_DATABASE_URL=$database_url" "$image" \
+    uv run --frozen manga-manager enqueue-pull "$STAGE_SMOKE_SOURCE"
+  sleep 5
+  docker run --rm --network "$network" -e "V2_DATABASE_URL=$database_url" "$image" \
+    uv run --frozen manga-manager stage-check --json
+fi
+
+# Rehearse a logical backup/restore into a disposable sibling database.
+docker exec "$postgres" pg_dump -U manga -d manga_manager -Fc -f /tmp/stage-rollback.dump
+docker exec "$postgres" dropdb -U manga --if-exists manga_manager_restore
+docker exec "$postgres" createdb -U manga manga_manager_restore
+docker exec "$postgres" pg_restore -U manga -d manga_manager_restore /tmp/stage-rollback.dump
+docker exec "$postgres" psql -U manga -d manga_manager_restore -Atc "SELECT version_num FROM alembic_version"
+docker exec "$postgres" dropdb -U manga manga_manager_restore
+
+docker restart "$web" "$worker" >/dev/null
+attempt=0
+until docker exec "$web" uv run --frozen python -c "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/healthz'))['ok']"; do
+  attempt=$((attempt + 1)); [ "$attempt" -lt 30 ] || { docker logs "$web"; exit 1; }
+  sleep 1
+done
 printf '%s\n' "staging ready: http://127.0.0.1:${STAGE_PORT:-18000}" "teardown: scripts/stage-local.sh down"

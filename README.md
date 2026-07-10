@@ -85,6 +85,11 @@ scripts/stage-local.sh down --volumes  # also delete the staging database
 Set `STAGE_PLATFORM=linux/arm64` when ARM64 binfmt/QEMU support is installed. This rehearsal does not
 change Raspberry Pi or Traefik state.
 
+Set `STAGE_IMPORT_ROOT=/path/to/repaired-cbz` to import and reconcile a repaired library during the
+rehearsal. Set `STAGE_SMOKE_SOURCE=asura`, `mangafire`, or `kingofshojo` only when a live provider
+smoke pull is intended. Every run performs a logical dump/restore into a disposable database and
+restarts web and worker containers before its final health check.
+
 ### Legacy audit and repair
 
 Audit and the default repair mode are read-only. `--apply` creates a consistent SQLite backup before
@@ -100,6 +105,19 @@ uv run manga-manager repair-legacy manga_manager.db --storage-root storage \
 Reports contain stable action keys, row evidence, before/after values, rollback instructions, and a
 SHA-256 storage manifest. A second applied run has no repeatable changes. V2 operational checks are
 available through `migrate`, `doctor`, and `stage-check`.
+
+Repair archives are retained by default. Delete only archives older than the 30-day rollback window:
+
+```bash
+uv run manga-manager cleanup-repair-archives storage --retain-days 30
+```
+
+`benchmark-workers` reports the effective pool limits. Asura concurrency two must be explicitly
+requested and is automatically reduced to one while its shared source state is in cooldown:
+
+```bash
+uv run manga-manager benchmark-workers --asura-concurrency 2
+```
 
 Backup checklist:
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
+import time
 from pathlib import Path
 
 from manga_manager.application.legacy_repair import LegacyRepair, write_legacy_report
@@ -219,3 +221,17 @@ def test_template_release_is_moved_to_repair_archive(tmp_path: Path) -> None:
     with sqlite3.connect(database) as connection:
         assert connection.execute("SELECT 1 FROM chapter_release WHERE id=3").fetchone() is None
         assert connection.execute("SELECT 1 FROM downloaded_file WHERE id=2").fetchone() is None
+
+
+def test_repair_archive_cleanup_preserves_thirty_day_window(tmp_path: Path) -> None:
+    archive_root = tmp_path / "storage" / "repair-archive"
+    old = archive_root / "old"
+    recent = archive_root / "recent"
+    old.mkdir(parents=True)
+    recent.mkdir()
+    old_time = time.time() - 31 * 86_400
+    os.utime(old, (old_time, old_time))
+    removed = LegacyRepair.cleanup_archives(tmp_path / "storage", retain_days=30)
+    assert removed == [old]
+    assert not old.exists()
+    assert recent.exists()
