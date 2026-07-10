@@ -2,6 +2,17 @@
 
 Last updated: 2026-07-10
 
+## PostgreSQL v2 transition
+
+- `manga_manager/` contains the durable PostgreSQL catalog, leased queue, workers,
+  content-addressed storage, migrations, CLI, and separate FastAPI/Jinja v2 web surface.
+- V2 discovery uses an indexed ID cursor and database-side filtering. Delta SSE emits `job` and
+  `counts` events; heartbeats are comments.
+- `audit-legacy` is read-only. `repair-legacy` defaults to dry-run and requires `--apply`; applied
+  runs create a SQLite backup before deterministic changes.
+- `scripts/stage-local.sh` is the local rehearsal path when Compose is unavailable. Pi and Traefik
+  cutover remains deferred.
+
 ## Purpose
 
 Manga Manager is a private personal-use manga discovery, tracking, download, and Kavita import
@@ -108,6 +119,8 @@ The scheduler:
   Download cooldown fields track source/CDN rate limits separately from poll health.
 - `ManualMatchRule`: records manual merge/separate decisions.
 - `MatchCandidate`: possible source-series-to-series matches pending user review.
+- `ChapterFingerprint`: perceptual image segment hashes built from downloaded CBZ pages for
+  conservative visual match candidates.
 
 Kavita mapping fields:
 
@@ -175,8 +188,11 @@ Important settings:
 - `KEEP_REPLACED_FILES`: archive old CBZs before replacement.
 - `MANGAFIRE_DISCOVERY_MODE`: defaults to `new`; set to `hot` only to request MangaFire's hot feed.
 - `MANGAFIRE_RECENT_LIMIT`: number of MangaFire recent titles to request.
-- `MANGAFIRE_RECENT_PAGES`: number of MangaFire `/updated` HTML pages to scan.
-- `KINGOFSHOJO_RECENT_PAGES`: number of King of Shojo recent pages to poll.
+- `SOURCE_FRONTIER_SENTINELS`, `SOURCE_FRONTIER_REQUIRED_HITS`: adaptive source-paging stop
+  controls.
+- `ASURA_RECENT_PAGES`, `MANGAFIRE_RECENT_PAGES`, `KINGOFSHOJO_RECENT_PAGES`: hard source-paging
+  caps.
+- `VISUAL_MATCH_*`: manual visual fingerprint and visual match thresholds.
 - `DOWNLOAD_CONCURRENCY`: total running download job cap.
 - `DOWNLOAD_PER_SERIES_CONCURRENCY`: running download cap for one canonical series.
 - `ASURA_DOWNLOAD_CONCURRENCY`, `MANGAFIRE_DOWNLOAD_CONCURRENCY`,
@@ -264,7 +280,7 @@ Focused imports:
 1. Gets only the requested enabled source adapter.
 2. Loads or creates `SourceHealth`.
 3. Skips disabled sources before constructing an adapter.
-4. Fetches recent source items.
+4. Fetches recent source items with adaptive frontier scanning when the adapter supports it.
 5. For each item, merges series metadata, caches cover image, fetches chapters, and upserts releases.
 6. Handles item-level failures without aborting the whole source poll.
 7. Records partial item failures as warning health/activity instead of clean success.
@@ -330,10 +346,21 @@ Kavita behavior:
 
 MangaFire behavior:
 
-- Default discovery uses paginated `/updated` HTML parsing controlled by `MANGAFIRE_RECENT_PAGES`.
+- Default discovery uses current latest/new card HTML parsing with `/manga/<slug>.<id>` and legacy
+  `/title/...` link support, controlled by adaptive frontier settings and `MANGAFIRE_RECENT_PAGES`.
 - Per-title detail API calls are not made during discovery; enrichment/rescan handles details later.
 - Updated-list chapter rows are kept as a fallback when chapter APIs are throttled or incomplete.
 - `hot` remains opt-in through `MANGAFIRE_DISCOVERY_MODE=hot` for legacy API parsing/tests.
+
+Visual matching:
+
+- `Build visual fingerprints` reads active local CBZ downloads and stores perceptual hashes for
+  multiple overlapping page segments.
+- It skips configured first/last pages, extreme aspect ratios, and low-detail images to reduce
+  translator/intro/credit noise.
+- `Rebuild visual matches` compares cached fingerprints and creates pending `MatchCandidate` rows
+  with reason `visual chapter match` only when multiple non-adjacent segment hits are found.
+- Visual matches never auto-merge; they are manual review signals.
 
 ## Kavita Integration
 
@@ -403,7 +430,8 @@ active. Cached cover bytes are validated as real images before the cover path is
 - Streams image downloads and enforces `MAX_PAGE_BYTES`.
 - Cover image downloads are streamed and enforce `MAX_COVER_BYTES`.
 - Rejects non-image content for page downloads.
-- Retries partial/incomplete page body failures once before surfacing a temporary download error.
+- Retries partial/incomplete page body failures up to three times before surfacing a temporary
+  download error.
 - Applies source-wide page semaphores so job concurrency multiplied by page concurrency does not
   create unbounded CDN requests.
 - Exposes `aclose()`; service code closes adapter clients after poll/download use.
@@ -507,6 +535,12 @@ The latest robustness pass implemented:
 - Existing source-series match candidate regeneration during repair.
 - Per-series download concurrency caps and running job heartbeat updates.
 - Manual stale download job recovery from Info.
+- Adaptive source frontier scanning across Asura, MangaFire, and KingOfShojo.
+- MangaFire current `/manga/<slug>.<id>` discovery parsing.
+- KingOfShojo placeholder/logo cover rejection and source cover fallback repair.
+- Asura polluted alias/helper chapter cleanup during repair.
+- Manual text match rebuild, visual fingerprint build, and visual match rebuild actions.
+- New Chapters thumbnails.
 
 ## Test Coverage
 

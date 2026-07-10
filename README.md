@@ -64,6 +64,43 @@ startup, or job inspection fails.
 For backups, keep both the Postgres volume and the `storage/` directory together. The database stores
 metadata and file paths, while `storage/` contains covers, CBZ files, and replacement archives.
 
+### PostgreSQL v2 staging
+
+The v2 profile separates migration, web, worker, and PostgreSQL processes with Pi-oriented memory
+limits. It publishes the v2 web application on port 8001:
+
+```bash
+docker compose --profile v2 up --build
+```
+
+On a host without Compose, the direct-Docker rehearsal builds, migrates, starts web/worker/database,
+and runs the staged health checks:
+
+```bash
+scripts/stage-local.sh
+scripts/stage-local.sh down
+scripts/stage-local.sh down --volumes  # also delete the staging database
+```
+
+Set `STAGE_PLATFORM=linux/arm64` when ARM64 binfmt/QEMU support is installed. This rehearsal does not
+change Raspberry Pi or Traefik state.
+
+### Legacy audit and repair
+
+Audit and the default repair mode are read-only. `--apply` creates a consistent SQLite backup before
+applying deterministic normalizations; evidence-dependent splits and quarantines remain reported.
+
+```bash
+uv run manga-manager audit-legacy manga_manager.db --storage-root storage --report reports/audit.json
+uv run manga-manager repair-legacy manga_manager.db --storage-root storage --report reports/dry-run.md
+uv run manga-manager repair-legacy manga_manager.db --storage-root storage \
+  --backup-dir backups --report reports/applied.json --apply
+```
+
+Reports contain stable action keys, row evidence, before/after values, rollback instructions, and a
+SHA-256 storage manifest. A second applied run has no repeatable changes. V2 operational checks are
+available through `migrate`, `doctor`, and `stage-check`.
+
 Backup checklist:
 
 1. Stop Manga Manager or pause scheduled work from your orchestrator.
@@ -150,6 +187,11 @@ covers, regenerates pending cross-source match candidates, and recovers stale do
 after parser or matcher fixes, or after importing data created by an older version. It does not flush
 or rebuild the database.
 
+`Rebuild matches` regenerates text, alias, and description-based candidates without doing a metadata
+rescan. `Build visual fingerprints` extracts conservative perceptual hashes from locally downloaded
+CBZ pages, and `Rebuild visual matches` uses those cached fingerprints to add pending candidates with
+reason `visual chapter match`. Visual matches are never auto-merged.
+
 `Recover stale jobs` requeues old `running` download jobs whose heartbeat is older than
 `DOWNLOAD_STALE_MINUTES`. Use it when a worker was interrupted and jobs remain stuck as running.
 Interrupted source pulls are handled automatically on application startup: any `queued` or `running`
@@ -209,11 +251,17 @@ catch titles with different translations.
 Manual source refresh actions are labeled `Pull`. Pulls run in the background and the top bar shows
 pull progress. Discovery is paginated with a `Load more` control using `DISCOVERY_PAGE_SIZE`.
 
+Source discovery uses adaptive frontier scanning. Before each poll, Manga Manager takes the newest
+known source rows as sentinels and keeps paging until enough sentinels are seen with no newer
+chapter, or the source hard cap is reached. Configure this with `SOURCE_FRONTIER_SENTINELS`,
+`SOURCE_FRONTIER_REQUIRED_HITS`, `ASURA_RECENT_PAGES`, `MANGAFIRE_RECENT_PAGES`, and
+`KINGOFSHOJO_RECENT_PAGES`. Empty sources scan a small initial frontier.
+
 MangaFire defaults to the latest/new updates feed via `MANGAFIRE_DISCOVERY_MODE=new`. Discovery uses
-paginated `/updated` HTML parsing controlled by `MANGAFIRE_RECENT_PAGES`; detail and chapter API
-calls happen later during enrichment/rescan so item-level MangaFire throttling does not hide the
-whole updated list. Set `MANGAFIRE_DISCOVERY_MODE=hot` only if you explicitly want MangaFire's hot
-feed for the legacy API parser/tests.
+the current homepage/latest-update cards and supports `/manga/<slug>.<id>` links as well as legacy
+`/title/...` links; detail and chapter API calls happen later during enrichment/rescan so item-level
+MangaFire throttling does not hide the whole updated list. Set `MANGAFIRE_DISCOVERY_MODE=hot` only if
+you explicitly want MangaFire's hot feed for the legacy API parser/tests.
 
 MangaFire is treated as English-only. MangaFire series with no English chapters are skipped during
 Discovery so they do not appear as broken cards.
@@ -243,6 +291,11 @@ source download cooldown so other ready providers can use workers while the sour
 reader extraction supports both `asura-images/chapters/` and older
 `asura-images/chapters-stitched/` page URLs.
 
+Individual incomplete page bodies are retried up to three times before the chapter job is delayed.
+Running jobs older than `DOWNLOAD_STALE_MINUTES`, or running jobs already carrying temporary
+partial-body/network error text, are recovered by startup, Info `Recover stale jobs`, queueing, and
+repair.
+
 ## Local Testing
 
 Start with the automated checks:
@@ -268,6 +321,8 @@ Expected no-Kavita behavior:
 - Library shows Today and Operations panels.
 - Library shows Kavita as not configured.
 - `Run Kavita sync` and `Run Kavita drain` do not crash; queued sync jobs remain available for later.
+- Discovery, Matches, Info pagination, source pulls, local downloads, repair, match rebuild, and
+  stale recovery all work without Kavita.
 - Source pull controls render. Only pull/download content you have the right to archive.
 
 To test the Kavita integration end to end, run Kavita separately and mount this repo's

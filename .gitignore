@@ -7,5 +7,12 @@ __pycache__/
 *.db
 *.db-shm
 *.db-wal
+*.db.bak-*
+*.pre-repair-*
+*-report.json
+*-report.md
 storage/
+storage-v2/
+storage-v2-stage/
 pictures/
+backups/

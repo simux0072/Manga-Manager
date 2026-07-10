@@ -10,7 +10,9 @@ COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev --no-install-project
 
 COPY app ./app
+COPY manga_manager ./manga_manager
 COPY alembic.ini ./
+COPY alembic.v2.ini ./
 COPY alembic ./alembic
 RUN uv sync --frozen --no-dev
 
