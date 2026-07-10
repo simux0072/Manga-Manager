@@ -1426,6 +1426,63 @@ async def test_lifespan_reports_scheduler_creation_failure(monkeypatch):
     assert recovered == ["download", "kavita"]
 
 
+async def test_lifespan_restarts_interrupted_source_pulls(monkeypatch):
+    class FakeScheduler:
+        running = False
+
+        def start(self):
+            self.running = True
+
+        def shutdown(self, wait=False):
+            self.running = False
+
+    engine = create_engine("sqlite:///:memory:", connect_args={"check_same_thread": False})
+    Base.metadata.create_all(engine)
+    Session = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
+    session = Session()
+    job = SourcePullJob(
+        source="mangafire",
+        status="running",
+        total_items=12,
+        processed_items=4,
+        error="interrupted",
+        completed_at=datetime.now(timezone.utc),
+    )
+    session.add(job)
+    session.commit()
+    job_id = job.id
+
+    @contextmanager
+    def fake_session():
+        yield session
+
+    scheduled = []
+
+    async def fake_run_pull_jobs_limited(job_ids):
+        scheduled.append(job_ids)
+
+    monkeypatch.setattr(main, "init_db", lambda: None)
+    monkeypatch.setattr(main, "recover_stale_download_jobs", lambda session: None)
+    monkeypatch.setattr(main, "recover_stale_kavita_sync_jobs", lambda session: None)
+    monkeypatch.setattr(main, "SessionLocal", fake_session)
+    monkeypatch.setattr(main, "create_scheduler", FakeScheduler)
+    monkeypatch.setattr(main, "run_pull_jobs_limited", fake_run_pull_jobs_limited)
+    try:
+        async with main.lifespan(main.app):
+            await asyncio.sleep(0)
+    finally:
+        session.close()
+
+    assert scheduled == [[job_id]]
+    with Session() as verify_session:
+        restarted = verify_session.get(SourcePullJob, job_id)
+        assert restarted.status == "queued"
+        assert restarted.total_items == 0
+        assert restarted.processed_items == 0
+        assert restarted.error == ""
+        assert restarted.completed_at is None
+
+
 async def test_scheduler_uses_non_overlapping_coalesced_jobs(monkeypatch):
     monkeypatch.setattr(scheduler_module, "enabled_source_names", lambda: [])
 
@@ -1455,11 +1512,58 @@ async def test_scheduler_source_poll_uses_pull_job(monkeypatch):
         calls.append(("create", source))
         return Job(), True
 
+    def fake_recover_stale_pull_jobs(active_session):
+        assert active_session is session
+        calls.append(("recover",))
+        return 0
+
     async def fake_run_pull_job(job_id):
         calls.append(("run", job_id))
 
     monkeypatch.setattr(scheduler_module, "enabled_source_names", lambda: ["mangafire"])
     monkeypatch.setattr(scheduler_module, "SessionLocal", FakeSessionLocal)
+    monkeypatch.setattr(scheduler_module, "create_pull_job", fake_create_pull_job)
+    monkeypatch.setattr(scheduler_module, "recover_stale_pull_jobs", fake_recover_stale_pull_jobs)
+    monkeypatch.setattr(scheduler_module, "run_pull_job", fake_run_pull_job)
+
+    scheduler = scheduler_module.create_scheduler()
+    poll_job = next(job for job in scheduler.get_jobs() if job.args == ("mangafire",))
+
+    await poll_job.func(*poll_job.args)
+
+    assert calls == [("recover",), ("create", "mangafire"), ("run", 42)]
+
+
+async def test_scheduler_source_poll_skips_fresh_active_pull(monkeypatch):
+    calls = []
+    session = object()
+
+    class Job:
+        id = 42
+
+    class FakeSessionLocal:
+        def __enter__(self):
+            return session
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+    def fake_recover_stale_pull_jobs(active_session):
+        assert active_session is session
+        calls.append(("recover",))
+        return 0
+
+    def fake_create_pull_job(active_session, source):
+        assert active_session is session
+        calls.append(("create", source))
+        return Job(), False
+
+    async def fake_run_pull_job(job_id):
+        calls.append(("run", job_id))
+
+    monkeypatch.setattr(scheduler_module, "enabled_source_names", lambda: ["mangafire"])
+    monkeypatch.setattr(scheduler_module, "SessionLocal", FakeSessionLocal)
+    monkeypatch.setattr(scheduler_module, "recover_stale_pull_jobs", fake_recover_stale_pull_jobs)
     monkeypatch.setattr(scheduler_module, "create_pull_job", fake_create_pull_job)
     monkeypatch.setattr(scheduler_module, "run_pull_job", fake_run_pull_job)
 
@@ -1468,7 +1572,7 @@ async def test_scheduler_source_poll_uses_pull_job(monkeypatch):
 
     await poll_job.func(*poll_job.args)
 
-    assert calls == [("create", "mangafire"), ("run", 42)]
+    assert calls == [("recover",), ("create", "mangafire")]
 
 
 async def test_scheduler_kavita_drain_queues_pending_before_running(monkeypatch):

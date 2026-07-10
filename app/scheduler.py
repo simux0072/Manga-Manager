@@ -11,6 +11,7 @@ from app.services import (
     create_pull_job,
     queue_pending_kavita_syncs,
     drain_download_queue,
+    recover_stale_pull_jobs,
     run_next_kavita_sync,
     run_pull_job,
 )
@@ -31,6 +32,7 @@ def create_scheduler() -> AsyncIOScheduler:
     async def poll(source: str) -> None:
         try:
             with SessionLocal() as session:
+                recover_stale_pull_jobs(session)
                 job, created = create_pull_job(session, source)
             if created:
                 await run_pull_job(job.id)

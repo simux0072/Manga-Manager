@@ -1,6 +1,6 @@
 # Manga Manager Project Context
 
-Last updated: 2026-07-09
+Last updated: 2026-07-10
 
 ## Purpose
 
@@ -75,9 +75,11 @@ On startup, `app.main.lifespan`:
 
 1. Runs `init_db()`.
 2. Recovers stale `running` download and Kavita sync jobs.
-3. Attempts to create the scheduler and records any creation failure.
-4. Schedules scheduler startup on the current event loop when creation succeeds.
-5. Shuts the scheduler down on app shutdown.
+3. Resets interrupted `queued` or `running` source pull jobs and schedules them to restart from the
+   beginning.
+4. Attempts to create the scheduler and records any creation failure.
+5. Schedules scheduler startup on the current event loop when creation succeeds.
+6. Shuts the scheduler down on app shutdown.
 
 `init_db()` runs Alembic migrations for normal database URLs. In-memory SQLite is special-cased for
 tests and uses `Base.metadata.create_all()`.
@@ -85,6 +87,8 @@ tests and uses `Base.metadata.create_all()`.
 The scheduler:
 
 - Polls Asura, MangaFire, and King of Shojo at configurable intervals when enabled.
+- Recovers stale active source pull rows before creating scheduled pull jobs, so old in-process rows
+  cannot make scheduled polling skip forever.
 - Calls `queue_downloads()` after each scheduled source poll.
 - Periodically drains queued downloads by repeatedly calling `run_next_download()`.
 - Periodically discovers pending Kavita sync work for tracked downloaded/unmapped series, then drains
@@ -97,6 +101,8 @@ The scheduler:
 - `Chapter`: canonical chapter row for a series and normalized chapter number.
 - `ChapterRelease`: one source-specific release for a chapter.
 - `DownloadJob`: one job per chapter release; `chapter_release_id` is unique.
+- `SourcePullJob`: one source scan job. `queued` and `running` are active statuses and are unique per
+  source.
 - `DownloadedFile`: historical file metadata for downloaded CBZs.
 - `SourceHealth`: per-source enabled state, last poll time, last error, and failure count.
   Download cooldown fields track source/CDN rate limits separately from poll health.

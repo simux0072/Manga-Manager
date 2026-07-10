@@ -782,6 +782,25 @@ async def run_pull_jobs_limited(job_ids: list[int]) -> None:
     await asyncio.gather(*(worker(job_id) for job_id in job_ids))
 
 
+def restart_interrupted_pull_jobs(session: Session) -> list[int]:
+    job_ids: list[int] = []
+    now = utcnow()
+    for job in session.scalars(
+        select(SourcePullJob)
+        .where(SourcePullJob.status.in_(["queued", "running"]))
+        .order_by(SourcePullJob.created_at.asc(), SourcePullJob.id.asc())
+    ):
+        job.status = "queued"
+        job.error = ""
+        job.completed_at = None
+        job.processed_items = 0
+        job.total_items = 0
+        job.updated_at = now
+        job_ids.append(job.id)
+    commit_with_retry(session)
+    return job_ids
+
+
 def recover_stale_pull_jobs(session: Session) -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(minutes=settings.download_stale_minutes)
     recovered = 0

@@ -333,6 +333,62 @@ async def test_run_pull_jobs_limited_respects_source_pull_concurrency(monkeypatc
     assert max_running == 1
 
 
+def test_restart_interrupted_pull_jobs_resets_active_jobs_only():
+    session = make_session()
+    completed_at = datetime.now(timezone.utc) - timedelta(minutes=5)
+    queued = SourcePullJob(
+        source="mangafire",
+        status="queued",
+        total_items=10,
+        processed_items=3,
+        error="old error",
+        completed_at=completed_at,
+    )
+    running = SourcePullJob(
+        source="asura",
+        status="running",
+        total_items=20,
+        processed_items=7,
+        error="interrupted",
+        completed_at=completed_at,
+    )
+    complete = SourcePullJob(
+        source="kingofshojo",
+        status="complete",
+        total_items=5,
+        processed_items=5,
+        completed_at=completed_at,
+    )
+    failed = SourcePullJob(
+        source="mangafire",
+        status="failed",
+        total_items=6,
+        processed_items=2,
+        error="failed",
+        completed_at=completed_at,
+    )
+    session.add_all([queued, running, complete, failed])
+    session.commit()
+
+    job_ids = services.restart_interrupted_pull_jobs(session)
+
+    assert job_ids == [queued.id, running.id]
+    assert queued.status == "queued"
+    assert queued.error == ""
+    assert queued.completed_at is None
+    assert queued.processed_items == 0
+    assert queued.total_items == 0
+    assert running.status == "queued"
+    assert running.error == ""
+    assert running.completed_at is None
+    assert running.processed_items == 0
+    assert running.total_items == 0
+    assert complete.status == "complete"
+    assert complete.processed_items == 5
+    assert failed.status == "failed"
+    assert failed.error == "failed"
+
+
 def test_recover_stale_pull_jobs_marks_old_active_jobs_failed(monkeypatch):
     session = make_session()
     monkeypatch.setattr(services.settings, "download_stale_minutes", 60)

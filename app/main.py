@@ -71,7 +71,7 @@ from app.services import (
     queue_pending_kavita_syncs,
     recover_stale_download_jobs,
     recover_stale_kavita_sync_jobs,
-    recover_stale_pull_jobs,
+    restart_interrupted_pull_jobs,
     refresh_missing_covers,
     repair_known_series,
     rescan_source_series,
@@ -122,11 +122,12 @@ async def lifespan(app: FastAPI):
     logger.info("starting database migrations")
     init_db()
     logger.info("database migrations complete")
+    interrupted_pull_job_ids: list[int] = []
     with SessionLocal() as session:
         recover_stale_download_jobs(session)
         recover_stale_kavita_sync_jobs(session)
         if hasattr(session, "scalars"):
-            recover_stale_pull_jobs(session)
+            interrupted_pull_job_ids = restart_interrupted_pull_jobs(session)
             cleanup_bad_discovery_rows(session)
     logger.info("stale job recovery complete")
     scheduler = None
@@ -155,6 +156,11 @@ async def lifespan(app: FastAPI):
         app.state.scheduler_start_scheduled = True
         asyncio.get_running_loop().call_soon(start_scheduler)
         logger.info("scheduler start scheduled")
+    if interrupted_pull_job_ids:
+        log_background_task(
+            run_pull_jobs_limited(interrupted_pull_job_ids),
+            f"restart interrupted source pulls job_ids={interrupted_pull_job_ids}",
+        )
     yield
     if scheduler is not None and scheduler.running:
         scheduler.shutdown(wait=False)

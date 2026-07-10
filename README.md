@@ -152,6 +152,10 @@ or rebuild the database.
 
 `Recover stale jobs` requeues old `running` download jobs whose heartbeat is older than
 `DOWNLOAD_STALE_MINUTES`. Use it when a worker was interrupted and jobs remain stuck as running.
+Interrupted source pulls are handled automatically on application startup: any `queued` or `running`
+source pull job left behind by a restart is reset to the beginning and scheduled again. Scheduled
+source polls still recover truly stale active pull rows before deciding whether to skip a duplicate
+poll.
 
 The job drawer is intentionally compact and only shows recent grouped work. The Info page is the
 authoritative operations view: it shows true queued/running/delayed/failed/completed counts and a
