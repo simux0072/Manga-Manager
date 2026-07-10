@@ -1,0 +1,278 @@
+from __future__ import annotations
+
+from collections.abc import Iterable
+from datetime import datetime, timezone
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.domain import ChapterItem, SeriesItem
+from manga_manager.domain.catalog import (
+    canonical_chapter_number,
+    chapter_sort_number,
+    normalize_title,
+)
+from manga_manager.infrastructure.db_models import (
+    CatalogChapter,
+    CatalogChapterRelease,
+    CatalogExternalIdentifier,
+    CatalogSeries,
+    CatalogSeriesAlias,
+    CatalogSourceSeries,
+    CatalogSourceState,
+)
+
+
+def utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+class CatalogRepository:
+    def source_frontier(self, session: Session, source: str) -> list[dict[str, str]]:
+        state = session.get(CatalogSourceState, source)
+        return list(state.frontier_json) if state is not None else []
+
+    def ingest(
+        self,
+        session: Session,
+        item: SeriesItem,
+        chapters: Iterable[ChapterItem],
+    ) -> CatalogSourceSeries:
+        source_series = session.scalar(
+            select(CatalogSourceSeries).where(
+                CatalogSourceSeries.source == item.source,
+                CatalogSourceSeries.source_id == item.source_id,
+            )
+        )
+        if source_series is None:
+            series = self._matching_series(session, item) or CatalogSeries(
+                title=item.title,
+                normalized_title=normalize_title(item.title),
+                description=item.description,
+                cover_url=item.cover_url,
+                metadata_json={},
+            )
+            session.add(series)
+            session.flush()
+            source_series = CatalogSourceSeries(
+                series_id=series.id,
+                source=item.source,
+                source_id=item.source_id,
+                title=item.title,
+                normalized_title=normalize_title(item.title),
+                url=item.url,
+            )
+            session.add(source_series)
+            session.flush()
+        else:
+            series = session.get(CatalogSeries, source_series.series_id)
+            if series is None:
+                raise RuntimeError(f"canonical series {source_series.series_id} is missing")
+
+        now = utcnow()
+        source_series.title = item.title
+        source_series.normalized_title = normalize_title(item.title)
+        source_series.url = item.url
+        source_series.description = item.description
+        source_series.cover_url = item.cover_url
+        source_series.popularity = item.popularity
+        source_series.metadata_json = dict(item.metadata)
+        source_series.last_checked_at = now
+        source_series.detail_fetched_at = now
+        if not series.description and item.description:
+            series.description = item.description
+        if not series.cover_url and item.cover_url:
+            series.cover_url = item.cover_url
+        series.updated_at = now
+
+        self._sync_aliases(session, series.id, source_series.id, item.aliases)
+        self._sync_external_ids(
+            session,
+            series.id,
+            source_series.id,
+            item.external_ids,
+        )
+        for chapter_item in chapters:
+            self._upsert_chapter(session, series.id, source_series.id, chapter_item)
+        session.flush()
+        return source_series
+
+    def record_poll_success(
+        self,
+        session: Session,
+        *,
+        source: str,
+        frontier: list[dict[str, str]],
+        partial_failures: int = 0,
+    ) -> None:
+        state = self._source_state(session, source)
+        state.health_status = "degraded" if partial_failures else "healthy"
+        state.consecutive_failures = 0
+        state.last_error = f"{partial_failures} item failures" if partial_failures else ""
+        state.frontier_json = list(frontier)
+        state.cooldown_until = None
+        state.last_poll_at = utcnow()
+        state.updated_at = utcnow()
+        session.flush()
+
+    def record_poll_failure(
+        self,
+        session: Session,
+        *,
+        source: str,
+        error: str,
+        cooldown_until: datetime | None = None,
+    ) -> None:
+        state = self._source_state(session, source)
+        state.health_status = "cooldown" if cooldown_until else "degraded"
+        state.consecutive_failures += 1
+        state.last_error = error[:4000]
+        state.cooldown_until = cooldown_until
+        state.last_poll_at = utcnow()
+        state.updated_at = utcnow()
+        session.flush()
+
+    def _matching_series(self, session: Session, item: SeriesItem) -> CatalogSeries | None:
+        for provider, value in item.external_ids.items():
+            identifier = session.scalar(
+                select(CatalogExternalIdentifier).where(
+                    CatalogExternalIdentifier.provider == provider,
+                    CatalogExternalIdentifier.value == value,
+                )
+            )
+            if identifier is not None:
+                return session.get(CatalogSeries, identifier.series_id)
+
+        normalized = normalize_title(item.title)
+        candidates = session.scalars(
+            select(CatalogSeries).where(CatalogSeries.normalized_title == normalized)
+        ).all()
+        eligible = []
+        for candidate in candidates:
+            already_has_source = session.scalar(
+                select(CatalogSourceSeries.id)
+                .where(CatalogSourceSeries.series_id == candidate.id)
+                .where(CatalogSourceSeries.source == item.source)
+                .limit(1)
+            )
+            if already_has_source is None:
+                eligible.append(candidate)
+        return eligible[0] if len(eligible) == 1 else None
+
+    def _sync_aliases(
+        self,
+        session: Session,
+        series_id: int,
+        source_series_id: int,
+        aliases: Iterable[str],
+    ) -> None:
+        for display_value in aliases:
+            normalized = normalize_title(display_value)
+            if not normalized:
+                continue
+            existing = session.scalar(
+                select(CatalogSeriesAlias).where(
+                    CatalogSeriesAlias.series_id == series_id,
+                    CatalogSeriesAlias.normalized_value == normalized,
+                )
+            )
+            if existing is None:
+                session.add(
+                    CatalogSeriesAlias(
+                        series_id=series_id,
+                        source_series_id=source_series_id,
+                        display_value=display_value,
+                        normalized_value=normalized,
+                    )
+                )
+
+    def _sync_external_ids(
+        self,
+        session: Session,
+        series_id: int,
+        source_series_id: int,
+        external_ids: dict[str, str],
+    ) -> None:
+        for provider, value in external_ids.items():
+            if not provider or not value:
+                continue
+            source_identifier = session.scalar(
+                select(CatalogExternalIdentifier).where(
+                    CatalogExternalIdentifier.source_series_id == source_series_id,
+                    CatalogExternalIdentifier.provider == provider,
+                )
+            )
+            existing = session.scalar(
+                select(CatalogExternalIdentifier).where(
+                    CatalogExternalIdentifier.provider == provider,
+                    CatalogExternalIdentifier.value == value,
+                )
+            )
+            if source_identifier is not None:
+                if existing is None or existing.id == source_identifier.id:
+                    source_identifier.value = value
+                continue
+            if existing is None:
+                session.add(
+                    CatalogExternalIdentifier(
+                        series_id=series_id,
+                        source_series_id=source_series_id,
+                        provider=provider,
+                        value=value,
+                    )
+                )
+
+    def _upsert_chapter(
+        self,
+        session: Session,
+        series_id: int,
+        source_series_id: int,
+        item: ChapterItem,
+    ) -> None:
+        canonical = canonical_chapter_number(item.number)
+        chapter = session.scalar(
+            select(CatalogChapter).where(
+                CatalogChapter.series_id == series_id,
+                CatalogChapter.canonical_number == canonical,
+            )
+        )
+        if chapter is None:
+            chapter = CatalogChapter(
+                series_id=series_id,
+                canonical_number=canonical,
+                display_number=item.number,
+                sort_number=chapter_sort_number(item.number),
+                title=item.title,
+            )
+            session.add(chapter)
+            session.flush()
+        elif not chapter.title and item.title:
+            chapter.title = item.title
+            chapter.updated_at = utcnow()
+
+        release = session.scalar(
+            select(CatalogChapterRelease).where(
+                CatalogChapterRelease.source_series_id == source_series_id,
+                CatalogChapterRelease.source_release_id == canonical,
+            )
+        )
+        if release is None:
+            release = CatalogChapterRelease(
+                chapter_id=chapter.id,
+                source_series_id=source_series_id,
+                source=item.source,
+                source_release_id=canonical,
+                title=item.title,
+                url=item.url,
+            )
+            session.add(release)
+        release.title = item.title
+        release.url = item.url
+        release.published_at = item.published_at
+
+    def _source_state(self, session: Session, source: str) -> CatalogSourceState:
+        state = session.get(CatalogSourceState, source)
+        if state is None:
+            state = CatalogSourceState(source=source)
+            session.add(state)
+        return state

@@ -1,0 +1,5 @@
+This migration tree belongs to the reliability-focused PostgreSQL schema.
+
+It is intentionally separate from the legacy ``app`` migration history so the
+new database can be built and rehearsed while the current service remains live.
+
