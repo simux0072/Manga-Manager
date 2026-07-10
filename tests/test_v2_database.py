@@ -39,6 +39,9 @@ def test_v2_migration_builds_job_constraints_and_indexes(tmp_path: Path) -> None
         "artifact_blob",
         "chapter_artifact",
         "library_projection",
+        "job_permit",
+        "match_decision_v2",
+        "catalog_observation_v2",
     } == set(inspector.get_table_names())
     indexes = {index["name"] for index in inspector.get_indexes("job")}
     assert {
@@ -47,6 +50,9 @@ def test_v2_migration_builds_job_constraints_and_indexes(tmp_path: Path) -> None
         "ix_job_lease_expiry",
         "ix_job_status",
         "uq_job_active_dedupe",
+        "ix_job_pool_claim",
+        "ix_job_source_status",
+        "uq_job_leased_chapter_series",
     } <= indexes
     checks = {constraint["name"] for constraint in inspector.get_check_constraints("job")}
     assert {
@@ -59,4 +65,4 @@ def test_v2_migration_builds_job_constraints_and_indexes(tmp_path: Path) -> None
     sessions = create_session_factory(engine)
     with sessions() as session:
         version = session.scalar(text("SELECT version_num FROM alembic_version"))
-    assert version == "0005_kavita_mapping"
+    assert version == "0007_catalog_integrity_search"

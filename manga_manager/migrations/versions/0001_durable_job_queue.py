@@ -83,4 +83,3 @@ def downgrade() -> None:
     op.drop_index("ix_job_status", table_name="job")
     op.drop_index("ix_job_kind", table_name="job")
     op.drop_table("job")
-

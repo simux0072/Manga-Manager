@@ -269,6 +269,18 @@ class CatalogRepository:
         release.title = item.title
         release.url = item.url
         release.published_at = item.published_at
+        series = session.get(CatalogSeries, series_id)
+        release_time = item.published_at or utcnow()
+        current_latest = series.latest_release_at if series is not None else None
+        if current_latest is not None and current_latest.tzinfo is None:
+            current_latest = current_latest.replace(tzinfo=timezone.utc)
+        if release_time.tzinfo is None:
+            release_time = release_time.replace(tzinfo=timezone.utc)
+        if series is not None and (current_latest is None or release_time >= current_latest):
+            series.latest_release_at = release_time
+            series.latest_release_number = item.number
+            series.latest_release_source = item.source
+            series.integrity_state = "healthy"
 
     def _source_state(self, session: Session, source: str) -> CatalogSourceState:
         state = session.get(CatalogSourceState, source)

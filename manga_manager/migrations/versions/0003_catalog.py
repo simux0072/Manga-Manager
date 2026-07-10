@@ -67,7 +67,9 @@ def upgrade() -> None:
     )
     op.create_index("ix_source_series_v2_series_id", "source_series_v2", ["series_id"])
     op.create_index("ix_source_series_v2_source", "source_series_v2", ["source"])
-    op.create_index("ix_source_series_v2_normalized_title", "source_series_v2", ["normalized_title"])
+    op.create_index(
+        "ix_source_series_v2_normalized_title", "source_series_v2", ["normalized_title"]
+    )
     op.create_index(
         "ix_source_series_v2_source_checked",
         "source_series_v2",
@@ -82,9 +84,7 @@ def upgrade() -> None:
         sa.Column("display_value", sa.String(length=500), nullable=False),
         sa.Column("normalized_value", sa.String(length=500), nullable=False),
         sa.ForeignKeyConstraint(["series_id"], ["series_v2.id"], ondelete="CASCADE"),
-        sa.ForeignKeyConstraint(
-            ["source_series_id"], ["source_series_v2.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["source_series_id"], ["source_series_v2.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("series_id", "normalized_value", name="uq_series_alias_v2_value"),
     )
@@ -100,9 +100,7 @@ def upgrade() -> None:
         sa.Column("provider", sa.String(length=50), nullable=False),
         sa.Column("value", sa.String(length=200), nullable=False),
         sa.ForeignKeyConstraint(["series_id"], ["series_v2.id"], ondelete="CASCADE"),
-        sa.ForeignKeyConstraint(
-            ["source_series_id"], ["source_series_v2.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["source_series_id"], ["source_series_v2.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("provider", "value", name="uq_external_identifier_v2_provider_value"),
         sa.UniqueConstraint(
@@ -146,9 +144,7 @@ def upgrade() -> None:
         sa.Column("first_seen_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("downloadable_after", sa.DateTime(timezone=True), nullable=True),
         sa.ForeignKeyConstraint(["chapter_id"], ["chapter_v2.id"], ondelete="CASCADE"),
-        sa.ForeignKeyConstraint(
-            ["source_series_id"], ["source_series_v2.id"], ondelete="CASCADE"
-        ),
+        sa.ForeignKeyConstraint(["source_series_id"], ["source_series_v2.id"], ondelete="CASCADE"),
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint(
             "source_series_id", "source_release_id", name="uq_chapter_release_v2_identity"

@@ -95,3 +95,6 @@ class JobLease:
     max_attempts: int
     owner: str
     expires_at: datetime
+    source: str = ""
+    series_key: str = ""
+    pool: str = "maintenance"

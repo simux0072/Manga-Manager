@@ -28,6 +28,10 @@ from manga_manager.infrastructure.database import (
     run_migrations,
 )
 from manga_manager.infrastructure.job_queue import JobQueue
+from manga_manager.infrastructure.db_models import (
+    CatalogChapter,
+    CatalogChapterRelease,
+)
 from manga_manager.infrastructure.storage import ContentAddressedStorage
 from manga_manager.settings import V2Settings
 from manga_manager.worker.service import WorkerService
@@ -169,12 +173,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             parser.error("chapter_release_id must be positive")
         sessions = create_session_factory(engine)
         with sessions() as session, session.begin():
+            release = session.get(CatalogChapterRelease, args.chapter_release_id)
+            if release is None:
+                parser.error("chapter_release_id does not exist")
+            chapter = session.get(CatalogChapter, release.chapter_id)
+            if chapter is None:
+                parser.error("chapter release has no canonical chapter")
             job, created = JobQueue().enqueue(
                 session,
                 kind=JobKind.CHAPTER_DOWNLOAD,
                 dedupe_key=f"release:{args.chapter_release_id}",
                 payload=ChapterDownloadPayload(chapter_release_id=args.chapter_release_id),
                 priority=10,
+                source=release.source,
+                series_key=str(chapter.series_id),
             )
         print(f"job_id={job.id} created={str(created).lower()}")
         return 0

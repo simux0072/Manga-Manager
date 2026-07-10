@@ -135,7 +135,10 @@ def read_comic_info(path: Path) -> tuple[str, str]:
         if member is None:
             return fallback_metadata(path)
         root = ElementTree.fromstring(archive.read(member))
-    return (root.findtext("Series", default="").strip(), root.findtext("Number", default="").strip())
+    return (
+        root.findtext("Series", default="").strip(),
+        root.findtext("Number", default="").strip(),
+    )
 
 
 def fallback_metadata(path: Path) -> tuple[str, str]:

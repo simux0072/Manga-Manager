@@ -74,4 +74,3 @@ class WorkerRegistry:
                 .order_by(WorkerHeartbeat.worker_id)
             )
         )
-

@@ -16,7 +16,7 @@ from manga_manager.domain.jobs import (
     NotificationPayload,
     SourcePullPayload,
 )
-from manga_manager.infrastructure.db_models import JobBase, JobEvent, WorkJob
+from manga_manager.infrastructure.db_models import JobBase, JobEvent, JobPermit, WorkJob
 from manga_manager.infrastructure.job_queue import JobQueue
 
 
@@ -112,12 +112,15 @@ def test_expired_lease_is_recovered_by_another_worker(session: Session) -> None:
     first = queue.claim(session, owner="worker-a", lease_for=timedelta(seconds=30), now=NOW)
     assert first is not None
 
-    assert queue.claim(
-        session,
-        owner="worker-b",
-        lease_for=timedelta(seconds=30),
-        now=NOW + timedelta(seconds=10),
-    ) is None
+    assert (
+        queue.claim(
+            session,
+            owner="worker-b",
+            lease_for=timedelta(seconds=30),
+            now=NOW + timedelta(seconds=10),
+        )
+        is None
+    )
     recovered = queue.claim(
         session,
         owner="worker-b",
@@ -178,21 +181,27 @@ def test_retry_becomes_terminal_at_max_attempts(session: Session) -> None:
     first = queue.claim(session, owner="worker-a", lease_for=timedelta(minutes=1), now=NOW)
     assert first is not None
     retry_at = NOW + timedelta(minutes=5)
-    assert queue.retry(
-        session,
-        job_id=first.id,
-        owner=first.owner,
-        available_at=retry_at,
-        error_code="timeout",
-        error_message="notification timed out",
-        now=NOW,
-    ) is JobState.RETRY_WAIT
-    assert queue.claim(
-        session,
-        owner="worker-a",
-        lease_for=timedelta(minutes=1),
-        now=retry_at - timedelta(seconds=1),
-    ) is None
+    assert (
+        queue.retry(
+            session,
+            job_id=first.id,
+            owner=first.owner,
+            available_at=retry_at,
+            error_code="timeout",
+            error_message="notification timed out",
+            now=NOW,
+        )
+        is JobState.RETRY_WAIT
+    )
+    assert (
+        queue.claim(
+            session,
+            owner="worker-a",
+            lease_for=timedelta(minutes=1),
+            now=retry_at - timedelta(seconds=1),
+        )
+        is None
+    )
 
     second = queue.claim(
         session,
@@ -202,15 +211,18 @@ def test_retry_becomes_terminal_at_max_attempts(session: Session) -> None:
     )
     assert second is not None
     assert second.attempt == 2
-    assert queue.retry(
-        session,
-        job_id=second.id,
-        owner=second.owner,
-        available_at=retry_at + timedelta(minutes=5),
-        error_code="timeout",
-        error_message="notification timed out again",
-        now=retry_at,
-    ) is JobState.FAILED
+    assert (
+        queue.retry(
+            session,
+            job_id=second.id,
+            owner=second.owner,
+            available_at=retry_at + timedelta(minutes=5),
+            error_code="timeout",
+            error_message="notification timed out again",
+            now=retry_at,
+        )
+        is JobState.FAILED
+    )
 
 
 def test_final_expired_lease_is_failed_instead_of_reclaimed(session: Session) -> None:
@@ -225,12 +237,15 @@ def test_final_expired_lease_is_failed_instead_of_reclaimed(session: Session) ->
     )
     assert queue.claim(session, owner="worker-a", lease_for=timedelta(seconds=10), now=NOW)
 
-    assert queue.claim(
-        session,
-        owner="worker-b",
-        lease_for=timedelta(seconds=10),
-        now=NOW + timedelta(seconds=11),
-    ) is None
+    assert (
+        queue.claim(
+            session,
+            owner="worker-b",
+            lease_for=timedelta(seconds=10),
+            now=NOW + timedelta(seconds=11),
+        )
+        is None
+    )
     session.refresh(job)
     assert job.status == JobState.FAILED.value
     assert job.error_code == "lease_expired"
@@ -338,3 +353,101 @@ def test_claim_can_be_limited_to_registered_kinds(session: Session) -> None:
     )
     assert lease is not None
     assert lease.id == download.id
+
+
+def test_provider_and_global_permits_limit_chapter_claims(session: Session) -> None:
+    queue = JobQueue()
+    for release_id in (1, 2):
+        queue.enqueue(
+            session,
+            kind=JobKind.CHAPTER_DOWNLOAD,
+            dedupe_key=f"release:{release_id}",
+            payload=ChapterDownloadPayload(chapter_release_id=release_id),
+            source="asura",
+            series_key=f"series-{release_id}",
+            available_at=NOW,
+        )
+    limits = {"download:asura": 1, "chapter_global": 4}
+    first = queue.claim(
+        session,
+        owner="worker-a",
+        lease_for=timedelta(minutes=1),
+        now=NOW,
+        pool_limits=limits,
+    )
+    assert first is not None
+    assert first.pool == "download:asura"
+    assert (
+        queue.claim(
+            session,
+            owner="worker-b",
+            lease_for=timedelta(minutes=1),
+            now=NOW,
+            pool_limits=limits,
+        )
+        is None
+    )
+    assert session.scalars(select(JobPermit).where(JobPermit.job_id == first.id)).all()
+    assert queue.succeed(session, job_id=first.id, owner="worker-a", now=NOW)
+    assert (
+        queue.claim(
+            session,
+            owner="worker-b",
+            lease_for=timedelta(minutes=1),
+            now=NOW,
+            pool_limits=limits,
+        )
+        is not None
+    )
+
+
+def test_per_series_exclusion_skips_to_other_series(session: Session) -> None:
+    queue = JobQueue()
+    for release_id, series_key in ((1, "same"), (2, "same"), (3, "other")):
+        queue.enqueue(
+            session,
+            kind=JobKind.CHAPTER_DOWNLOAD,
+            dedupe_key=f"release:{release_id}",
+            payload=ChapterDownloadPayload(chapter_release_id=release_id),
+            source="mangafire",
+            series_key=series_key,
+            available_at=NOW,
+        )
+    limits = {"download:mangafire": 2, "chapter_global": 4}
+    first = queue.claim(
+        session, owner="a", lease_for=timedelta(minutes=1), now=NOW, pool_limits=limits
+    )
+    second = queue.claim(
+        session, owner="b", lease_for=timedelta(minutes=1), now=NOW, pool_limits=limits
+    )
+    assert first is not None and first.series_key == "same"
+    assert second is not None and second.series_key == "other"
+
+
+def test_expired_permits_are_recovered_with_job_lease(session: Session) -> None:
+    queue = JobQueue()
+    queue.enqueue(
+        session,
+        kind=JobKind.CHAPTER_DOWNLOAD,
+        dedupe_key="release:1",
+        payload=ChapterDownloadPayload(chapter_release_id=1),
+        source="kingofshojo",
+        series_key="series-1",
+        available_at=NOW,
+    )
+    limits = {"download:kingofshojo": 1, "chapter_global": 4}
+    first = queue.claim(
+        session, owner="dead", lease_for=timedelta(seconds=10), now=NOW, pool_limits=limits
+    )
+    assert first is not None
+    recovered = queue.claim(
+        session,
+        owner="replacement",
+        lease_for=timedelta(minutes=1),
+        now=NOW + timedelta(seconds=11),
+        pool_limits=limits,
+    )
+    assert recovered is not None
+    assert recovered.id == first.id
+    permits = session.scalars(select(JobPermit).where(JobPermit.job_id == first.id)).all()
+    assert {permit.owner for permit in permits} == {"replacement"}

@@ -139,6 +139,7 @@ class ChapterDownloadHandler:
                     folder_path=str(self.storage.library_root / Path(projection_relative).parent),
                 ),
                 priority=100,
+                series_key=str(snapshot.series_id),
             )
         self.storage.materialize(blob.relative_path, result.projection_relative_path)
 

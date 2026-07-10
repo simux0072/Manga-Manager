@@ -62,10 +62,14 @@ class StorageReconciler:
                 self.storage.materialize(row.blob_path, row.projection_path)
                 repaired += 1
 
-        disk_blobs = {
-            path.relative_to(self.storage.root).as_posix()
-            for path in self.storage.blob_root.rglob("*.cbz")
-        } if self.storage.blob_root.exists() else set()
+        disk_blobs = (
+            {
+                path.relative_to(self.storage.root).as_posix()
+                for path in self.storage.blob_root.rglob("*.cbz")
+            }
+            if self.storage.blob_root.exists()
+            else set()
+        )
         removed = self._remove_stale_staging(current, remove_staging_older_than)
         return ReconciliationReport(
             checked=len(expected),

@@ -79,9 +79,7 @@ class KavitaSyncHandler:
             raise RetryableJobError("kavita_unavailable", str(exc)) from exc
 
         context.ensure_lease()
-        by_number = {
-            canonical_chapter_number(chapter.number): chapter for chapter in chapters
-        }
+        by_number = {canonical_chapter_number(chapter.number): chapter for chapter in chapters}
         with self.session_factory() as session, session.begin():
             series = session.get(CatalogSeries, snapshot.series_id)
             if series is None:
@@ -130,5 +128,7 @@ def match_series(snapshot: KavitaSnapshot, candidates: list[KavitaSeries]) -> Ka
             if candidate.id == snapshot.existing_kavita_id:
                 return candidate
     normalized = normalize_title(snapshot.title)
-    matches = [candidate for candidate in candidates if normalize_title(candidate.name) == normalized]
+    matches = [
+        candidate for candidate in candidates if normalize_title(candidate.name) == normalized
+    ]
     return matches[0] if len(matches) == 1 else None

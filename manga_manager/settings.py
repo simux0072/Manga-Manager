@@ -19,6 +19,10 @@ class V2Settings(BaseSettings):
     database_url: str = ""
     worker_id: str = Field(default_factory=default_worker_id, min_length=1, max_length=180)
     worker_concurrency: int = Field(default=1, ge=1, le=32)
+    global_chapter_concurrency: int = Field(default=4, ge=1, le=32)
+    asura_download_concurrency: int = Field(default=1, ge=1, le=2)
+    mangafire_download_concurrency: int = Field(default=2, ge=1, le=8)
+    kingofshojo_download_concurrency: int = Field(default=2, ge=1, le=8)
     worker_poll_seconds: float = Field(default=1.0, gt=0, le=60)
     worker_lease_seconds: int = Field(default=300, ge=30, le=86_400)
     worker_heartbeat_seconds: int = Field(default=30, ge=5, le=3_600)
@@ -64,3 +68,15 @@ class V2Settings(BaseSettings):
         if self.enable_kingofshojo:
             intervals["kingofshojo"] = timedelta(minutes=self.kingofshojo_poll_minutes)
         return intervals
+
+    def pool_limits(self) -> dict[str, int]:
+        return {
+            "source_pull": 1,
+            "download:asura": self.asura_download_concurrency,
+            "download:mangafire": self.mangafire_download_concurrency,
+            "download:kingofshojo": self.kingofshojo_download_concurrency,
+            "chapter_global": self.global_chapter_concurrency,
+            "kavita": 1,
+            "maintenance": 1,
+            "notification": 1,
+        }

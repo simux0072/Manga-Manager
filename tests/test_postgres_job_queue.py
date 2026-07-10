@@ -11,7 +11,7 @@ from alembic.config import Config
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from manga_manager.domain.jobs import JobKind, MaintenancePayload
+from manga_manager.domain.jobs import ChapterDownloadPayload, JobKind, MaintenancePayload
 from manga_manager.infrastructure.database import DEFAULT_ALEMBIC_CONFIG, run_migrations
 from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.infrastructure.scheduler_leadership import (
@@ -29,7 +29,9 @@ def sessions():
     run_migrations(DATABASE_URL)
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
     with engine.begin() as connection:
-        connection.execute(text("TRUNCATE job_event, worker_heartbeat, job RESTART IDENTITY CASCADE"))
+        connection.execute(
+            text("TRUNCATE job_event, worker_heartbeat, job RESTART IDENTITY CASCADE")
+        )
     yield engine, sessionmaker(engine, expire_on_commit=False)
     engine.dispose()
 
@@ -90,6 +92,70 @@ def test_partial_unique_index_deduplicates_concurrent_enqueue(sessions) -> None:
     assert sorted(created for _job_id, created in results) == [False, True]
 
 
+def test_provider_permit_cap_is_atomic_across_workers(sessions) -> None:
+    _engine, factory = sessions
+    with factory() as session, session.begin():
+        for release_id in (1, 2):
+            JobQueue().enqueue(
+                session,
+                kind=JobKind.CHAPTER_DOWNLOAD,
+                dedupe_key=f"release:{release_id}",
+                payload=ChapterDownloadPayload(chapter_release_id=release_id),
+                source="asura",
+                series_key=f"series-{release_id}",
+                available_at=NOW,
+            )
+    barrier = Barrier(2)
+
+    def claim(owner: str) -> int | None:
+        with factory() as session, session.begin():
+            barrier.wait()
+            lease = JobQueue().claim(
+                session,
+                owner=owner,
+                lease_for=timedelta(minutes=1),
+                now=NOW,
+                pool_limits={"download:asura": 1, "chapter_global": 4},
+            )
+            return lease.id if lease else None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        claims = list(executor.map(claim, ["worker-a", "worker-b"]))
+    assert sum(job_id is not None for job_id in claims) == 1
+
+
+def test_per_series_cap_is_atomic_across_workers(sessions) -> None:
+    _engine, factory = sessions
+    with factory() as session, session.begin():
+        for release_id in (1, 2):
+            JobQueue().enqueue(
+                session,
+                kind=JobKind.CHAPTER_DOWNLOAD,
+                dedupe_key=f"release:{release_id}",
+                payload=ChapterDownloadPayload(chapter_release_id=release_id),
+                source="mangafire",
+                series_key="same-series",
+                available_at=NOW,
+            )
+    barrier = Barrier(2)
+
+    def claim(owner: str) -> int | None:
+        with factory() as session, session.begin():
+            barrier.wait()
+            lease = JobQueue().claim(
+                session,
+                owner=owner,
+                lease_for=timedelta(minutes=1),
+                now=NOW,
+                pool_limits={"download:mangafire": 2, "chapter_global": 4},
+            )
+            return lease.id if lease else None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        claims = list(executor.map(claim, ["worker-a", "worker-b"]))
+    assert sum(job_id is not None for job_id in claims) == 1
+
+
 def test_scheduler_advisory_lock_has_one_leader(sessions) -> None:
     engine, _factory = sessions
     first = try_acquire_scheduler_leadership(engine)
@@ -112,5 +178,5 @@ def test_v2_migrations_round_trip_on_postgresql(sessions) -> None:
     command.upgrade(config, "head")
     with Session(create_engine(DATABASE_URL)) as session:
         assert session.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0005_kavita_mapping"
+            "0007_catalog_integrity_search"
         )

@@ -135,7 +135,9 @@ class SourcePullHandler:
                 raise
             except Exception as exc:
                 failures += 1
-                logger.warning("source item failed source=%s url=%s: %s", item.source, item.url, exc)
+                logger.warning(
+                    "source item failed source=%s url=%s: %s", item.source, item.url, exc
+                )
         return fetched, failures
 
     def _record_failure(

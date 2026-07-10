@@ -47,6 +47,7 @@ class WorkerSettings:
     poll_interval: timedelta = timedelta(seconds=1)
     retry_base: timedelta = timedelta(seconds=30)
     retry_cap: timedelta = timedelta(hours=1)
+    pool_limits: Mapping[str, int] | None = None
 
     def __post_init__(self) -> None:
         if self.lease_for <= timedelta(0):
@@ -74,6 +75,7 @@ class JobWorker:
         settings: WorkerSettings | None = None,
         clock: Clock = utcnow,
         claim_kinds: Collection[JobKind] | None = None,
+        claim_pools: Collection[str] | None = None,
     ) -> None:
         self.owner = owner.strip()
         if not self.owner:
@@ -84,6 +86,7 @@ class JobWorker:
         self.settings = settings or WorkerSettings()
         self.clock = clock
         self.claim_kinds = frozenset(claim_kinds) if claim_kinds is not None else None
+        self.claim_pools = frozenset(claim_pools) if claim_pools is not None else None
 
     async def run_once(self) -> WorkerRunResult:
         lease = self._claim()
@@ -148,7 +151,9 @@ class JobWorker:
             if result is not WorkerRunResult.IDLE:
                 continue
             try:
-                await asyncio.wait_for(stop.wait(), timeout=self.settings.poll_interval.total_seconds())
+                await asyncio.wait_for(
+                    stop.wait(), timeout=self.settings.poll_interval.total_seconds()
+                )
             except TimeoutError:
                 continue
 
@@ -160,6 +165,8 @@ class JobWorker:
                 lease_for=self.settings.lease_for,
                 now=self.clock(),
                 kinds=self.claim_kinds,
+                pool_limits=dict(self.settings.pool_limits or {}),
+                pools=self.claim_pools,
             )
 
     async def _heartbeat_loop(self, lease: JobLease, lease_lost: asyncio.Event) -> None:

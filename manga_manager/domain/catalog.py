@@ -31,4 +31,3 @@ def chapter_sort_number(value: str) -> Decimal | None:
         return Decimal(canonical)
     except InvalidOperation:
         return None
-

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from email.utils import parsedate_to_datetime
 import time
+import weakref
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -12,6 +13,9 @@ from app.adapters.base import SourceRateLimited
 from app.settings import settings
 
 _page_semaphores: dict[str, asyncio.Semaphore] = {}
+_request_schedulers: dict[str, tuple[asyncio.Lock, float]] = {}
+_worker_page_semaphores: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+WORKER_INFLIGHT_BYTE_BUDGET = 256 * 1024 * 1024
 
 
 class HttpSourceClient:
@@ -27,8 +31,6 @@ class HttpSourceClient:
         self.throttle_seconds = throttle_seconds
         self.transport = transport
         self._client: httpx.AsyncClient | None = None
-        self._last_request_at = 0.0
-        self._lock = asyncio.Lock()
 
     async def get_soup(self, path_or_url: str) -> BeautifulSoup:
         url = path_or_url if path_or_url.startswith("http") else f"{self.base_url}{path_or_url}"
@@ -119,12 +121,15 @@ class HttpSourceClient:
     async def wait_for_throttle(self) -> None:
         if self.throttle_seconds <= 0:
             return
-        async with self._lock:
-            elapsed = time.monotonic() - self._last_request_at
+        lock, last_request_at = _request_schedulers.setdefault(self.base_url, (asyncio.Lock(), 0.0))
+        async with lock:
+            # Fetch again after waiting for the lock; another client may have updated it.
+            _, last_request_at = _request_schedulers[self.base_url]
+            elapsed = time.monotonic() - last_request_at
             remaining = self.throttle_seconds - elapsed
             if remaining > 0:
                 await asyncio.sleep(remaining)
-            self._last_request_at = time.monotonic()
+            _request_schedulers[self.base_url] = (lock, time.monotonic())
 
     async def aclose(self) -> None:
         if self._client is not None:
@@ -154,22 +159,49 @@ async def iter_ordered_bytes(
             yield await client.get_bytes(url, referer=referer)
         return
 
-    semaphore = asyncio.Semaphore(concurrency)
+    window = max(1, concurrency)
+    semaphore = asyncio.Semaphore(window)
     source_semaphore = page_semaphore_for_client(client)
+    worker_semaphore = worker_page_semaphore()
 
     async def fetch(url: str) -> bytes:
         async with semaphore:
             async with source_semaphore:
-                return await client.get_bytes(url, referer=referer)
+                async with worker_semaphore:
+                    return await client.get_bytes(url, referer=referer)
 
-    tasks = [asyncio.create_task(fetch(url)) for url in urls]
+    tasks: dict[int, asyncio.Task[bytes]] = {}
+    next_index = 0
+
+    def fill_window() -> None:
+        nonlocal next_index
+        while next_index < len(urls) and len(tasks) < window:
+            tasks[next_index] = asyncio.create_task(fetch(urls[next_index]))
+            next_index += 1
+
+    fill_window()
     try:
-        for task in tasks:
-            yield await task
+        for index in range(len(urls)):
+            task = tasks.pop(index)
+            page = await task
+            fill_window()
+            yield page
     except Exception:
-        for task in tasks:
+        for task in tasks.values():
             task.cancel()
+        await asyncio.gather(*tasks.values(), return_exceptions=True)
         raise
+
+
+def worker_page_semaphore() -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    semaphore = _worker_page_semaphores.get(loop)
+    if semaphore is None:
+        max_page_bytes = max(1, settings.max_page_bytes)
+        capacity = max(1, WORKER_INFLIGHT_BYTE_BUDGET // max_page_bytes)
+        semaphore = asyncio.Semaphore(capacity)
+        _worker_page_semaphores[loop] = semaphore
+    return semaphore
 
 
 def page_semaphore_for_client(client: HttpSourceClient) -> asyncio.Semaphore:

@@ -31,9 +31,10 @@ class WorkerService:
         self.registry = registry or WorkerRegistry()
 
     async def run(self, stop: asyncio.Event) -> None:
+        specs = self._pool_specs()
         tasks = [
-            asyncio.create_task(self._run_slot(slot, stop))
-            for slot in range(1, self.settings.worker_concurrency + 1)
+            asyncio.create_task(self._run_slot(slot, pool, kinds, stop))
+            for slot, pool, kinds in specs
         ]
         await stop.wait()
         grace = self.settings.worker_shutdown_grace_seconds
@@ -45,26 +46,59 @@ class WorkerService:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def _run_slot(self, slot: int, stop: asyncio.Event) -> None:
-        worker_id = f"{self.settings.worker_id}-{slot}"
+    def _pool_specs(self) -> list[tuple[int, str, set[JobKind]]]:
+        requested = [
+            ("source_pull", 1, {JobKind.SOURCE_PULL}),
+            (
+                "download:asura",
+                self.settings.asura_download_concurrency,
+                {JobKind.CHAPTER_DOWNLOAD},
+            ),
+            (
+                "download:kingofshojo",
+                self.settings.kingofshojo_download_concurrency,
+                {JobKind.CHAPTER_DOWNLOAD},
+            ),
+            (
+                "download:mangafire",
+                self.settings.mangafire_download_concurrency,
+                {JobKind.CHAPTER_DOWNLOAD},
+            ),
+            ("kavita", 1, {JobKind.KAVITA_SYNC}),
+            ("maintenance", 1, {JobKind.MAINTENANCE}),
+        ]
+        specs: list[tuple[int, str, set[JobKind]]] = []
+        for pool, count, kinds in requested:
+            if not kinds.intersection(self.handlers):
+                continue
+            for _ in range(count):
+                specs.append((len(specs) + 1, pool, kinds))
+        return specs
+
+    async def _run_slot(
+        self, slot: int, pool: str, kinds: set[JobKind], stop: asyncio.Event
+    ) -> None:
+        worker_id = f"{self.settings.worker_id}-{pool.replace(':', '-')}-{slot}"
         with self.session_factory() as session, session.begin():
             self.registry.register(
                 session,
                 worker_id=worker_id,
-                metadata={"slot": slot, "concurrency": self.settings.worker_concurrency},
+                metadata={"slot": slot, "pool": pool, "pool_limits": self.settings.pool_limits()},
             )
         heartbeat = asyncio.create_task(self._heartbeat(worker_id, stop))
         runtime = JobWorker(
             owner=worker_id,
             session_factory=self.session_factory,
             handlers=self.handlers,
-            claim_kinds=set(self.handlers),
+            claim_kinds=kinds.intersection(self.handlers),
+            claim_pools={pool},
             settings=WorkerSettings(
                 lease_for=self.settings.lease_for,
                 heartbeat_interval=self.settings.job_heartbeat_interval,
                 poll_interval=timedelta(seconds=self.settings.worker_poll_seconds),
                 retry_base=timedelta(seconds=self.settings.retry_base_seconds),
                 retry_cap=timedelta(seconds=self.settings.retry_cap_seconds),
+                pool_limits=self.settings.pool_limits(),
             ),
         )
         try:
@@ -86,4 +120,3 @@ class WorkerService:
                     if not self.registry.heartbeat(session, worker_id=worker_id):
                         logger.error("worker heartbeat row disappeared worker_id=%s", worker_id)
                         return
-

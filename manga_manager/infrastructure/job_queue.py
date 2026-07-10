@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from collections.abc import Collection
 from typing import Any
 
-from sqlalchemy import Select, and_, or_, select, update
+from sqlalchemy import Select, and_, delete, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -16,7 +16,7 @@ from manga_manager.domain.jobs import (
     JobState,
     parse_job_payload,
 )
-from manga_manager.infrastructure.db_models import JobEvent, WorkJob
+from manga_manager.infrastructure.db_models import JobEvent, JobPermit, WorkJob
 
 
 def utcnow() -> datetime:
@@ -44,6 +44,9 @@ class JobQueue:
         priority: int = 100,
         max_attempts: int = 3,
         available_at: datetime | None = None,
+        source: str = "",
+        series_key: str = "",
+        pool: str = "",
     ) -> tuple[WorkJob, bool]:
         key = dedupe_key.strip()
         if not key:
@@ -52,6 +55,10 @@ class JobQueue:
             raise ValueError("max_attempts must be at least 1")
 
         validated_payload = parse_job_payload(kind, payload)
+        routed_source = source.strip()
+        if kind is JobKind.SOURCE_PULL:
+            routed_source = validated_payload.source
+        routed_pool = pool.strip() or default_pool(kind, routed_source)
         existing = self.active_job(session, kind=kind, dedupe_key=key)
         if existing is not None:
             return existing, False
@@ -63,6 +70,9 @@ class JobQueue:
             priority=priority,
             max_attempts=max_attempts,
             available_at=available_at or utcnow(),
+            source=routed_source,
+            series_key=series_key.strip(),
+            pool=routed_pool,
         )
         try:
             with session.begin_nested():
@@ -97,6 +107,8 @@ class JobQueue:
         *,
         now: datetime | None = None,
         kinds: Collection[JobKind] | None = None,
+        pools: Collection[str] | None = None,
+        exclude_ids: Collection[int] | None = None,
     ) -> Select[tuple[WorkJob]]:
         current = now or utcnow()
         ready = and_(
@@ -121,6 +133,13 @@ class JobQueue:
             if not values:
                 return query.where(False)
             query = query.where(WorkJob.kind.in_(values))
+        if pools is not None:
+            values = [pool for pool in pools if pool]
+            if not values:
+                return query.where(False)
+            query = query.where(WorkJob.pool.in_(values))
+        if exclude_ids:
+            query = query.where(WorkJob.id.not_in(tuple(exclude_ids)))
         return query
 
     def claim(
@@ -131,6 +150,8 @@ class JobQueue:
         lease_for: timedelta,
         now: datetime | None = None,
         kinds: Collection[JobKind] | None = None,
+        pool_limits: dict[str, int] | None = None,
+        pools: Collection[str] | None = None,
     ) -> JobLease | None:
         worker = owner.strip()
         if not worker:
@@ -139,7 +160,32 @@ class JobQueue:
             raise ValueError("lease_for must be positive")
         current = now or utcnow()
         self.fail_exhausted_leases(session, now=current)
-        job = session.scalar(self.claim_query(now=current, kinds=kinds))
+        self._expire_permits(session, current)
+        limits = pool_limits or {}
+        job = None
+        rejected: set[int] = set()
+        for _ in range(50):
+            candidate = session.scalar(
+                self.claim_query(
+                    now=current,
+                    kinds=kinds,
+                    pools=pools,
+                    exclude_ids=rejected,
+                )
+            )
+            if candidate is None:
+                break
+            if self._acquire_permits(
+                session,
+                candidate,
+                owner=worker,
+                expires_at=current + lease_for,
+                now=current,
+                limits=limits,
+            ):
+                job = candidate
+                break
+            rejected.add(candidate.id)
         if job is None:
             return None
 
@@ -164,6 +210,9 @@ class JobQueue:
             max_attempts=job.max_attempts,
             owner=worker,
             expires_at=expires_at,
+            source=job.source,
+            series_key=job.series_key,
+            pool=job.pool,
         )
 
     def fail_exhausted_leases(self, session: Session, *, now: datetime | None = None) -> int:
@@ -193,6 +242,7 @@ class JobQueue:
                 owner=prior_owner,
                 message=job.error_message,
             )
+            self._release_permits(session, job.id)
         session.flush()
         return len(jobs)
 
@@ -220,6 +270,13 @@ class JobQueue:
                 updated_at=current,
             )
         )
+        if result.rowcount == 1:
+            session.execute(
+                update(JobPermit)
+                .where(JobPermit.job_id == job_id)
+                .where(JobPermit.owner == owner)
+                .values(lease_expires_at=current + lease_for)
+            )
         return result.rowcount == 1
 
     def succeed(
@@ -293,6 +350,7 @@ class JobQueue:
         job.error_message = error_message
         job.updated_at = current
         job.completed_at = current if terminal else None
+        self._release_permits(session, job.id)
         self._record_event(
             session,
             job,
@@ -330,6 +388,7 @@ class JobQueue:
         job.error_message = reason
         job.updated_at = current
         job.completed_at = current
+        self._release_permits(session, job.id)
         self._record_event(session, job, "cancelled", owner=owner, message=reason)
         session.flush()
         return True
@@ -393,6 +452,7 @@ class JobQueue:
         job.error_code = "released"
         job.error_message = reason
         job.updated_at = current
+        self._release_permits(session, job.id)
         self._record_event(session, job, "released", owner=owner, message=reason)
         session.flush()
         return True
@@ -428,6 +488,7 @@ class JobQueue:
         job.error_message = error_message
         job.updated_at = current
         job.completed_at = current
+        self._release_permits(session, job.id)
         self._record_event(
             session,
             job,
@@ -438,6 +499,73 @@ class JobQueue:
         )
         session.flush()
         return True
+
+    def _expire_permits(self, session: Session, now: datetime) -> None:
+        session.execute(delete(JobPermit).where(JobPermit.lease_expires_at <= now))
+
+    def _acquire_permits(
+        self,
+        session: Session,
+        job: WorkJob,
+        *,
+        owner: str,
+        expires_at: datetime,
+        now: datetime,
+        limits: dict[str, int],
+    ) -> bool:
+        if job.kind == JobKind.CHAPTER_DOWNLOAD.value and job.series_key:
+            series_lock = f"chapter-series:{job.series_key}"
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                session.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:series_lock))"),
+                    {"series_lock": series_lock},
+                )
+            leased_for_series = session.scalar(
+                select(WorkJob.id)
+                .where(WorkJob.kind == JobKind.CHAPTER_DOWNLOAD.value)
+                .where(WorkJob.status == JobState.LEASED.value)
+                .where(WorkJob.series_key == job.series_key)
+                .where(WorkJob.lease_expires_at > now)
+                .limit(1)
+            )
+            if leased_for_series is not None:
+                return False
+        pools = [job.pool]
+        if job.kind == JobKind.CHAPTER_DOWNLOAD.value:
+            pools.append("chapter_global")
+        pools = sorted(set(filter(None, pools)))
+        for pool in pools:
+            limit = limits.get(pool)
+            if limit is None:
+                continue
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                session.execute(
+                    text("SELECT pg_advisory_xact_lock(hashtext(:permit_pool))"),
+                    {"permit_pool": pool},
+                )
+            active = session.scalar(
+                select(func.count())
+                .select_from(JobPermit)
+                .where(JobPermit.pool == pool)
+                .where(JobPermit.lease_expires_at > now)
+            )
+            if int(active or 0) >= limit:
+                return False
+        for pool in pools:
+            if pool in limits:
+                session.add(
+                    JobPermit(
+                        job_id=job.id,
+                        pool=pool,
+                        owner=owner,
+                        lease_expires_at=expires_at,
+                    )
+                )
+        session.flush()
+        return True
+
+    def _release_permits(self, session: Session, job_id: int) -> None:
+        session.execute(delete(JobPermit).where(JobPermit.job_id == job_id))
 
     def _record_event(
         self,
@@ -459,3 +587,15 @@ class JobQueue:
                 details=dict(details or {}),
             )
         )
+
+
+def default_pool(kind: JobKind, source: str = "") -> str:
+    if kind is JobKind.SOURCE_PULL:
+        return "source_pull"
+    if kind is JobKind.CHAPTER_DOWNLOAD:
+        return f"download:{source}" if source else "download:unknown"
+    if kind is JobKind.KAVITA_SYNC:
+        return "kavita"
+    if kind is JobKind.NOTIFICATION:
+        return "notification"
+    return "maintenance"

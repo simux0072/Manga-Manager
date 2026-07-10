@@ -40,4 +40,3 @@ def run_migrations(
     config = Config(str(config_path))
     config.set_main_option("sqlalchemy.url", database_url)
     command.upgrade(config, "head")
-
