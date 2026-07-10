@@ -1,0 +1,8 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}Manga Manager{% endblock %}</title><link rel="stylesheet" href="/static/styles.css"><script defer src="/static/htmx.min.js"></script></head>
+<body><aside class="sidebar"><a href="/discovery">Discover</a><a href="/library">Library</a><a href="/operations">Operations</a></aside>
+<header class="topbar"><strong>Manga Manager</strong><span>PostgreSQL v2</span></header>
+<main class="content">{% block content %}{% endblock %}</main>
+<nav class="bottom-nav"><a href="/discovery">Discover</a><a href="/library">Library</a><a href="/operations">Ops</a></nav>
+<aside id="job-drawer" class="job-drawer" hidden></aside>{% block scripts %}{% endblock %}</body></html>

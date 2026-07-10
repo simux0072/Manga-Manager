@@ -11,6 +11,10 @@
 <section class="table">
   {% for chapter in chapters %}
     <article class="chapter-progress-row new-chapter-row">
+      {% set cover_src = series_cover_src(chapter.series) %}
+      <div class="cover tiny">
+        {% if cover_src %}<img src="{{ cover_src }}" alt="">{% else %}<span>No cover</span>{% endif %}
+      </div>
       <div>
         <h2>{{ chapter.series.title }}</h2>
         <p>Ch. {{ chapter.number }}{% if chapter.title %} · {{ chapter.title }}{% endif %}</p>

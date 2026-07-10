@@ -10,6 +10,9 @@
     <form method="post" action="/kavita/want-to-read/sync" data-async-form>{{ csrf_input()|safe }}<button>Sync Want to Read</button></form>
     <form method="post" action="/maintenance/refresh-missing-covers" data-async-form>{{ csrf_input()|safe }}<button>Refresh missing covers</button></form>
     <form method="post" action="/maintenance/repair-known-series" data-async-form>{{ csrf_input()|safe }}<button>Repair known manga</button></form>
+    <form method="post" action="/maintenance/rebuild-matches" data-async-form>{{ csrf_input()|safe }}<button>Rebuild matches</button></form>
+    <form method="post" action="/maintenance/build-visual-fingerprints" data-async-form>{{ csrf_input()|safe }}<button>Build visual fingerprints</button></form>
+    <form method="post" action="/maintenance/rebuild-visual-matches" data-async-form>{{ csrf_input()|safe }}<button>Rebuild visual matches</button></form>
     <form method="post" action="/maintenance/recover-stale-downloads" data-async-form>{{ csrf_input()|safe }}<button>Recover stale jobs</button></form>
     <form method="post" action="/maintenance/cleanup-retention" data-async-form>{{ csrf_input()|safe }}<button>Cleanup retention</button></form>
     <form method="post" action="/retry-failed" data-async-form>{{ csrf_input()|safe }}<button>Retry failed jobs</button></form>

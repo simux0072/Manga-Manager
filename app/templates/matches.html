@@ -62,7 +62,10 @@
       </div>
     </article>
   {% else %}
-    <p class="empty">No uncertain matches need review.</p>
+    <div class="empty">
+      <p>No uncertain matches need review.</p>
+      <p class="muted">Run Repair known manga or Rebuild matches from Info after source pulls if this looks unexpectedly empty.</p>
+    </div>
   {% endfor %}
 </section>
 {% endblock %}

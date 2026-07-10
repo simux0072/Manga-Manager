@@ -5,6 +5,7 @@ const state = {
   drawerSections: new Map(),
   infoJobPages: {active: 1, failed: 1, completed: 1},
   infoJobPageSize: 25,
+  infoSectionLoading: new Set(),
   jobStatusErrors: 0,
   unloading: false,
   filter: new URLSearchParams(window.location.search).get("filter") || "all",
@@ -442,6 +443,7 @@ function renderJobs(payload) {
   const counts = statusCounts(payload);
   Object.entries(byStatus).forEach(([status, jobs]) => {
     document.querySelectorAll(`[data-jobs-status="${status}"]`).forEach((target) => {
+      if (state.infoSectionLoading.has(status)) return;
       const sectionPage = payload.sections && payload.sections[status];
       if (sectionPage) renderInfoJobSection(target, status, sectionPage);
       else renderInfoJobSection(target, status, {
@@ -484,6 +486,20 @@ function renderInfoJobSection(target, status, page) {
   target.replaceChildren(list, pager);
 }
 
+function renderInfoLoading(target) {
+  const loading = document.createElement("p");
+  loading.className = "muted";
+  loading.textContent = "Loading jobs...";
+  target.replaceChildren(loading);
+}
+
+function renderInfoError(target, message) {
+  const error = document.createElement("p");
+  error.className = "error";
+  error.textContent = message || "Job status unavailable.";
+  target.replaceChildren(error);
+}
+
 function renderInfoPager(status, page) {
   const pager = document.createElement("div");
   pager.className = "job-pager";
@@ -506,8 +522,7 @@ function renderInfoPager(status, page) {
     button.textContent = text;
     button.disabled = nextPage === current || totalPages <= 1;
     button.addEventListener("click", () => {
-      state.infoJobPages[status] = nextPage;
-      refreshJobs().catch((error) => toast(error.message, "error"));
+      refreshInfoSection(status, nextPage).catch((error) => toast(error.message, "error"));
     });
     pager.append(button);
   });
@@ -519,12 +534,32 @@ function renderInfoPager(status, page) {
     button.textContent = text;
     button.disabled = nextPage === current || totalPages <= 1;
     button.addEventListener("click", () => {
-      state.infoJobPages[status] = nextPage;
-      refreshJobs().catch((error) => toast(error.message, "error"));
+      refreshInfoSection(status, nextPage).catch((error) => toast(error.message, "error"));
     });
     pager.append(button);
   });
   return pager;
+}
+
+async function refreshInfoSection(status, page) {
+  const target = document.querySelector(`[data-jobs-status="${status}"]`);
+  if (!target) return;
+  state.infoJobPages[status] = page;
+  state.infoSectionLoading.add(status);
+  renderInfoLoading(target);
+  const response = await fetch(jobsStatusUrl(), {headers: {"Accept": "application/json"}});
+  if (!response.ok) {
+    renderInfoError(target, `Job status request failed (${response.status}).`);
+    state.infoSectionLoading.delete(status);
+    return;
+  }
+  const payload = await response.json();
+  state.jobs = payload;
+  renderOverall(payload);
+  const sectionPage = payload.sections && payload.sections[status];
+  if (sectionPage) renderInfoJobSection(target, status, sectionPage);
+  else renderInfoError(target, "Job status section missing.");
+  state.infoSectionLoading.delete(status);
 }
 
 async function refreshJobs() {

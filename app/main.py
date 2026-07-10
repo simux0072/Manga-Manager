@@ -42,10 +42,12 @@ from app.models import (
     SeriesProgress,
     SourceHealth,
     SourcePullJob,
+    SourceSeries,
 )
 from app.scheduler import create_scheduler
 from app.services import (
     FIRST_IMPORT_CHAPTERS,
+    build_visual_fingerprints,
     cleanup_bad_discovery_rows,
     create_pull_job,
     decode_metadata,
@@ -61,7 +63,6 @@ from app.services import (
     kavita_series_url,
     merge_match_candidate,
     release_display_time,
-    series_latest_platform_release_time,
     pull_status,
     pending_kavita_sync_series_count,
     queue_chapter_download,
@@ -73,6 +74,8 @@ from app.services import (
     recover_stale_kavita_sync_jobs,
     restart_interrupted_pull_jobs,
     refresh_missing_covers,
+    rebuild_visual_matches,
+    regenerate_match_candidates,
     repair_known_series,
     rescan_source_series,
     retry_download_job,
@@ -452,6 +455,7 @@ def operations_status(request: Request, session: Session) -> dict:
                 select(DownloadJob.status, func.count()).group_by(DownloadJob.status)
             )
         },
+        "download_queue": download_queue_state_counts(session),
         "kavita_sync_jobs": {
             status: count
             for status, count in session.execute(
@@ -496,6 +500,9 @@ def notice_context(request: Request) -> dict[str, str]:
         "wtr": f"Kavita Want to Read imported {count or '0'} series.",
         "bulk-matches": f"Updated {count or '0'} match candidates.",
         "recover-downloads": f"Recovered {count or '0'} stale download jobs.",
+        "rebuild-matches": f"Rebuilt {count or '0'} match candidates.",
+        "visual-fingerprints": f"Built {count or '0'} visual fingerprints.",
+        "visual-matches": f"Created {count or '0'} visual match candidates.",
     }
     return {"type": notice, "message": messages.get(notice, "")}
 
@@ -614,6 +621,19 @@ def random_mapped_series(series: list[Series]) -> Series | None:
     return None
 
 
+def series_cover_src(series: Series) -> str:
+    if series.cover_path:
+        return f"/covers/{Path(series.cover_path).name}"
+    if series.cover_url:
+        return series.cover_url
+    for source in sorted(series.sources, key=lambda row: source_priority_label(row.source), reverse=True):
+        if source.cover_path:
+            return f"/covers/{Path(source.cover_path).name}"
+        if source.cover_url:
+            return source.cover_url
+    return ""
+
+
 @app.get("/", response_class=HTMLResponse)
 def discovery(request: Request, session: Session = Depends(get_session)):
     page = max(1, int(request.query_params.get("page", "1") or "1"))
@@ -623,20 +643,21 @@ def discovery(request: Request, session: Session = Depends(get_session)):
         source_filter = "all"
     page_size = settings.discovery_page_size
     offset = (page - 1) * page_size
-    series = session.scalars(
+    source_counts = discovery_source_counts(session, enabled_sources)
+    ordered_ids = discovery_ordered_series_ids(session, source_filter)
+    has_next = len(ordered_ids) > offset + page_size
+    page_ids = ordered_ids[offset : offset + page_size]
+    rows = session.scalars(
         select(Series)
+        .where(Series.id.in_(page_ids))
         .where(Series.status == "new")
         .options(
             selectinload(Series.sources),
             selectinload(Series.chapters).selectinload(Chapter.releases),
         )
     ).all()
-    source_counts = discovery_source_counts(series, enabled_sources)
-    if source_filter != "all":
-        series = [item for item in series if any(source.source == source_filter for source in item.sources)]
-    series = discovery_order(series, source_filter)
-    has_next = len(series) > offset + page_size
-    series = series[offset : offset + page_size]
+    by_id = {series.id: series for series in rows}
+    series = [by_id[series_id] for series_id in page_ids if series_id in by_id]
     health_rows = {row.source: row for row in session.scalars(select(SourceHealth)).all()}
     health = [
         health_rows.get(source) or SourceHealth(source=source, enabled=True)
@@ -662,30 +683,96 @@ def discovery(request: Request, session: Session = Depends(get_session)):
     )
 
 
-def discovery_source_counts(series: list[Series], enabled_sources: list[str]) -> dict[str, int]:
-    counts = {"all": len(series)}
+def discovery_source_counts(session: Session, enabled_sources: list[str]) -> dict[str, int]:
+    counts = {
+        "all": session.scalar(
+            select(func.count()).select_from(Series).where(Series.status == "new")
+        )
+        or 0
+    }
     for source in enabled_sources:
-        counts[source] = sum(1 for item in series if any(row.source == source for row in item.sources))
+        counts[source] = (
+            session.scalar(
+                select(func.count(func.distinct(Series.id)))
+                .select_from(Series)
+                .join(SourceSeries, SourceSeries.series_id == Series.id)
+                .where(Series.status == "new")
+                .where(SourceSeries.source == source)
+            )
+            or 0
+        )
     return counts
 
 
-def discovery_order(series: list[Series], source_filter: str) -> list[Series]:
-    ordered = sorted(series, key=series_latest_platform_release_time, reverse=True)
+def discovery_ordered_series_ids(session: Session, source_filter: str) -> list[int]:
+    chapter_times = (
+        select(
+            Chapter.series_id.label("series_id"),
+            func.min(
+                func.coalesce(
+                    ChapterRelease.published_at,
+                    ChapterRelease.first_seen_at,
+                    Chapter.updated_at,
+                )
+            ).label("chapter_time"),
+        )
+        .select_from(Chapter)
+        .outerjoin(ChapterRelease, ChapterRelease.chapter_id == Chapter.id)
+        .group_by(Chapter.id, Chapter.series_id)
+        .subquery()
+    )
+    query = (
+        select(
+            Series.id,
+            SourceSeries.source,
+            func.coalesce(
+                func.max(chapter_times.c.chapter_time),
+                Series.updated_at,
+            ).label("latest_at"),
+        )
+        .select_from(Series)
+        .outerjoin(SourceSeries, SourceSeries.series_id == Series.id)
+        .outerjoin(chapter_times, chapter_times.c.series_id == Series.id)
+        .where(Series.status == "new")
+        .group_by(Series.id, SourceSeries.source, Series.updated_at)
+    )
+    if source_filter != "all":
+        query = query.where(SourceSeries.source == source_filter)
+    source_rows = session.execute(query).all()
+    latest_by_series: dict[int, datetime] = {}
+    sources_by_series: dict[int, set[str]] = {}
+    for series_id, source, latest_at in source_rows:
+        latest = aware_datetime(latest_at) or datetime.min.replace(tzinfo=timezone.utc)
+        if series_id not in latest_by_series or latest > latest_by_series[series_id]:
+            latest_by_series[series_id] = latest
+        if source:
+            sources_by_series.setdefault(series_id, set()).add(source)
+        else:
+            sources_by_series.setdefault(series_id, set())
+    ordered = sorted(latest_by_series, key=lambda series_id: latest_by_series[series_id], reverse=True)
     if source_filter != "all":
         return ordered
-    buckets: dict[str, list[Series]] = {}
+    buckets: dict[str, list[int]] = {}
     source_order: list[str] = []
-    for item in ordered:
-        primary = max((source.source for source in item.sources), default="unknown", key=source_priority_label)
+    for series_id in ordered:
+        primary = max(sources_by_series.get(series_id) or {"unknown"}, key=source_priority_label)
         if primary not in buckets:
             source_order.append(primary)
-        buckets.setdefault(primary, []).append(item)
-    result: list[Series] = []
+        buckets.setdefault(primary, []).append(series_id)
+    result: list[int] = []
     while any(buckets.values()):
         for source in source_order:
             if buckets[source]:
                 result.append(buckets[source].pop(0))
     return result
+
+
+def aware_datetime(value) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value
 
 
 @app.get("/library", response_class=HTMLResponse)
@@ -791,7 +878,7 @@ def new_chapters(request: Request, session: Session = Depends(get_session)):
         .where(Chapter.downloaded_source != "")
         .where(~Chapter.progress.has(ChapterProgress.status == "read"))
         .options(
-            selectinload(Chapter.series),
+            selectinload(Chapter.series).selectinload(Series.sources),
             selectinload(Chapter.progress),
             selectinload(Chapter.releases),
         )
@@ -804,6 +891,7 @@ def new_chapters(request: Request, session: Session = Depends(get_session)):
             "chapters": chapters,
             "kavita_chapter_url": kavita_chapter_url,
             "chapter_platform_release_time": chapter_platform_release_time,
+            "series_cover_src": series_cover_src,
             "active": "new",
         },
     )
@@ -1040,6 +1128,12 @@ def download_job_payload(job: DownloadJob, session: Session) -> dict:
     release = session.get(ChapterRelease, job.chapter_release_id)
     chapter = release.chapter if release else None
     series = chapter.series if chapter else None
+    source_health = session.get(SourceHealth, release.source) if release else None
+    now = datetime.now(timezone.utc)
+    cooldown_until = aware_datetime(source_health.download_cooldown_until) if source_health else None
+    cooldown_blocked = bool(
+        job.status in {"queued", "delayed"} and cooldown_until and cooldown_until > now
+    )
     return {
         "id": job.id,
         "kind": "download",
@@ -1049,6 +1143,9 @@ def download_job_payload(job: DownloadJob, session: Session) -> dict:
         "job_type": job.job_type,
         "error": job.error,
         "retry_after": iso_time(job.retry_after),
+        "cooldown_blocked": cooldown_blocked,
+        "source_cooldown_until": iso_time(cooldown_until),
+        "source_cooldown_reason": source_health.download_cooldown_reason if source_health else "",
         "created_at": iso_time(job.created_at),
         "updated_at": iso_time(job.updated_at),
         "retryable": job.status == "failed",
@@ -1089,6 +1186,16 @@ def download_group_payload(series_id: int | None, chapter_jobs: list[dict]) -> d
         status: sum(1 for job in chapter_jobs if job["status"] == status)
         for status in ("queued", "running", "delayed", "complete", "failed", "skipped")
     }
+    cooldown_blocked = sum(1 for job in chapter_jobs if job.get("cooldown_blocked"))
+    ready_queued = sum(
+        1
+        for job in chapter_jobs
+        if job["status"] == "queued" and not job.get("cooldown_blocked") and not job.get("retry_after")
+    )
+    if cooldown_blocked:
+        counts["cooldown_blocked"] = cooldown_blocked
+    if ready_queued:
+        counts["ready_queued"] = ready_queued
     processed = sum(1 for job in chapter_jobs if job["status"] in PROCESSED_DOWNLOAD_STATUSES)
     total = len(chapter_jobs)
     latest = sorted_jobs[0] if sorted_jobs else {}
@@ -1108,6 +1215,15 @@ def download_group_payload(series_id: int | None, chapter_jobs: list[dict]) -> d
         "updated_at": latest.get("updated_at", ""),
         "created_at": min((job.get("created_at", "") for job in chapter_jobs), default=""),
         "error": next((job.get("error", "") for job in sorted_jobs if job.get("error")), ""),
+        "cooldown_blocked": any(job.get("cooldown_blocked") for job in chapter_jobs),
+        "source_cooldown_until": next(
+            (job.get("source_cooldown_until", "") for job in sorted_jobs if job.get("source_cooldown_until")),
+            "",
+        ),
+        "source_cooldown_reason": next(
+            (job.get("source_cooldown_reason", "") for job in sorted_jobs if job.get("source_cooldown_reason")),
+            "",
+        ),
         "counts": counts,
         "chapters": sorted_jobs,
     }
@@ -1260,6 +1376,7 @@ def jobs_status_payload(
         )
     }
     active_downloads = sum(download_counts.get(status, 0) for status in ("queued", "running", "delayed"))
+    download_queue_counts = download_queue_state_counts(session)
     active_kavita = sum(1 for job in kavita_jobs if job.status in {"queued", "running"})
     payload = {
         "overall": {
@@ -1267,6 +1384,8 @@ def jobs_status_payload(
             "processed": pull_processed,
             "total": pull_total,
             "active_downloads": active_downloads,
+            "ready_downloads": download_queue_counts["ready"],
+            "cooldown_blocked_downloads": download_queue_counts["cooldown_blocked"],
             "active_kavita": active_kavita,
         },
         "pulls": [pull_job_payload(job) for job in pull_jobs],
@@ -1274,6 +1393,7 @@ def jobs_status_payload(
         "kavita": [kavita_job_payload(job) for job in kavita_jobs],
         "counts": {
             "downloads": download_counts,
+            "download_queue": download_queue_counts,
             "kavita": {
                 status: count
                 for status, count in session.execute(
@@ -1295,6 +1415,34 @@ def jobs_status_payload(
             for section in INFO_JOB_STATUSES
         }
     return payload
+
+
+def download_queue_state_counts(session: Session) -> dict[str, int]:
+    now = datetime.now(timezone.utc)
+    rows = session.execute(
+        select(DownloadJob.status, DownloadJob.retry_after, SourceHealth.download_cooldown_until)
+        .select_from(DownloadJob)
+        .join(ChapterRelease, ChapterRelease.id == DownloadJob.chapter_release_id)
+        .outerjoin(SourceHealth, SourceHealth.source == ChapterRelease.source)
+        .where(DownloadJob.status.in_(["queued", "delayed"]))
+    ).all()
+    ready = 0
+    retry_delayed = 0
+    cooldown_blocked = 0
+    for status, retry_after, cooldown_until in rows:
+        retry = aware_datetime(retry_after)
+        cooldown = aware_datetime(cooldown_until)
+        if cooldown and cooldown > now:
+            cooldown_blocked += 1
+        elif retry and retry > now:
+            retry_delayed += 1
+        elif status in {"queued", "delayed"}:
+            ready += 1
+    return {
+        "ready": ready,
+        "retry_delayed": retry_delayed,
+        "cooldown_blocked": cooldown_blocked,
+    }
 
 
 @app.get("/api/jobs/status")
@@ -1447,6 +1595,49 @@ async def repair_series(request: Request, session: Session = Depends(get_session
         "/info",
         "repair",
         count=result["rescanned"],
+    )
+
+
+@app.post("/maintenance/rebuild-matches")
+def rebuild_matches(request: Request, session: Session = Depends(get_session)):
+    count = regenerate_match_candidates(session)
+    return json_or_redirect(
+        request,
+        {"ok": True, "count": count, "message": f"Rebuilt {count} match candidates."},
+        "/info",
+        "rebuild-matches",
+        count=count,
+    )
+
+
+@app.post("/maintenance/build-visual-fingerprints")
+def build_fingerprints(request: Request, session: Session = Depends(get_session)):
+    result = build_visual_fingerprints(session)
+    return json_or_redirect(
+        request,
+        {
+            "ok": True,
+            **result,
+            "message": (
+                f"Built {result['fingerprints']} chapter and "
+                f"{result.get('cover_fingerprints', 0)} cover visual fingerprints."
+            ),
+        },
+        "/info",
+        "visual-fingerprints",
+        count=result["fingerprints"] + result.get("cover_fingerprints", 0),
+    )
+
+
+@app.post("/maintenance/rebuild-visual-matches")
+def rebuild_visual_match_candidates(request: Request, session: Session = Depends(get_session)):
+    count = rebuild_visual_matches(session)
+    return json_or_redirect(
+        request,
+        {"ok": True, "count": count, "message": f"Created {count} visual match candidates."},
+        "/info",
+        "visual-matches",
+        count=count,
     )
 
 
