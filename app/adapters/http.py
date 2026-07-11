@@ -187,10 +187,11 @@ async def iter_ordered_bytes(
             fill_window()
             yield page
     except Exception:
+        raise
+    finally:
         for task in tasks.values():
             task.cancel()
         await asyncio.gather(*tasks.values(), return_exceptions=True)
-        raise
 
 
 def worker_page_semaphore() -> asyncio.Semaphore:

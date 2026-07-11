@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import signal
+import time
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -12,7 +13,11 @@ from sqlalchemy import text
 
 from manga_manager.application.source_pull import SourcePullHandler
 from manga_manager.application.storage_reconcile import StorageReconciler
-from manga_manager.application.legacy_repair import LegacyRepair, write_legacy_report
+from manga_manager.application.legacy_repair import (
+    LegacyRepair,
+    sqlite_path,
+    write_legacy_report,
+)
 from manga_manager.application.cbz_import import LegacyCbzImporter, write_report
 from manga_manager.application.chapter_download import ChapterDownloadHandler
 from manga_manager.application.kavita_sync import KavitaSyncHandler
@@ -55,6 +60,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cleanup.add_argument("storage_root", type=Path)
     cleanup.add_argument("--retain-days", type=int, default=30)
+    rescan = subcommands.add_parser(
+        "rescan-legacy", help="rescan legacy sources, covers, chapters, matches, and stale jobs"
+    )
+    rescan.add_argument("database", type=Path)
+    rescan.add_argument("--limit", type=int)
     for name, help_text in (
         ("audit-legacy", "audit a legacy SQLite catalog without changing it"),
         ("repair-legacy", "repair safe legacy defects; defaults to dry-run"),
@@ -93,6 +103,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "cleanup-repair-archives":
         removed = LegacyRepair.cleanup_archives(args.storage_root, retain_days=args.retain_days)
         print(f"removed={len(removed)} retain_days={args.retain_days}")
+        return 0
+    if args.command == "rescan-legacy":
+        if args.limit is not None and args.limit < 1:
+            parser.error("--limit must be positive")
+        from sqlalchemy import create_engine
+        from sqlalchemy.orm import Session
+
+        from app.services import repair_known_series
+
+        database = sqlite_path(args.database)
+        legacy_engine = create_engine(f"sqlite:///{database}", connect_args={"timeout": 30})
+        with Session(legacy_engine, expire_on_commit=False) as session:
+            result = asyncio.run(repair_known_series(session, limit=args.limit))
+        print(json.dumps(result, sort_keys=True))
         return 0
     if args.command in {"audit-legacy", "repair-legacy"}:
         repair = LegacyRepair(args.database, storage_root=args.storage_root)
@@ -152,12 +176,49 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "WHERE a.state='active' AND b.checksum IS NULL"
                 )
             )
+            missing_projection = connection.scalar(
+                text(
+                    "SELECT count(*) FROM chapter_artifact a "
+                    "LEFT JOIN library_projection p ON p.artifact_id=a.id "
+                    "WHERE a.state='active' AND p.artifact_id IS NULL"
+                )
+            )
+            blobs = connection.execute(
+                text(
+                    "SELECT b.relative_path FROM chapter_artifact a "
+                    "JOIN artifact_blob b ON b.checksum=a.blob_checksum "
+                    "WHERE a.state='active'"
+                )
+            ).all()
+            started = time.perf_counter()
+            connection.execute(
+                text(
+                    "SELECT id FROM series_v2 "
+                    "ORDER BY latest_release_at DESC NULLS LAST, id DESC LIMIT 25"
+                )
+            ).all()
+            first_page_ms = round((time.perf_counter() - started) * 1000, 2)
+        invalid_archives: list[str] = []
+        for (relative_path,) in blobs:
+            path = storage.root / relative_path
+            try:
+                storage.validate_cbz(path)
+            except (OSError, ValueError) as exc:
+                invalid_archives.append(f"{relative_path}: {exc}")
         payload = {
-            "ok": invalid == 0,
+            "ok": (
+                invalid == 0
+                and missing_projection == 0
+                and not invalid_archives
+                and first_page_ms < 1_000
+            ),
             "database": "ok",
             "migration": version,
             "jobs": counts,
             "active_artifacts_without_blob": invalid,
+            "active_artifacts_without_projection": missing_projection,
+            "invalid_active_archives": invalid_archives,
+            "catalog_first_page_ms": first_page_ms,
             "storage_root": str(storage.root.resolve()),
         }
         if args.json_output:

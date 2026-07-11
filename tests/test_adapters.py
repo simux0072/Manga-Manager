@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 import httpx
 from bs4 import BeautifulSoup
@@ -7,6 +9,7 @@ from app.adapters.http import HttpSourceClient
 from app.adapters.base import FrontierSentinel, SourceRateLimited
 from app.adapters.kingofshojo import KingOfShojoAdapter
 from app.adapters.mangafire import MangaFireAdapter
+from app.adapters.http import iter_ordered_bytes
 from app.adapters.parsing import extract_image_urls
 from app.domain import SeriesItem
 
@@ -53,7 +56,11 @@ def test_asura_parses_comics_and_filters_chapter_images():
 
     chapters = adapter.parse_chapters(soup, recent[0])
     assert [(chapter.number, chapter.title, chapter.url) for chapter in chapters] == [
-        ("128", "Chapter 128", "https://asurascans.com/comics/star-embracing-swordmaster-a80d257e/chapter/128")
+        (
+            "128",
+            "Chapter 128",
+            "https://asurascans.com/comics/star-embracing-swordmaster-a80d257e/chapter/128",
+        )
     ]
     assert chapters[0].published_at is not None
 
@@ -97,7 +104,9 @@ def test_asura_detail_prefers_visible_summary_and_filters_polluted_alias():
 
     item = AsuraAdapter().parse_series_detail(
         soup,
-        SeriesItem("asura", "comics/example", "Example Hero", "https://asurascans.com/comics/example"),
+        SeriesItem(
+            "asura", "comics/example", "Example Hero", "https://asurascans.com/comics/example"
+        ),
     )
 
     assert item.description == "Visible series summary."
@@ -194,7 +203,12 @@ def test_kingofshojo_filters_navigation_series_and_extracts_dates():
 
     chapters = adapter.parse_chapters(
         soup,
-        SeriesItem("kingofshojo", "manga/tears-on-a-withered-flower", "Tears", "https://kingofshojo.com/manga/tears-on-a-withered-flower/"),
+        SeriesItem(
+            "kingofshojo",
+            "manga/tears-on-a-withered-flower",
+            "Tears",
+            "https://kingofshojo.com/manga/tears-on-a-withered-flower/",
+        ),
     )
     assert chapters[0].number == "109"
     assert chapters[0].title == "Chapter 109"
@@ -231,7 +245,12 @@ def test_kingofshojo_extracts_aliases_from_description_prefix_and_cleans_cover()
 
     item = KingOfShojoAdapter().parse_series_detail(
         soup,
-        SeriesItem("kingofshojo", "manga/sashimi", "Sashimi Master", "https://kingofshojo.com/manga/sashimi/"),
+        SeriesItem(
+            "kingofshojo",
+            "manga/sashimi",
+            "Sashimi Master",
+            "https://kingofshojo.com/manga/sashimi/",
+        ),
     )
 
     assert "Conquering the Academy with Just a Sashimi Knife" in item.aliases
@@ -352,7 +371,9 @@ def test_kingofshojo_rejects_logo_cover_and_prefers_real_summary_image():
 
     item = KingOfShojoAdapter().parse_series_detail(
         soup,
-        SeriesItem("kingofshojo", "manga/example", "Example", "https://kingofshojo.com/manga/example/"),
+        SeriesItem(
+            "kingofshojo", "manga/example", "Example", "https://kingofshojo.com/manga/example/"
+        ),
     )
 
     assert item.cover_url == "https://cdn.kingofshojo.com/king-bucket/images/example-cover.webp"
@@ -372,7 +393,9 @@ def test_mangafire_html_detail_fallback_parses_metadata():
 
     item = MangaFireAdapter().parse_series_detail_html(
         soup,
-        SeriesItem("mangafire", "gl3", "Gun X Clover", "https://mangafire.to/title/gl3-gun-x-clover"),
+        SeriesItem(
+            "mangafire", "gl3", "Gun X Clover", "https://mangafire.to/title/gl3-gun-x-clover"
+        ),
     )
 
     assert item.description == "A school action series."
@@ -392,7 +415,9 @@ def test_mangafire_html_detail_preserves_comma_aliases():
 
     item = MangaFireAdapter().parse_series_detail_html(
         soup,
-        SeriesItem("mangafire", "oxr4y", "Escape Me If You Can", "https://mangafire.to/title/oxr4y"),
+        SeriesItem(
+            "mangafire", "oxr4y", "Escape Me If You Can", "https://mangafire.to/title/oxr4y"
+        ),
     )
 
     assert item.aliases == (
@@ -618,7 +643,7 @@ async def test_mangafire_recent_frontier_imports_api_rows_when_homepage_is_js_sh
         if request.url.path == "/":
             return httpx.Response(
                 200,
-                text="<html><body><div id=\"app\"></div><script src=\"/app.js\"></script></body></html>",
+                text='<html><body><div id="app"></div><script src="/app.js"></script></body></html>',
                 request=request,
             )
         return httpx.Response(
@@ -792,3 +817,31 @@ async def test_http_client_raises_rate_limit_with_retry_after():
         await client.client.aclose()
 
     assert exc_info.value.retry_after is not None
+
+
+async def test_ordered_page_fetch_uses_bounded_sliding_window():
+    class WindowClient:
+        base_url = "https://mangafire.window.test"
+
+        def __init__(self):
+            self.started: list[str] = []
+            self.release_first = asyncio.Event()
+
+        async def get_bytes(self, url: str, referer: str = "") -> bytes:
+            self.started.append(url)
+            if url.endswith("/0"):
+                await self.release_first.wait()
+            return url.encode()
+
+    client = WindowClient()
+    iterator = iter_ordered_bytes(
+        client,
+        [f"https://mangafire.window.test/{index}" for index in range(100)],
+        concurrency=3,
+    )
+    first_page = asyncio.create_task(anext(iterator))
+    await asyncio.sleep(0.05)
+    assert len(client.started) == 3
+    client.release_first.set()
+    assert await first_page == b"https://mangafire.window.test/0"
+    await iterator.aclose()

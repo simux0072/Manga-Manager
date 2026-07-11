@@ -500,3 +500,82 @@ def test_shared_source_cooldown_skips_provider_jobs(session: Session) -> None:
         )
         is not None
     )
+
+
+def test_global_chapter_ceiling_applies_across_provider_pools(session: Session) -> None:
+    queue = JobQueue()
+    for release_id, source in ((1, "mangafire"), (2, "kingofshojo")):
+        queue.enqueue(
+            session,
+            kind=JobKind.CHAPTER_DOWNLOAD,
+            dedupe_key=f"release:global:{release_id}",
+            payload=ChapterDownloadPayload(chapter_release_id=release_id),
+            source=source,
+            series_key=f"series-{release_id}",
+            available_at=NOW,
+        )
+    limits = {
+        "download:mangafire": 2,
+        "download:kingofshojo": 2,
+        "chapter_global": 1,
+    }
+    assert (
+        queue.claim(
+            session,
+            owner="first",
+            lease_for=timedelta(minutes=1),
+            now=NOW,
+            pool_limits=limits,
+        )
+        is not None
+    )
+    assert (
+        queue.claim(
+            session,
+            owner="second",
+            lease_for=timedelta(minutes=1),
+            now=NOW,
+            pool_limits=limits,
+        )
+        is None
+    )
+
+
+def test_capped_pool_does_not_block_other_pool_fairness(session: Session) -> None:
+    queue = JobQueue()
+    for release_id, source, priority in (
+        (1, "asura", 1),
+        (2, "asura", 2),
+        (3, "mangafire", 3),
+    ):
+        queue.enqueue(
+            session,
+            kind=JobKind.CHAPTER_DOWNLOAD,
+            dedupe_key=f"release:fair:{release_id}",
+            payload=ChapterDownloadPayload(chapter_release_id=release_id),
+            source=source,
+            series_key=f"fair-series-{release_id}",
+            priority=priority,
+            available_at=NOW,
+        )
+    limits = {
+        "download:asura": 1,
+        "download:mangafire": 2,
+        "chapter_global": 4,
+    }
+    first = queue.claim(
+        session,
+        owner="first",
+        lease_for=timedelta(minutes=1),
+        now=NOW,
+        pool_limits=limits,
+    )
+    second = queue.claim(
+        session,
+        owner="second",
+        lease_for=timedelta(minutes=1),
+        now=NOW,
+        pool_limits=limits,
+    )
+    assert first is not None and first.source == "asura"
+    assert second is not None and second.source == "mangafire"
