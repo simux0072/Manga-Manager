@@ -126,6 +126,13 @@ def full_legacy_database(path: Path) -> Path:
           id INTEGER PRIMARY KEY, chapter_release_id INTEGER NOT NULL UNIQUE REFERENCES chapter_release(id),
           status TEXT NOT NULL DEFAULT 'queued'
         );
+        CREATE TABLE activity_event (
+          id INTEGER PRIMARY KEY,
+          download_job_id INTEGER REFERENCES download_job(id),
+          chapter_id INTEGER REFERENCES chapter(id),
+          series_id INTEGER REFERENCES series(id),
+          kavita_sync_job_id INTEGER
+        );
         INSERT INTO series VALUES (1, 'Merged', 'merged', '', '', '', 'new');
         INSERT INTO source_series VALUES
           (1, 1, 'asura', 'first', 'First', 'first', 'https://asura.test/comics/first', '', '', '', '{}'),
@@ -177,6 +184,8 @@ def test_repair_consolidates_evidenced_helper_release(tmp_path: Path) -> None:
         connection.execute(
             "INSERT INTO downloaded_file VALUES (2, 2, 3, 'asura', 'helper.cbz', 1, NULL)"
         )
+        connection.execute("INSERT INTO download_job VALUES (1, 3, 'queued')")
+        connection.execute("INSERT INTO activity_event VALUES (1, 1, 2, 1, NULL)")
         connection.commit()
     actions, _ = LegacyRepair(database).repair(apply=True, backup_dir=tmp_path / "backups")
     assert any(
@@ -189,6 +198,12 @@ def test_repair_consolidates_evidenced_helper_release(tmp_path: Path) -> None:
             "SELECT chapter_id, chapter_release_id, active FROM downloaded_file WHERE id=2"
         ).fetchone()
         assert (chapter_id, release_id, active) == (1, 1, 1)
+        assert (
+            connection.execute("SELECT download_job_id FROM activity_event WHERE id=1").fetchone()[
+                0
+            ]
+            is None
+        )
 
 
 def test_template_release_is_moved_to_repair_archive(tmp_path: Path) -> None:
@@ -235,3 +250,23 @@ def test_repair_archive_cleanup_preserves_thirty_day_window(tmp_path: Path) -> N
     assert removed == [old]
     assert not old.exists()
     assert recent.exists()
+
+
+def test_storage_manifest_cache_is_resumable_and_invalidates_changed_files(
+    tmp_path: Path,
+) -> None:
+    database = legacy_database(tmp_path / "legacy.db")
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    chapter = storage / "chapter.cbz"
+    chapter.write_bytes(b"first")
+    cache = tmp_path / "manifest.json"
+    repair = LegacyRepair(database, storage_root=storage)
+    first = repair.manifest(cache)
+    assert cache.is_file()
+    assert first[0]["sha256"]
+    second = repair.manifest(cache)
+    assert second == first
+    chapter.write_bytes(b"changed")
+    third = repair.manifest(cache)
+    assert third[0]["sha256"] != first[0]["sha256"]

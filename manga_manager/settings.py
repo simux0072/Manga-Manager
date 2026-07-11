@@ -29,6 +29,9 @@ class V2Settings(BaseSettings):
     worker_shutdown_grace_seconds: int = Field(default=30, ge=1, le=3_600)
     retry_base_seconds: int = Field(default=30, ge=1, le=3_600)
     retry_cap_seconds: int = Field(default=3_600, ge=1, le=86_400)
+    rate_limit_cooldown_minutes: int = Field(default=5, ge=1, le=1_440)
+    asura_rate_limit_cooldown_minutes: int = Field(default=15, ge=1, le=1_440)
+    circuit_breaker_failures: int = Field(default=3, ge=1, le=100)
     scheduler_check_seconds: int = Field(default=30, ge=5, le=3_600)
     enable_asura: bool = True
     enable_mangafire: bool = True
@@ -80,3 +83,11 @@ class V2Settings(BaseSettings):
             "maintenance": 1,
             "notification": 1,
         }
+
+    def source_cooldown(self, source: str) -> timedelta:
+        minutes = (
+            self.asura_rate_limit_cooldown_minutes
+            if source == "asura"
+            else self.rate_limit_cooldown_minutes
+        )
+        return timedelta(minutes=minutes)

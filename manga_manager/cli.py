@@ -63,6 +63,11 @@ def build_parser() -> argparse.ArgumentParser:
         legacy.add_argument("database", type=Path)
         legacy.add_argument("--storage-root", type=Path)
         legacy.add_argument("--report", type=Path, required=True)
+        legacy.add_argument(
+            "--manifest-file",
+            type=Path,
+            help="persistent manifest cache; reused on retry when present",
+        )
         legacy.add_argument("--backup-dir", type=Path)
         if name == "repair-legacy":
             legacy.add_argument(
@@ -92,6 +97,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command in {"audit-legacy", "repair-legacy"}:
         repair = LegacyRepair(args.database, storage_root=args.storage_root)
         apply = args.command == "repair-legacy" and args.apply
+        manifest_path = args.manifest_file or args.report.with_suffix(
+            args.report.suffix + ".manifest.json"
+        )
+        manifest = repair.manifest(manifest_path)
         actions, backup = (
             repair.repair(apply=apply, backup_dir=args.backup_dir)
             if args.command == "repair-legacy"
@@ -102,7 +111,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             database=repair.database,
             dry_run=not apply,
             actions=actions,
-            manifest=repair.manifest(),
+            manifest=manifest,
             backup=backup,
         )
         print(
@@ -267,6 +276,12 @@ async def run_worker(settings: V2Settings, engine) -> int:
     chapter_download = ChapterDownloadHandler(
         session_factory=sessions,
         storage=create_storage(settings),
+        cooldowns={
+            source: settings.source_cooldown(source)
+            for source in ("asura", "mangafire", "kingofshojo")
+        }
+        | {"default": settings.source_cooldown("default")},
+        circuit_breaker_failures=settings.circuit_breaker_failures,
     )
     kavita_sync = KavitaSyncHandler(
         session_factory=sessions,

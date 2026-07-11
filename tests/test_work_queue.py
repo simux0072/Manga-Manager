@@ -16,7 +16,13 @@ from manga_manager.domain.jobs import (
     NotificationPayload,
     SourcePullPayload,
 )
-from manga_manager.infrastructure.db_models import JobBase, JobEvent, JobPermit, WorkJob
+from manga_manager.infrastructure.db_models import (
+    CatalogSourceState,
+    JobBase,
+    JobEvent,
+    JobPermit,
+    WorkJob,
+)
 from manga_manager.infrastructure.job_queue import JobQueue
 
 
@@ -451,3 +457,46 @@ def test_expired_permits_are_recovered_with_job_lease(session: Session) -> None:
     assert recovered.id == first.id
     permits = session.scalars(select(JobPermit).where(JobPermit.job_id == first.id)).all()
     assert {permit.owner for permit in permits} == {"replacement"}
+
+
+def test_shared_source_cooldown_skips_provider_jobs(session: Session) -> None:
+    queue = JobQueue()
+    queue.enqueue(
+        session,
+        kind=JobKind.CHAPTER_DOWNLOAD,
+        dedupe_key="release:cooling",
+        payload=ChapterDownloadPayload(chapter_release_id=1),
+        source="asura",
+        series_key="cooling-series",
+        available_at=NOW,
+    )
+    session.add(
+        CatalogSourceState(
+            source="asura",
+            health_status="cooldown",
+            cooldown_until=NOW + timedelta(minutes=10),
+        )
+    )
+    session.flush()
+    assert (
+        queue.claim(
+            session,
+            owner="worker",
+            lease_for=timedelta(minutes=1),
+            now=NOW,
+            pool_limits={"download:asura": 1, "chapter_global": 4},
+        )
+        is None
+    )
+    state = session.get(CatalogSourceState, "asura")
+    state.cooldown_until = NOW - timedelta(seconds=1)
+    assert (
+        queue.claim(
+            session,
+            owner="worker",
+            lease_for=timedelta(minutes=1),
+            now=NOW,
+            pool_limits={"download:asura": 1, "chapter_global": 4},
+        )
+        is not None
+    )

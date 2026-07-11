@@ -180,3 +180,15 @@ def test_v2_migrations_round_trip_on_postgresql(sessions) -> None:
         assert session.scalar(text("SELECT version_num FROM alembic_version")) == (
             "0007_catalog_integrity_search"
         )
+        indexes = set(
+            session.scalars(
+                text(
+                    "SELECT indexname FROM pg_indexes WHERE tablename='series_v2'"
+                )
+            ).all()
+        )
+        assert {
+            "ix_series_v2_title_trgm",
+            "ix_series_v2_normalized_title_trgm",
+            "ix_series_v2_latest_cursor",
+        } <= indexes

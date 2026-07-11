@@ -133,22 +133,43 @@ class LegacyRepair:
             RepairAction(**{**asdict(item), "applied": item.key in applied}) for item in actions
         ], backup
 
-    def manifest(self) -> list[dict[str, Any]]:
+    def manifest(self, cache_path: Path | None = None) -> list[dict[str, Any]]:
         if self.storage_root is None or not self.storage_root.exists():
             return []
+        cached: dict[str, dict[str, Any]] = {}
+        if cache_path is not None and cache_path.is_file():
+            try:
+                cached = {
+                    record["path"]: record
+                    for record in json.loads(cache_path.read_text(encoding="utf-8"))
+                }
+            except (KeyError, TypeError, json.JSONDecodeError):
+                cached = {}
         records: list[dict[str, Any]] = []
-        for path in sorted(self.storage_root.rglob("*.cbz")):
-            digest = hashlib.sha256()
-            with path.open("rb") as handle:
-                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-                    digest.update(chunk)
-            records.append(
-                {
-                    "path": path.relative_to(self.storage_root).as_posix(),
-                    "bytes": path.stat().st_size,
+        for index, path in enumerate(sorted(self.storage_root.rglob("*.cbz")), start=1):
+            stat = path.stat()
+            relative = path.relative_to(self.storage_root).as_posix()
+            record = cached.get(relative)
+            if (
+                not record
+                or record.get("bytes") != stat.st_size
+                or record.get("mtime_ns") != stat.st_mtime_ns
+            ):
+                digest = hashlib.sha256()
+                with path.open("rb") as handle:
+                    for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                        digest.update(chunk)
+                record = {
+                    "path": relative,
+                    "bytes": stat.st_size,
+                    "mtime_ns": stat.st_mtime_ns,
                     "sha256": digest.hexdigest(),
                 }
-            )
+            records.append(record)
+            if cache_path is not None and index % 50 == 0:
+                write_manifest_cache(cache_path, records)
+        if cache_path is not None:
+            write_manifest_cache(cache_path, records)
         return records
 
     @staticmethod
@@ -528,6 +549,16 @@ class LegacyRepair:
                 (target_chapter_id, target_release_id, helper_release_id),
             )
         if table_exists(connection, "download_job"):
+            helper_jobs = connection.execute(
+                "SELECT id FROM download_job WHERE chapter_release_id=?",
+                (helper_release_id,),
+            ).fetchall()
+            if table_exists(connection, "activity_event"):
+                for helper_job in helper_jobs:
+                    connection.execute(
+                        "UPDATE activity_event SET download_job_id=NULL WHERE download_job_id=?",
+                        (helper_job["id"],),
+                    )
             target_job = connection.execute(
                 "SELECT id FROM download_job WHERE chapter_release_id=?", (target_release_id,)
             ).fetchone()
@@ -547,6 +578,11 @@ class LegacyRepair:
         connection.execute("DELETE FROM chapter_release WHERE id=?", (helper_release_id,))
         old_chapter_id = helper["chapter_id"]
         if old_chapter_id and old_chapter_id != target_chapter_id:
+            if table_exists(connection, "activity_event"):
+                connection.execute(
+                    "UPDATE activity_event SET chapter_id=? WHERE chapter_id=?",
+                    (target_chapter_id, old_chapter_id),
+                )
             remaining = connection.execute(
                 "SELECT 1 FROM chapter_release WHERE chapter_id=? LIMIT 1", (old_chapter_id,)
             ).fetchone()
@@ -722,3 +758,10 @@ def evidenced_chapter_number(url: str, title: str) -> str | None:
             else title_match.group(1)
         )
     return None
+
+
+def write_manifest_cache(path: Path, records: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(records, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary, path)

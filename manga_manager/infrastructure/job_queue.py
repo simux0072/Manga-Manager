@@ -16,7 +16,12 @@ from manga_manager.domain.jobs import (
     JobState,
     parse_job_payload,
 )
-from manga_manager.infrastructure.db_models import JobEvent, JobPermit, WorkJob
+from manga_manager.infrastructure.db_models import (
+    CatalogSourceState,
+    JobEvent,
+    JobPermit,
+    WorkJob,
+)
 
 
 def utcnow() -> datetime:
@@ -124,6 +129,20 @@ class JobQueue:
             select(WorkJob)
             .where(or_(ready, expired))
             .where(WorkJob.attempts < WorkJob.max_attempts)
+            .where(
+                or_(
+                    WorkJob.kind != JobKind.CHAPTER_DOWNLOAD.value,
+                    ~select(CatalogSourceState.source)
+                    .where(CatalogSourceState.source == WorkJob.source)
+                    .where(
+                        or_(
+                            CatalogSourceState.manual_enabled.is_(False),
+                            CatalogSourceState.cooldown_until > current,
+                        )
+                    )
+                    .exists(),
+                )
+            )
             .order_by(WorkJob.priority.asc(), WorkJob.available_at.asc(), WorkJob.id.asc())
             .with_for_update(skip_locked=True)
             .limit(1)

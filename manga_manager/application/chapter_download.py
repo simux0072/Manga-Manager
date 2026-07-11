@@ -24,6 +24,7 @@ from manga_manager.infrastructure.db_models import (
     CatalogChapterRelease,
     CatalogSeries,
     CatalogSourceSeries,
+    CatalogSourceState,
 )
 from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.infrastructure.storage import ContentAddressedStorage
@@ -63,12 +64,19 @@ class ChapterDownloadHandler:
         adapter_factory: AdapterFactory = adapter_for_source,
         artifacts: ArtifactRepository | None = None,
         queue: JobQueue | None = None,
+        cooldowns: dict[str, timedelta] | None = None,
+        circuit_breaker_failures: int = 3,
     ) -> None:
         self.session_factory = session_factory
         self.storage = storage
         self.adapter_factory = adapter_factory
         self.artifacts = artifacts or ArtifactRepository()
         self.queue = queue or JobQueue()
+        self.cooldowns = cooldowns or {
+            "asura": timedelta(minutes=15),
+            "default": timedelta(minutes=5),
+        }
+        self.circuit_breaker_failures = circuit_breaker_failures
 
     async def __call__(self, context: JobContext) -> None:
         payload = context.lease.payload
@@ -100,6 +108,8 @@ class ChapterDownloadHandler:
             )
         except SourceRateLimited as exc:
             retry_at = aware_datetime(exc.retry_after)
+            retry_at = retry_at or utcnow() + self._cooldown(snapshot.source)
+            self._record_source_failure(snapshot.source, str(exc), retry_at)
             delay = max(retry_at - utcnow(), timedelta(seconds=1)) if retry_at else None
             raise RetryableJobError("rate_limited", str(exc), retry_after=delay) from exc
         except ChapterTemporarilyUnavailable as exc:
@@ -107,6 +117,7 @@ class ChapterDownloadHandler:
             delay = max(retry_at - utcnow(), timedelta(seconds=1)) if retry_at else None
             raise RetryableJobError("temporarily_unavailable", str(exc), retry_after=delay) from exc
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
+            self._record_source_failure(snapshot.source, str(exc), None)
             raise RetryableJobError("source_network_error", str(exc)) from exc
         except ValueError as exc:
             raise RetryableJobError("invalid_content", str(exc)) from exc
@@ -142,6 +153,27 @@ class ChapterDownloadHandler:
                 series_key=str(snapshot.series_id),
             )
         self.storage.materialize(blob.relative_path, result.projection_relative_path)
+
+    def _cooldown(self, source: str) -> timedelta:
+        return self.cooldowns.get(source, self.cooldowns["default"])
+
+    def _record_source_failure(
+        self, source: str, error: str, cooldown_until: datetime | None
+    ) -> None:
+        with self.session_factory() as session, session.begin():
+            state = session.get(CatalogSourceState, source)
+            if state is None:
+                state = CatalogSourceState(source=source)
+                session.add(state)
+                session.flush()
+            failures = state.consecutive_failures + 1
+            if cooldown_until is None and failures >= self.circuit_breaker_failures:
+                cooldown_until = utcnow() + self._cooldown(source)
+            state.consecutive_failures = failures
+            state.last_error = error[:4000]
+            state.cooldown_until = cooldown_until
+            state.health_status = "cooldown" if cooldown_until else "degraded"
+            state.updated_at = utcnow()
 
 
 def load_snapshot(session: Session, release_id: int) -> DownloadSnapshot | None:

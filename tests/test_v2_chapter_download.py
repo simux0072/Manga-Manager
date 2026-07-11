@@ -13,7 +13,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.adapters.base import SourceAdapter
+from app.adapters.base import SourceAdapter, SourceRateLimited
 from app.domain import ChapterItem, SeriesItem
 from manga_manager.application.chapter_download import ChapterDownloadHandler
 from manga_manager.application.job_handlers import JobContext, RetryableJobError
@@ -21,6 +21,7 @@ from manga_manager.domain.jobs import ChapterDownloadPayload, JobKind
 from manga_manager.infrastructure.catalog_repository import CatalogRepository
 from manga_manager.infrastructure.db_models import (
     CatalogChapterRelease,
+    CatalogSourceState,
     ChapterArtifact,
     JobBase,
     LibraryProjection,
@@ -178,3 +179,32 @@ async def test_download_handler_classifies_invalid_pages_as_retryable(
     with pytest.raises(RetryableJobError) as error:
         await handler(context)
     assert error.value.code == "invalid_content"
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_sets_shared_source_cooldown(
+    sessions: TrackingSessions,
+    tmp_path: Path,
+) -> None:
+    _release_id, context = setup_release_and_context(sessions)
+
+    class RateLimitedAdapter(PageAdapter):
+        async def iter_chapter_pages(self, chapter: ChapterItem) -> AsyncIterator[bytes]:
+            raise SourceRateLimited("slow down")
+            yield b""  # pragma: no cover
+
+    adapter = RateLimitedAdapter(sessions, [])
+    handler = ChapterDownloadHandler(
+        session_factory=sessions,
+        storage=storage(tmp_path),
+        adapter_factory=lambda _source: adapter,
+        cooldowns={"default": timedelta(minutes=7)},
+    )
+    with pytest.raises(RetryableJobError) as error:
+        await handler(context)
+    assert error.value.code == "rate_limited"
+    with sessions() as session:
+        state = session.get(CatalogSourceState, "fake")
+        assert state is not None
+        assert state.health_status == "cooldown"
+        assert state.cooldown_until is not None
