@@ -8,6 +8,7 @@ from sqlalchemy.orm import sessionmaker
 from manga_manager.infrastructure.db_models import (
     CatalogChapter,
     CatalogChapterRelease,
+    CatalogChapterReadingState,
     CatalogMatchDecision,
     CatalogSeries,
     CatalogSourceSeries,
@@ -121,7 +122,11 @@ async def test_operations_and_health() -> None:
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         assert (await client.get("/healthz")).json()["architecture"] == "postgresql-v2"
-        assert (await client.get("/operations")).status_code == 200
+        operations = await client.get("/operations")
+        probe = await client.post("/operations/probe", headers={"HX-Request": "true"})
+        assert operations.status_code == 200
+        assert "missing_projections" in operations.text
+        assert "Queued probe" in probe.text
 
 
 async def test_updates_matches_activity_and_library_modes() -> None:
@@ -176,3 +181,67 @@ async def test_confirmed_match_merges_complete_groups() -> None:
             session.query(CatalogSeries).one().id
         }
         assert session.query(CatalogMatchDecision).one().decision == "accepted"
+
+
+async def test_chapter_read_state_and_series_state_return_fragments() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session:
+        chapter_id = session.query(CatalogChapter).one().id
+        series_id = session.query(CatalogSeries).filter_by(title="Tracked").one().id
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        chapter = await client.post(
+            f"/chapters/{chapter_id}/state",
+            data={"state": "read"},
+            headers={"HX-Request": "true"},
+        )
+        series = await client.post(
+            f"/series/{series_id}/state",
+            data={"state": "caught_up"},
+            headers={"HX-Request": "true"},
+        )
+    assert 'id="chapter-state-' in chapter.text
+    assert ">read<" in chapter.text
+    assert 'id="series-state-' in series.text
+    with sessions() as session:
+        assert session.get(CatalogChapterReadingState, chapter_id).status == "read"
+
+
+async def test_library_cursor_fragment_preserves_filter_parameters() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        for index in range(55):
+            session.add(
+                CatalogSeries(
+                    title=f"Extra {index}",
+                    normalized_title=f"extra {index}",
+                    status="reading",
+                )
+            )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get(
+            "/library",
+            params={"state": "reading", "q": ""},
+            headers={"HX-Request": "true"},
+        )
+    assert "<!doctype html>" not in response.text
+    assert "state=reading" in response.text
+
+
+async def test_batch_match_rejection_returns_empty_fragment() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session:
+        decision_id = session.query(CatalogMatchDecision).one().id
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/matches/batch",
+            data={"decision_ids": str(decision_id), "decision": "rejected"},
+            headers={"HX-Request": "true"},
+        )
+    assert response.status_code == 200
+    assert response.text == ""
