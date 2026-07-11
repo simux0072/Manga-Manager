@@ -1,0 +1,17 @@
+.git
+.venv
+.pytest_cache
+.ruff_cache
+frontend/node_modules
+frontend/dist
+frontend/test-results
+node_modules
+storage
+storage-v2
+storage-v2-stage
+backups
+reports
+*.db
+*.db-*
+*.sqlite*
+*.wal

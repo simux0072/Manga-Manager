@@ -1,19 +1,21 @@
 # Manga Manager Project Context
 
-Last updated: 2026-07-11
+Last updated: 2026-07-12
 
 ## PostgreSQL v2 transition
 
 - `manga_manager/` contains the durable PostgreSQL catalog, leased queue, workers,
-  content-addressed storage, migrations, CLI, and separate FastAPI/Jinja v2 web surface.
+  content-addressed storage, migrations, CLI, and FastAPI JSON/SSE surface. `frontend/` contains the
+  React/TypeScript media-library client compiled into the production image.
 - V2 discovery uses an indexed ID cursor and database-side filtering. Delta SSE emits `job` and
   `counts` events; heartbeats are comments.
 - `audit-legacy` is read-only. `repair-legacy` defaults to dry-run and requires `--apply`; applied
   runs create a SQLite backup before deterministic changes.
 - `scripts/stage-local.sh` is the local rehearsal path when Compose is unavailable. Pi and Traefik
   cutover remains deferred.
-- The current schema head is `0009_canonical_provider_unique`. It adds reading state and shared
-  request scheduling, and enforces at most one identity from each provider per canonical series.
+- The current schema head is `0011_classify_legacy_failures`. It repairs nullable source
+  counters, adds description/alias search indexes, classifies known historical failures, and retains
+  the canonical provider uniqueness invariant.
 - Provider requests use PostgreSQL-backed global pacing/cooldowns. Chapter downloads use leased
   provider permits, an ordered bounded page window, streaming CBZ output, and a 256 MiB worker-wide
   in-flight byte budget.
@@ -38,21 +40,29 @@ access controls. It should only be used where the user has the right to archive 
 
 ## Current Product Shape
 
-The current v2 application is a FastAPI server with server-rendered Jinja/HTMX pages:
+The current v2 application is a React/Vite client backed by versioned FastAPI JSON APIs and SSE:
 
-- `/` and `/discover` show cursor-paginated discovery with source/search filters and tracking actions.
+- `/` and `/discovery` show cursor-paginated discovery with live title/alias/description search,
+  multi-source filters, and optimistic tracking actions.
 - `/library` provides cover-grid and compact-list modes, saved filters, reading state, and progress.
-- `/updates` shows the chronological release feed with open/read actions.
+- `/updates` groups unread releases only for tracked series and provides open/read actions.
 - `/operations` shows source, queue, worker, storage, and database health plus maintenance actions.
-- `/matches` shows possible cross-source series matches for manual merge/separation.
+- `/matches` shows balanced, cover-backed cross-source comparisons, human-readable evidence, and
+  individual merge/separation actions with destructive confirmation.
 - `/healthz` returns JSON with app, scheduler, and source health.
 - POST routes handle source pulls, queueing, retries, status/reading changes, and match decisions.
 - GET routes handle Kavita-oriented series/chapter opening. Mapped items redirect to Kavita; unmapped
   items queue focused imports and return with a pending state if Kavita is not ready.
 
-HTMX fragment responses progressively enhance ordinary links and forms. Delta SSE carries job/count
-changes; comment heartbeats do not trigger refreshes. The legacy `app/` layer remains only as a
-migration and source-rescan compatibility surface while the deployed web/worker use `manga_manager/`.
+TanStack Query provides cancellable typeahead, optimistic state changes, and targeted cache
+invalidation. Delta SSE carries job/count changes; comment heartbeats do not trigger refreshes. The
+legacy `app/` layer remains only as a migration/source-adapter compatibility surface while the
+deployed web/worker use `manga_manager/` and the compiled frontend.
+
+The verified concurrency profile is Asura 1 job × 1 page, MangaFire 2 × 4, and KingOfShojo 2 × 4,
+under a four-chapter global ceiling and a 256 MiB worker-wide buffered-byte budget. The sites do not
+publish numeric quotas; July 2026 bounded header/robots checks found Cloudflare in front of all three
+and no explicit rate-limit headers. Therefore larger values are benchmark-only, never assumed safe.
 
 ## Main Plan
 

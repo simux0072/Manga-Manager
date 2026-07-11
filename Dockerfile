@@ -1,3 +1,11 @@
+FROM node:22-alpine AS frontend-build
+
+WORKDIR /frontend
+COPY frontend/package.json frontend/package-lock.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npm run build
+
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 
 WORKDIR /app
@@ -15,6 +23,7 @@ COPY alembic.ini ./
 COPY alembic.v2.ini ./
 COPY alembic ./alembic
 COPY scripts ./scripts
+COPY --from=frontend-build /frontend/dist ./frontend/dist
 RUN uv sync --frozen --no-dev
 
 EXPOSE 8000

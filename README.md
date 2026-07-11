@@ -69,6 +69,16 @@ metadata and file paths, while `storage/` contains covers, CBZ files, and replac
 The v2 profile separates migration, web, worker, and PostgreSQL processes with Pi-oriented memory
 limits. It publishes the v2 web application on port 8001:
 
+The web image uses a multi-stage build: Node 22 compiles the React/TypeScript client, while the final
+runtime contains only Python and the static bundle. Local frontend development and checks use:
+
+```bash
+cd frontend
+npm install
+npm test
+npm run build
+```
+
 ```bash
 docker compose --profile v2 up --build
 ```
@@ -139,10 +149,11 @@ Provider request start times are reserved in PostgreSQL, so request spacing and 
 across all worker processes. Downloaded pages retain a worker-wide byte reservation until the ordered
 CBZ writer consumes them; buffered pages therefore remain inside the 256 MiB in-flight budget.
 
-The v2 library stores series state and chapter-level `unread`, `reading`, or `read` progress. Discovery,
-Library, Updates, Matches, and Operations preserve ordinary links/forms while using self-hosted fragment
-updates when JavaScript is available. Saved Library filters are browser-local because the private service
-has no user/session model.
+The v2 library stores series state and chapter-level `unread`, `reading`, or `read` progress. Its
+React client uses versioned JSON endpoints, cancellable typeahead, optimistic tracking actions, and
+delta SSE job events. The FastAPI routes still provide bookmark redirects, while the client handles
+in-place state changes. Saved Library filters are browser-local because the private service has no
+user/session model.
 
 Backup checklist:
 
@@ -274,12 +285,10 @@ external notification calls bounded.
 
 ## Discovery
 
-The Discovery page is a two-column update list on desktop and one column on mobile. Each item shows
-cover art, a truncated title, source badges, combined stats when available, a short description,
-aliases/genres, and the newest 2-3 known chapter releases with relative ages. The cover/title area
-opens the series; chapter rows open the specific chapter. Bookmark/follow counts are summed across
-merged sources. Rating uses the highest-priority source that has a rating rather than averaging
-different sites.
+The v2 Discovery page is a responsive media grid with large covers and always-visible metadata.
+Search covers titles, aliases, and descriptions and refreshes after a 250 ms debounce. Source chips
+are multi-select OR filters and update immediately. Tracking removes the card optimistically and
+offers an Undo notification; cursor pagination keeps filtering and ordering inside PostgreSQL.
 
 Source tabs filter Discovery server-side and show counts for `All`, Asura, MangaFire, and
 KingOfShojo. `All` interleaves recent series by source so a very active source cannot dominate the
@@ -311,8 +320,14 @@ Discovery so they do not appear as broken cards.
 
 ## Rate Limits And Retries
 
-Source adapters respect per-source request intervals. Asura defaults to a conservative request
-interval because its CDN may return `429 Too Many Requests` during bursts. Relevant settings:
+Source adapters respect provider-global request intervals and cooldowns. Asura defaults to one
+chapter job, one page request, and conservative pacing because its CDN may return `429 Too Many
+Requests` during bursts. MangaFire and KingOfShojo each default to two chapter jobs with a four-page
+ordered window. The global chapter ceiling is four. These are intentionally empirical safety
+defaults: the providers publish no numeric request quota, and bounded July 2026 checks exposed no
+rate-limit response headers. All three public origins/CDNs were Cloudflare-fronted. Increase them
+only with `benchmark-workers`; a `429`/`Retry-After` activates the shared cooldown and Asura's
+two-job benchmark automatically falls back to one. Relevant settings:
 
 - `ASURA_REQUEST_INTERVAL_SECONDS`: delay between Asura HTTP requests.
 - `DOWNLOAD_CONCURRENCY`: maximum total running chapter download jobs.
