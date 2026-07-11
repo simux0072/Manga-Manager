@@ -66,4 +66,4 @@ def test_v2_migration_builds_job_constraints_and_indexes(tmp_path: Path) -> None
     sessions = create_session_factory(engine)
     with sessions() as session:
         version = session.scalar(text("SELECT version_num FROM alembic_version"))
-    assert version == "0009_canonical_provider_unique"
+    assert version == "0011_classify_legacy_failures"

@@ -157,8 +157,7 @@ class ContentAddressedStorage:
                         progress(image_count)
             if image_count < self.min_download_pages:
                 raise ValueError(
-                    f"chapter contains {image_count} images; minimum is "
-                    f"{self.min_download_pages}"
+                    f"chapter contains {image_count} images; minimum is {self.min_download_pages}"
                 )
             return self.store_existing(staging)
         finally:

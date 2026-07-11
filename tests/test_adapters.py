@@ -635,6 +635,33 @@ async def test_mangafire_recent_frontier_uses_titles_api_with_browser_headers(mo
     assert items[0].metadata["recent_chapters"][0]["number"] == "61"
 
 
+async def test_asura_second_page_404_is_normal_pagination_end(monkeypatch):
+    requested = []
+
+    async def handler(request):
+        requested.append(request.url.path)
+        if request.url.path == "/":
+            return httpx.Response(
+                200,
+                text='<a href="/comics/one"><img src="/cover.jpg">One</a>',
+                request=request,
+            )
+        return httpx.Response(404, request=request)
+
+    monkeypatch.setattr("app.adapters.asura.settings.asura_recent_pages", 3)
+    adapter = AsuraAdapter()
+    adapter.client = HttpSourceClient(
+        "https://asurascans.com", transport=httpx.MockTransport(handler)
+    )
+    try:
+        items = await adapter.list_recent_frontier([])
+    finally:
+        await adapter.aclose()
+
+    assert requested == ["/", "/page/2/"]
+    assert [item.title for item in items] == ["One"]
+
+
 async def test_mangafire_recent_frontier_imports_api_rows_when_homepage_is_js_shell(monkeypatch):
     requested_paths = []
 

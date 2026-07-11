@@ -35,9 +35,7 @@ def upgrade() -> None:
             name="ck_chapter_reading_state_v2_status",
         ),
     )
-    op.create_index(
-        "ix_chapter_reading_state_v2_status", "chapter_reading_state_v2", ["status"]
-    )
+    op.create_index("ix_chapter_reading_state_v2_status", "chapter_reading_state_v2", ["status"])
     op.create_index(
         "ix_chapter_reading_state_v2_status_updated",
         "chapter_reading_state_v2",

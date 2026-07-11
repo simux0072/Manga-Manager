@@ -20,7 +20,9 @@ class V2Settings(BaseSettings):
     worker_id: str = Field(default_factory=default_worker_id, min_length=1, max_length=180)
     worker_concurrency: int = Field(default=1, ge=1, le=32)
     global_chapter_concurrency: int = Field(default=4, ge=1, le=32)
-    asura_download_concurrency: int = Field(default=1, ge=1, le=2)
+    # Normal workers are deliberately fixed at one. benchmark-workers uses a scoped,
+    # non-validated model copy for the explicit two-job Asura experiment.
+    asura_download_concurrency: int = Field(default=1, ge=1, le=1)
     mangafire_download_concurrency: int = Field(default=2, ge=1, le=8)
     kingofshojo_download_concurrency: int = Field(default=2, ge=1, le=8)
     worker_poll_seconds: float = Field(default=1.0, gt=0, le=60)

@@ -31,7 +31,9 @@ class ProviderRequestScheduler:
         current = now or utcnow()
         with self.session_factory() as session, session.begin():
             if session.bind is not None and session.bind.dialect.name == "postgresql":
-                session.execute(select(func.pg_advisory_xact_lock(func.hashtext(f"request:{source}"))))
+                session.execute(
+                    select(func.pg_advisory_xact_lock(func.hashtext(f"request:{source}")))
+                )
             state = session.get(CatalogSourceState, source)
             if state is None:
                 state = CatalogSourceState(source=source)

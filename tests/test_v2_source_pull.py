@@ -56,9 +56,7 @@ class FakeAdapter(SourceAdapter):
     async def list_recent(self) -> list[SeriesItem]:
         return await self.list_recent_frontier([])
 
-    async def list_recent_frontier(
-        self, sentinels: list[FrontierSentinel]
-    ) -> list[SeriesItem]:
+    async def list_recent_frontier(self, sentinels: list[FrontierSentinel]) -> list[SeriesItem]:
         assert self.sessions.active == 0
         self.frontier = sentinels
         return [
@@ -156,9 +154,7 @@ async def test_source_pull_keeps_database_closed_during_http_and_ingests_idempot
         assert state is not None
         assert state.health_status == "healthy"
         assert state.frontier_json == [{"source_id": "series-1", "latest_chapter": "10.0"}]
-        progress = session.scalars(
-            select(JobEvent).where(JobEvent.event_type == "progress")
-        ).all()
+        progress = session.scalars(select(JobEvent).where(JobEvent.event_type == "progress")).all()
         assert len(progress) == 2
 
 
@@ -230,3 +226,24 @@ def test_shared_external_id_never_adds_second_identity_from_same_provider(
             [],
         )
         assert first.series_id != second.series_id
+
+
+def test_source_failure_repairs_null_counter_and_opens_circuit_after_three(
+    sessions: TrackingSessionFactory,
+) -> None:
+    repository = CatalogRepository()
+    with sessions() as session, session.begin():
+        state = CatalogSourceState(source="broken", consecutive_failures=0)
+        session.add(state)
+        session.flush()
+        state.consecutive_failures = None
+        repository.record_poll_failure(session, source="broken", error="first")
+    with sessions() as session, session.begin():
+        repository.record_poll_failure(session, source="broken", error="second")
+        repository.record_poll_failure(session, source="broken", error="third")
+    with sessions() as session:
+        state = session.get(CatalogSourceState, "broken")
+        assert state is not None
+        assert state.consecutive_failures == 3
+        assert state.health_status == "cooldown"
+        assert state.cooldown_until is not None

@@ -68,6 +68,9 @@ class SourcePollScheduler:
                 state = session.get(CatalogSourceState, source)
                 if state is not None and not state.manual_enabled:
                     continue
+                cooldown_until = aware_datetime(state.cooldown_until) if state is not None else None
+                if cooldown_until is not None and cooldown_until > current:
+                    continue
                 last_poll = aware_datetime(state.last_poll_at) if state is not None else None
                 if last_poll is not None and last_poll + interval > current:
                     continue

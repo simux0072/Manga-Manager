@@ -16,9 +16,7 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     with op.batch_alter_table("source_series_v2") as batch:
-        batch.create_unique_constraint(
-            "uq_source_series_v2_series_source", ["series_id", "source"]
-        )
+        batch.create_unique_constraint("uq_source_series_v2_series_source", ["series_id", "source"])
 
 
 def downgrade() -> None:

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -126,8 +126,12 @@ class CatalogRepository:
         cooldown_until: datetime | None = None,
     ) -> None:
         state = self._source_state(session, source)
+        # Imported pre-v2 rows may predate the non-null application default.
+        state.consecutive_failures = (state.consecutive_failures or 0) + 1
+        if cooldown_until is None and state.consecutive_failures >= 3:
+            minutes = min(5 * (2 ** (state.consecutive_failures - 3)), 360)
+            cooldown_until = utcnow() + timedelta(minutes=minutes)
         state.health_status = "cooldown" if cooldown_until else "degraded"
-        state.consecutive_failures += 1
         state.last_error = error[:4000]
         state.cooldown_until = cooldown_until
         state.last_poll_at = utcnow()

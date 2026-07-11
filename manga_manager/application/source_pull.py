@@ -11,7 +11,7 @@ import httpx
 from app.adapters import adapter_for_source
 from app.adapters.base import FrontierSentinel, SourceAdapter, SourceRateLimited
 from app.domain import ChapterItem, SeriesItem
-from manga_manager.application.job_handlers import JobContext, RetryableJobError
+from manga_manager.application.job_handlers import JobContext, PermanentJobError, RetryableJobError
 from manga_manager.domain.jobs import SourcePullPayload
 from manga_manager.infrastructure.catalog_repository import CatalogRepository
 from manga_manager.infrastructure.job_queue import JobQueue
@@ -68,16 +68,22 @@ class SourcePullHandler:
         except (httpx.TimeoutException, httpx.NetworkError) as exc:
             self._record_failure(source, str(exc), None)
             raise RetryableJobError("source_network_error", str(exc)) from exc
+        except httpx.HTTPStatusError as exc:
+            self._record_failure(source, str(exc), None)
+            status = exc.response.status_code
+            if 400 <= status < 500 and status not in {408, 429}:
+                raise PermanentJobError("source_http_error", str(exc)) from exc
+            raise RetryableJobError("source_http_error", str(exc)) from exc
         except Exception as exc:
             self._record_failure(source, str(exc), None)
-            raise
+            raise PermanentJobError("source_processing_error", str(exc)) from exc
         finally:
             await adapter.aclose()
 
         if failures and not fetched:
             message = f"all {failures} discovered items failed"
             self._record_failure(source, message, None)
-            raise RetryableJobError("all_items_failed", message)
+            raise PermanentJobError("all_items_failed", message)
 
         for index, row in enumerate(fetched, start=1):
             context.ensure_lease()

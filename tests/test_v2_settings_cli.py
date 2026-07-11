@@ -16,6 +16,11 @@ def test_v2_settings_require_postgresql() -> None:
     ).require_database_url() == "postgresql+psycopg://localhost/test"
 
 
+def test_normal_worker_cannot_enable_asura_concurrency_two() -> None:
+    with pytest.raises(ValueError, match="less than or equal to 1"):
+        V2Settings(asura_download_concurrency=2)
+
+
 def test_cli_exposes_transition_commands() -> None:
     parser = build_parser()
     assert parser.parse_args(["migrate"]).command == "migrate"

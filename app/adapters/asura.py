@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import re
+import httpx
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
 from app.adapters.base import ChapterTemporarilyUnavailable, FrontierSentinel, SourceAdapter
 from app.adapters.http import HttpSourceClient, iter_ordered_bytes, page_concurrency_for_source
-from app.adapters.parsing import clean_chapter_title, extract_image_urls, nearby_cover_attr, parse_source_date
+from app.adapters.parsing import (
+    clean_chapter_title,
+    extract_image_urls,
+    nearby_cover_attr,
+    parse_source_date,
+)
 from app.domain import ChapterItem, SeriesItem, normalize_chapter_number
 from app.settings import settings
 
@@ -33,10 +39,21 @@ class AsuraAdapter(SourceAdapter):
         sentinel_map = {sentinel.source_id: sentinel.latest_chapter for sentinel in sentinels}
         required_hits = min(settings.source_frontier_required_hits, len(sentinel_map))
         hits = 0
-        max_pages = settings.asura_recent_pages if sentinels else min(3, settings.asura_recent_pages)
+        max_pages = (
+            settings.asura_recent_pages if sentinels else min(3, settings.asura_recent_pages)
+        )
         for page in range(1, max_pages + 1):
             path = "/" if page == 1 else f"/page/{page}/"
-            parsed = self.parse_recent_series(await self.client.get_soup(path))
+            try:
+                soup = await self.client.get_soup(path)
+            except httpx.HTTPStatusError as exc:
+                # Asura currently returns 404 when a listing has no next page.  A
+                # successful first page followed by that response is pagination
+                # exhaustion, not provider degradation.
+                if page > 1 and exc.response.status_code == 404:
+                    break
+                raise
+            parsed = self.parse_recent_series(soup)
             if not parsed:
                 break
             items.extend(parsed)
@@ -139,7 +156,11 @@ class AsuraAdapter(SourceAdapter):
                 "type": first_word_after(page_text, "type"),
             }
         )
-        genres = tuple(chip.get_text(" ", strip=True) for chip in soup.select("a[href*='genre'], a[href*='genres']") if chip.get_text(" ", strip=True))
+        genres = tuple(
+            chip.get_text(" ", strip=True)
+            for chip in soup.select("a[href*='genre'], a[href*='genres']")
+            if chip.get_text(" ", strip=True)
+        )
         aliases = parse_aliases(page_text, title)
         return SeriesItem(
             source=source_series.source,
@@ -192,7 +213,9 @@ class AsuraAdapter(SourceAdapter):
         soup = await self.client.get_soup(chapter.url)
         urls = self.parse_chapter_image_urls(soup)
         if not urls and is_premium_or_locked(soup):
-            retry_after = datetime.now(timezone.utc) + timedelta(hours=settings.asura_delay_hours or 1)
+            retry_after = datetime.now(timezone.utc) + timedelta(
+                hours=settings.asura_delay_hours or 1
+            )
             raise ChapterTemporarilyUnavailable("Asura chapter is still premium", retry_after)
         async for page in iter_ordered_bytes(
             self.client,
@@ -204,9 +227,7 @@ class AsuraAdapter(SourceAdapter):
 
     def parse_chapter_image_urls(self, soup) -> list[str]:
         return [
-            url
-            for url in extract_image_urls(soup, self.base_url)
-            if is_asura_chapter_image(url)
+            url for url in extract_image_urls(soup, self.base_url) if is_asura_chapter_image(url)
         ]
 
     @staticmethod
@@ -235,7 +256,9 @@ def dedupe_chapters(items: list[ChapterItem]) -> list[ChapterItem]:
 
 
 def clean_series_title(title: str) -> str:
-    title = re.sub(r"\b(Just now|today|yesterday|last week|\d+\s+\w+\s+ago)\b.*", "", title, flags=re.I)
+    title = re.sub(
+        r"\b(Just now|today|yesterday|last week|\d+\s+\w+\s+ago)\b.*", "", title, flags=re.I
+    )
     title = re.sub(r"\b(Chapter|Ch\.)\s+\d+(?:\.\d+)?\b.*", "", title, flags=re.I)
     title = re.sub(r"^\s*\d+(?:\.\d+)?\s+(?=[A-Z])", "", title)
     return " ".join(title.split())
@@ -255,7 +278,14 @@ def is_premium_or_locked(soup) -> bool:
 
 def is_helper_chapter_link(title: str) -> bool:
     normalized = " ".join((title or "").split()).lower()
-    return normalized in {"first chapter", "latest chapter", "first", "latest", "manhwa", "text mode"}
+    return normalized in {
+        "first chapter",
+        "latest chapter",
+        "first",
+        "latest",
+        "manhwa",
+        "text mode",
+    }
 
 
 def frontier_hits(items: list[SeriesItem], sentinels: dict[str, str]) -> int:
@@ -263,7 +293,11 @@ def frontier_hits(items: list[SeriesItem], sentinels: dict[str, str]) -> int:
     for item in items:
         known = sentinels.get(item.source_id)
         latest = latest_recent_chapter(item)
-        if known is not None and latest is not None and chapter_number_key(latest) <= chapter_number_key(known):
+        if (
+            known is not None
+            and latest is not None
+            and chapter_number_key(latest) <= chapter_number_key(known)
+        ):
             hits += 1
     return hits
 
@@ -315,7 +349,9 @@ def first_word_after(text: str, label: str) -> str:
 
 
 def parse_aliases(text: str, title: str) -> tuple[str, ...]:
-    match = re.search(rf"{re.escape(title)}\s+(.{{10,220}}?)\s+(?:In a world|Read |Bookmark|First Chapter)", text)
+    match = re.search(
+        rf"{re.escape(title)}\s+(.{{10,220}}?)\s+(?:In a world|Read |Bookmark|First Chapter)", text
+    )
     if not match:
         return ()
     aliases = [
