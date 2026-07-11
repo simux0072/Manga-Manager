@@ -1,16 +1,12 @@
 from __future__ import annotations
 
-import asyncio
-import json
-from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, Form, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, RedirectResponse, StreamingResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import FileResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-from sqlalchemy import delete, func, or_, select, update
-from sqlalchemy.orm import Session, aliased, sessionmaker
+from sqlalchemy import delete, select, update
+from sqlalchemy.orm import Session, sessionmaker
 
 from manga_manager.infrastructure.database import create_database_engine, create_session_factory
 from manga_manager.infrastructure.db_models import (
@@ -22,541 +18,69 @@ from manga_manager.infrastructure.db_models import (
     CatalogSeries,
     CatalogSeriesAlias,
     CatalogSourceSeries,
-    CatalogSourceState,
-    JobEvent,
-    JobPermit,
     ChapterArtifact,
     LibraryProjection,
-    WorkerHeartbeat,
-    WorkJob,
 )
-from manga_manager.domain.jobs import JobKind, JobState, MaintenancePayload, SourcePullPayload
-from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.settings import V2Settings
+from manga_manager.web.api import create_api_router
 
 
-ROOT = Path(__file__).resolve().parent
-templates = Jinja2Templates(directory=ROOT / "templates")
+ROOT = Path(__file__).parents[2]
+PAGE_PATHS = ("/", "/discovery", "/library", "/updates", "/matches", "/activity", "/operations")
 
 
 def create_app(session_factory: sessionmaker[Session] | None = None) -> FastAPI:
-    app = FastAPI(title="Manga Manager", version="2")
-    app.mount(
-        "/static",
-        StaticFiles(directory=Path(__file__).parents[2] / "app" / "static"),
-        name="static",
-    )
+    application = FastAPI(title="Manga Manager", version="2")
+    resolved_factory = session_factory
 
-    async def sessions():
-        factory = session_factory
-        if factory is None:
+    def get_session_factory() -> sessionmaker[Session]:
+        nonlocal resolved_factory
+        if resolved_factory is None:
             settings = V2Settings()
-            factory = create_session_factory(
+            resolved_factory = create_session_factory(
                 create_database_engine(settings.require_database_url())
             )
-        with factory() as session:
-            yield session
+        return resolved_factory
 
-    @app.get("/healthz")
-    async def health(session: Session = Depends(sessions)) -> dict[str, object]:
-        session.execute(select(1))
+    application.include_router(create_api_router(get_session_factory))
+    frontend = ROOT / "frontend" / "dist"
+    if (frontend / "assets").exists():
+        application.mount(
+            "/assets", StaticFiles(directory=frontend / "assets"), name="frontend-assets"
+        )
+
+    if (frontend / "index.html").exists():
+
+        async def react_page() -> FileResponse:
+            return FileResponse(frontend / "index.html")
+
+        for path in PAGE_PATHS:
+            application.add_api_route(path, react_page, methods=["GET"], include_in_schema=False)
+
+    @application.get("/healthz")
+    async def health() -> dict[str, object]:
+        with get_session_factory()() as session:
+            session.execute(select(1))
         return {"ok": True, "architecture": "postgresql-v2"}
 
-    @app.get("/", response_class=HTMLResponse)
-    @app.get("/discovery", response_class=HTMLResponse)
-    async def discovery(
-        request: Request,
-        cursor: str = Query(default="", max_length=80),
-        q: str = Query(default="", max_length=200),
-        source: str = Query(default="", max_length=50),
-        session: Session = Depends(sessions),
-    ) -> HTMLResponse:
-        query = select(CatalogSeries)
-        if cursor:
-            cursor_time, cursor_id = decode_cursor(cursor)
-            if cursor_time is None:
-                query = query.where(
-                    CatalogSeries.latest_release_at.is_(None), CatalogSeries.id < cursor_id
-                )
-            else:
-                query = query.where(
-                    or_(
-                        CatalogSeries.latest_release_at < cursor_time,
-                        CatalogSeries.latest_release_at.is_(None),
-                        (
-                            (CatalogSeries.latest_release_at == cursor_time)
-                            & (CatalogSeries.id < cursor_id)
-                        ),
-                    )
-                )
-        if q.strip():
-            term = f"%{q.strip()}%"
-            query = query.where(
-                or_(CatalogSeries.title.ilike(term), CatalogSeries.normalized_title.ilike(term))
-            )
-        if source:
-            from manga_manager.infrastructure.db_models import CatalogSourceSeries
-
-            query = query.join(
-                CatalogSourceSeries, CatalogSourceSeries.series_id == CatalogSeries.id
-            ).where(CatalogSourceSeries.source == source)
-        rows = session.scalars(
-            query.order_by(
-                CatalogSeries.latest_release_at.desc().nullslast(), CatalogSeries.id.desc()
-            ).limit(25)
-        ).all()
-        context = {
-            "request": request,
-            "series": rows,
-            "next_cursor": encode_cursor(rows[-1].latest_release_at, rows[-1].id)
-            if len(rows) == 25
-            else None,
-            "q": q,
-            "source": source,
-            "section": "discovery",
-        }
-        template = (
-            "_series_grid.html" if request.headers.get("HX-Request") == "true" else "discovery.html"
-        )
-        return templates.TemplateResponse(request, template, context)
-
-    @app.get("/library", response_class=HTMLResponse)
-    async def library(
-        request: Request,
-        view: str = Query(default="grid", pattern="^(grid|list)$"),
-        state: str = Query(default=""),
-        cursor: str = Query(default="", max_length=80),
-        q: str = Query(default="", max_length=200),
-        source: str = Query(default="", max_length=50),
-        session: Session = Depends(sessions),
-    ) -> HTMLResponse:
-        query = select(CatalogSeries).where(CatalogSeries.status != "untracked")
-        if state:
-            query = query.where(CatalogSeries.status == state)
-        if q.strip():
-            term = f"%{q.strip()}%"
-            query = query.where(
-                or_(CatalogSeries.title.ilike(term), CatalogSeries.normalized_title.ilike(term))
-            )
-        if source:
-            query = query.join(
-                CatalogSourceSeries, CatalogSourceSeries.series_id == CatalogSeries.id
-            ).where(CatalogSourceSeries.source == source)
-        if cursor:
-            cursor_time, cursor_id = decode_cursor(cursor)
-            if cursor_time is None:
-                raise HTTPException(422, "invalid library cursor")
-            query = query.where(
-                or_(
-                    CatalogSeries.updated_at < cursor_time,
-                    (CatalogSeries.updated_at == cursor_time) & (CatalogSeries.id < cursor_id),
-                )
-            )
-        rows = session.scalars(
-            query.order_by(CatalogSeries.updated_at.desc(), CatalogSeries.id.desc()).limit(50)
-        ).all()
-        progress = dict(
-            session.execute(
-                select(CatalogChapter.series_id, func.count())
-                .join(
-                    CatalogChapterReadingState,
-                    CatalogChapterReadingState.chapter_id == CatalogChapter.id,
-                )
-                .where(CatalogChapterReadingState.status == "read")
-                .where(CatalogChapter.series_id.in_([row.id for row in rows] or [-1]))
-                .group_by(CatalogChapter.series_id)
-            ).all()
-        )
-        context = {
-            "series": rows,
-            "section": "library",
-            "view": view,
-            "state": state,
-            "q": q,
-            "source": source,
-            "progress": progress,
-            "next_cursor": encode_cursor(rows[-1].updated_at, rows[-1].id)
-            if len(rows) == 50
-            else None,
-        }
-        return templates.TemplateResponse(
-            request,
-            "_library_grid.html"
-            if request.headers.get("HX-Request") == "true"
-            else "library.html",
-            context,
-        )
-
-    @app.get("/updates", response_class=HTMLResponse)
-    async def updates(
-        request: Request,
-        cursor: str = Query(default="", max_length=80),
-        session: Session = Depends(sessions),
-    ) -> HTMLResponse:
-        query = (
-            select(
-                CatalogChapterRelease,
-                CatalogChapter,
-                CatalogSeries,
-                CatalogChapterReadingState,
-            )
-            .join(CatalogChapter, CatalogChapter.id == CatalogChapterRelease.chapter_id)
-            .join(CatalogSeries, CatalogSeries.id == CatalogChapter.series_id)
-            .outerjoin(
-                CatalogChapterReadingState,
-                CatalogChapterReadingState.chapter_id == CatalogChapter.id,
-            )
-        )
-        release_time = func.coalesce(
-            CatalogChapterRelease.published_at, CatalogChapterRelease.first_seen_at
-        )
-        if cursor:
-            cursor_time, cursor_id = decode_cursor(cursor)
-            if cursor_time is None:
-                raise HTTPException(422, "invalid updates cursor")
-            query = query.where(
-                or_(
-                    release_time < cursor_time,
-                    (release_time == cursor_time) & (CatalogChapterRelease.id < cursor_id),
-                )
-            )
-        rows = session.execute(
-            query.order_by(
-                release_time.desc(),
-                CatalogChapterRelease.id.desc(),
-            ).limit(50)
-        ).all()
-        return templates.TemplateResponse(
-            request,
-            "updates.html",
-            {
-                "rows": rows,
-                "next_cursor": encode_cursor(
-                    rows[-1][0].published_at or rows[-1][0].first_seen_at,
-                    rows[-1][0].id,
-                )
-                if len(rows) == 50
-                else None,
-                "section": "updates",
-            },
-        )
-
-    @app.get("/matches", response_class=HTMLResponse)
-    async def matches(request: Request, session: Session = Depends(sessions)) -> HTMLResponse:
-        left = aliased(CatalogSourceSeries)
-        right = aliased(CatalogSourceSeries)
-        rows = session.execute(
-            select(CatalogMatchDecision, left, right)
-            .join(left, left.id == CatalogMatchDecision.left_source_series_id)
-            .join(right, right.id == CatalogMatchDecision.right_source_series_id)
-            .where(CatalogMatchDecision.decision == "pending")
-            .order_by(CatalogMatchDecision.confidence.desc(), CatalogMatchDecision.id)
-            .limit(100)
-        ).all()
-        return templates.TemplateResponse(
-            request, "matches.html", {"rows": rows, "section": "matches"}
-        )
-
-    @app.post("/matches/{decision_id}/decision")
-    async def decide_match(
-        request: Request,
-        decision_id: int,
-        decision: str = Form(),
-        confirmation: str = Form(default=""),
-        session: Session = Depends(sessions),
-    ):
-        if decision not in {"accepted", "rejected"}:
-            raise HTTPException(422, "invalid match decision")
-        if decision == "accepted" and confirmation != "MERGE":
-            raise HTTPException(422, "type MERGE to confirm")
-        with session.begin():
-            row = session.get(CatalogMatchDecision, decision_id)
-            if row is None:
-                raise HTTPException(404, "match decision not found")
-            if decision == "accepted":
-                merge_match_groups(session, row)
-            row.decision = decision
-            row.decided_by = "operator"
-            row.decided_at = func.now()
-        if request.headers.get("HX-Request") == "true":
-            return HTMLResponse("")
-        return RedirectResponse("/matches", status_code=303)
-
-    @app.post("/matches/batch")
-    async def decide_matches_batch(
-        request: Request,
-        decision_ids: list[int] = Form(),
-        decision: str = Form(),
-        confirmation: str = Form(default=""),
-        session: Session = Depends(sessions),
-    ):
-        if decision not in {"accepted", "rejected"} or not decision_ids:
-            raise HTTPException(422, "select matches and a valid decision")
-        if decision == "accepted" and confirmation != "MERGE":
-            raise HTTPException(422, "type MERGE to confirm")
-        with session.begin():
-            rows = session.scalars(
-                select(CatalogMatchDecision)
-                .where(CatalogMatchDecision.id.in_(decision_ids))
-                .order_by(CatalogMatchDecision.id)
-            ).all()
-            if len(rows) != len(set(decision_ids)):
-                raise HTTPException(404, "one or more match decisions are missing")
-            if decision == "accepted":
-                for row in rows:
-                    left = session.get(CatalogSourceSeries, row.left_source_series_id)
-                    right = session.get(CatalogSourceSeries, row.right_source_series_id)
-                    if left is None or right is None:
-                        raise HTTPException(409, "one match identity no longer exists")
-                    left_sources = set(
-                        session.scalars(
-                            select(CatalogSourceSeries.source).where(
-                                CatalogSourceSeries.series_id == left.series_id
-                            )
-                        ).all()
-                    )
-                    right_sources = set(
-                        session.scalars(
-                            select(CatalogSourceSeries.source).where(
-                                CatalogSourceSeries.series_id == right.series_id
-                            )
-                        ).all()
-                    )
-                    if left_sources.intersection(right_sources):
-                        raise HTTPException(409, "batch merge would duplicate a provider")
-                for row in rows:
-                    merge_match_groups(session, row)
-            for row in rows:
-                row.decision = decision
-                row.decided_by = "operator"
-                row.decided_at = func.now()
-        if request.headers.get("HX-Request") == "true":
-            return HTMLResponse("")
-        return RedirectResponse("/matches", status_code=303)
-
-    @app.get("/activity", response_class=HTMLResponse)
-    async def activity(
-        request: Request,
-        event_type: str = Query(default="", max_length=30),
-        session: Session = Depends(sessions),
-    ) -> HTMLResponse:
-        query = select(JobEvent)
-        if event_type:
-            query = query.where(JobEvent.event_type == event_type)
-        events = session.scalars(query.order_by(JobEvent.id.desc()).limit(200)).all()
-        return templates.TemplateResponse(
-            request,
-            "activity.html",
-            {"events": events, "event_type": event_type, "section": "activity"},
-        )
-
-    @app.post("/series/{series_id}/state")
-    async def reading_state(
-        request: Request,
-        series_id: int,
-        state: str = Form(),
-        session: Session = Depends(sessions),
-    ):
-        allowed = {"untracked", "interested", "reading", "caught_up", "paused"}
-        if state not in allowed:
-            raise HTTPException(422, "invalid reading state")
-        with session.begin():
-            series = session.get(CatalogSeries, series_id)
-            if series is None:
-                raise HTTPException(404, "series not found")
-            series.status = state
-            series.updated_at = datetime.now(timezone.utc)
-        if request.headers.get("HX-Request") == "true":
-            return templates.TemplateResponse(
-                request, "_series_state.html", {"item": series}
-            )
-        return RedirectResponse("/library", status_code=303)
-
-    @app.post("/chapters/{chapter_id}/state")
-    async def chapter_reading_state(
-        request: Request,
-        chapter_id: int,
-        state: str = Form(),
-        session: Session = Depends(sessions),
-    ):
-        if state not in {"unread", "reading", "read"}:
-            raise HTTPException(422, "invalid chapter reading state")
-        with session.begin():
-            chapter = session.get(CatalogChapter, chapter_id)
-            if chapter is None:
-                raise HTTPException(404, "chapter not found")
-            row = session.get(CatalogChapterReadingState, chapter_id)
-            if row is None:
-                row = CatalogChapterReadingState(chapter_id=chapter_id)
-                session.add(row)
-            row.status = state
-            row.read_at = datetime.now(timezone.utc) if state == "read" else None
-            row.updated_at = datetime.now(timezone.utc)
-        if request.headers.get("HX-Request") == "true":
-            return templates.TemplateResponse(
-                request, "_chapter_state.html", {"chapter": chapter, "reading": row}
-            )
-        return RedirectResponse("/updates", status_code=303)
-
-    @app.get("/operations", response_class=HTMLResponse)
-    async def operations(request: Request, session: Session = Depends(sessions)) -> HTMLResponse:
-        counts = dict(
-            session.execute(select(WorkJob.status, func.count()).group_by(WorkJob.status)).all()
-        )
-        jobs = session.scalars(select(WorkJob).order_by(WorkJob.updated_at.desc()).limit(100)).all()
-        sources = session.scalars(
-            select(CatalogSourceState).order_by(CatalogSourceState.source)
-        ).all()
-        workers = session.scalars(
-            select(WorkerHeartbeat).order_by(WorkerHeartbeat.heartbeat_at.desc())
-        ).all()
-        permits = session.scalars(select(JobPermit).order_by(JobPermit.pool, JobPermit.id)).all()
-        health = {
-            "series": session.scalar(select(func.count()).select_from(CatalogSeries)) or 0,
-            "chapters": session.scalar(select(func.count()).select_from(CatalogChapter)) or 0,
-            "active_artifacts": session.scalar(
-                select(func.count())
-                .select_from(ChapterArtifact)
-                .where(ChapterArtifact.state == "active")
-            )
-            or 0,
-            "missing_projections": session.scalar(
-                select(func.count())
-                .select_from(ChapterArtifact)
-                .outerjoin(LibraryProjection, LibraryProjection.artifact_id == ChapterArtifact.id)
-                .where(ChapterArtifact.state == "active", LibraryProjection.artifact_id.is_(None))
-            )
-            or 0,
-        }
-        return templates.TemplateResponse(
-            request,
-            "operations.html",
-            {
-                "counts": counts,
-                "jobs": jobs,
-                "sources": sources,
-                "workers": workers,
-                "permits": permits,
-                "health": health,
-                "section": "operations",
-            },
-        )
-
-    @app.post("/operations/sources/{source}/pull")
-    async def operation_pull_source(
-        request: Request, source: str, session: Session = Depends(sessions)
-    ):
-        if source not in {"asura", "mangafire", "kingofshojo"}:
-            raise HTTPException(422, "invalid source")
-        with session.begin():
-            job, _ = JobQueue().enqueue(
-                session,
-                kind=JobKind.SOURCE_PULL,
-                dedupe_key=f"source:{source}",
-                payload=SourcePullPayload(source=source),
-                priority=10,
-            )
-        if request.headers.get("HX-Request") == "true":
-            return HTMLResponse(f"<span class='state-chip'>Queued job {job.id}</span>")
-        return RedirectResponse("/operations", status_code=303)
-
-    @app.post("/operations/probe")
-    async def operation_probe(request: Request, session: Session = Depends(sessions)):
-        with session.begin():
-            job, _ = JobQueue().enqueue(
-                session,
-                kind=JobKind.MAINTENANCE,
-                dedupe_key="operations-probe",
-                payload=MaintenancePayload(action="stage_probe"),
-                priority=1,
-            )
-        if request.headers.get("HX-Request") == "true":
-            return HTMLResponse(f"<span class='state-chip'>Queued probe {job.id}</span>")
-        return RedirectResponse("/operations", status_code=303)
-
-    @app.post("/operations/jobs/{job_id}/retry")
-    async def operation_retry_job(
-        request: Request, job_id: int, session: Session = Depends(sessions)
-    ):
-        with session.begin():
-            job = session.get(WorkJob, job_id)
-            if job is None or job.status not in {
-                JobState.FAILED.value,
-                JobState.CANCELLED.value,
-            }:
-                raise HTTPException(409, "job cannot be retried")
-            job.status = JobState.QUEUED.value
-            job.attempts = 0
-            job.available_at = datetime.now(timezone.utc)
-            job.lease_owner = ""
-            job.lease_expires_at = None
-            job.error_code = ""
-            job.error_message = ""
-            job.completed_at = None
-            job.updated_at = datetime.now(timezone.utc)
-        if request.headers.get("HX-Request") == "true":
-            return HTMLResponse("<span class='state-chip'>Queued</span>")
-        return RedirectResponse("/operations", status_code=303)
-    @app.get("/events/jobs")
-    async def job_events(
-        request: Request, after: int = Query(default=0, ge=0)
-    ) -> StreamingResponse:
-        async def stream():
-            cursor = after
-            while not await request.is_disconnected():
-                factory = session_factory
-                if factory is None:
-                    settings = V2Settings()
-                    factory = create_session_factory(
-                        create_database_engine(settings.require_database_url())
-                    )
-                with factory() as session:
-                    events = session.scalars(
-                        select(JobEvent)
-                        .where(JobEvent.id > cursor)
-                        .order_by(JobEvent.id)
-                        .limit(100)
-                    ).all()
-                    for event in events:
-                        cursor = event.id
-                        data = {
-                            "event_id": event.id,
-                            "id": event.job_id,
-                            "state": event.status,
-                            "message": event.message,
-                            "timestamp": event.created_at.isoformat(),
-                        }
-                        yield f"id: {event.id}\nevent: job\ndata: {json.dumps(data)}\n\n"
-                    if events:
-                        counts = dict(
-                            session.execute(
-                                select(WorkJob.status, func.count()).group_by(WorkJob.status)
-                            ).all()
-                        )
-                        yield f"event: counts\ndata: {json.dumps(counts)}\n\n"
-                    else:
-                        yield ": heartbeat\n\n"
-                await asyncio.sleep(2)
-
-        return StreamingResponse(
-            stream(),
-            media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-        )
-
-    # Preserve common legacy bookmarks.
-    async def redirect_library():
+    async def redirect_library() -> RedirectResponse:
         return RedirectResponse("/library", 308)
 
-    async def redirect_operations():
+    async def redirect_operations() -> RedirectResponse:
         return RedirectResponse("/operations", 308)
 
-    async def redirect_updates():
+    async def redirect_updates() -> RedirectResponse:
         return RedirectResponse("/updates", 308)
 
-    app.add_api_route("/new", redirect_updates, methods=["GET"])
-    app.add_api_route("/info", redirect_operations, methods=["GET"])
-    return app
+    async def redirect_events() -> RedirectResponse:
+        return RedirectResponse("/api/v2/events", 307)
+
+    application.add_api_route("/new", redirect_updates, methods=["GET"])
+    application.add_api_route("/new-chapters", redirect_updates, methods=["GET"])
+    application.add_api_route("/info", redirect_operations, methods=["GET"])
+    application.add_api_route("/catalog", redirect_library, methods=["GET"])
+    application.add_api_route("/events/jobs", redirect_events, methods=["GET"])
+    return application
 
 
 app = create_app()
@@ -694,25 +218,3 @@ def merge_match_groups(session: Session, decision: CatalogMatchDecision) -> None
             target_series.latest_release_source = source_series.latest_release_source
     if source_series is not None:
         session.delete(source_series)
-
-
-def encode_cursor(value: datetime | None, row_id: int) -> str:
-    if value is None:
-        return f"0-{row_id}"
-    if value.tzinfo is None:
-        value = value.replace(tzinfo=timezone.utc)
-    return f"{int(value.timestamp() * 1_000_000)}-{row_id}"
-
-
-def decode_cursor(value: str) -> tuple[datetime | None, int]:
-    try:
-        micros_text, row_id_text = value.split("-", 1)
-        micros = int(micros_text)
-        row_id = int(row_id_text)
-        if micros < 0 or row_id < 1:
-            raise ValueError
-    except ValueError as exc:
-        raise HTTPException(422, "invalid cursor") from exc
-    if micros == 0:
-        return None, row_id
-    return datetime.fromtimestamp(micros / 1_000_000, tz=timezone.utc), row_id

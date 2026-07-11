@@ -1,0 +1,10 @@
+export type Source = {name:string; title:string; url:string}
+export type Series = {id:number; title:string; description:string; cover_url:string; status:string; integrity_state:string; latest_chapter:string; latest_source:string; latest_at:string|null; sources:Source[]; aliases:string[]; chapter_count:number; read_count:number; unread_count:number}
+export type Chapter = {id:number; number:string; title:string; source:string; url:string; released_at:string; reading_status:string}
+export type UpdateSeries = Series & {unread_chapters:Chapter[]}
+export type Page<T,C=string> = {items:T[]; next_cursor:C|null}
+export type Job = {id:number; kind:string; description:string; source:string; pool:string; status:string; attempt:number; max_attempts:number; error_code:string; error_message:string; available_at:string; created_at:string; updated_at:string; completed_at:string|null; context:{series_id?:number;title?:string;cover_url?:string;chapter?:string}}
+export type MatchSide = Series & {source_title:string;source:string;url:string}
+export type Match = {id:number;confidence:number;evidence:{tone:string;label:string}[];left:MatchSide;right:MatchSide}
+export type ActivityEvent = {id:number;job:Job;type:string;status:string;message:string;details:Record<string,unknown>;created_at:string}
+export type Operations = {job_counts:Record<string,number>;health:Record<string,number>;sources:{source:string;status:string;failures:number;last_error:string;last_poll_at:string|null;cooldown_until:string|null;enabled:boolean}[];workers:{id:string;status:string;active_job_id:number|null;heartbeat_at:string;metadata:Record<string,unknown>}[];permits:Record<string,number>}

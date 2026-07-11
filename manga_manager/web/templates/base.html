@@ -1,8 +1,0 @@
-<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>{% block title %}Manga Manager{% endblock %}</title><link rel="stylesheet" href="/static/styles.css"><script defer src="/static/htmx.min.js"></script></head>
-<body><aside class="sidebar"><a href="/discovery">Discover</a><a href="/library">Library</a><a href="/updates">Updates</a><a href="/matches">Matches</a><a href="/activity">Activity</a><a href="/operations">Operations</a></aside>
-<header class="topbar"><strong>Manga Manager</strong><span>PostgreSQL v2</span></header>
-<main class="content">{% block content %}{% endblock %}</main>
-<nav class="bottom-nav"><a href="/discovery">Discover</a><a href="/library">Library</a><a href="/updates">Updates</a><a href="/operations">Ops</a></nav>
-<button id="job-toggle" class="job-toggle" aria-controls="job-drawer" aria-expanded="false">Jobs <span id="job-count">0</span></button><aside id="job-drawer" class="job-drawer" hidden><h2>Job activity</h2><div id="job-events"></div></aside><script defer src="/static/v2.js"></script>{% block scripts %}{% endblock %}</body></html>

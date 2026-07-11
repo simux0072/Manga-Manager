@@ -1,19 +1,19 @@
-from __future__ import annotations
+from datetime import datetime, timedelta, timezone
 
 import httpx
-from datetime import datetime, timezone
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from manga_manager.infrastructure.db_models import (
     CatalogChapter,
-    CatalogChapterRelease,
     CatalogChapterReadingState,
+    CatalogChapterRelease,
     CatalogMatchDecision,
     CatalogSeries,
     CatalogSourceSeries,
     JobBase,
     JobEvent,
+    WorkerHeartbeat,
     WorkJob,
 )
 from manga_manager.web.app import create_app
@@ -31,9 +31,16 @@ def app_with_catalog():
         one = CatalogSeries(
             title="A Very Long Example Manga Title",
             normalized_title="a very long example manga title",
+            description="A painter explores impossible dungeons",
+            cover_url="https://images.test/one.jpg",
             status="untracked",
         )
-        two = CatalogSeries(title="Tracked", normalized_title="tracked", status="reading")
+        two = CatalogSeries(
+            title="Tracked",
+            normalized_title="tracked",
+            cover_url="https://images.test/two.jpg",
+            status="reading",
+        )
         session.add_all([one, two])
         session.flush()
         first_source = CatalogSourceSeries(
@@ -75,7 +82,7 @@ def app_with_catalog():
                 left_source_series_id=first_source.id,
                 right_source_series_id=second_source.id,
                 confidence=0.92,
-                evidence_json={"title": "similar"},
+                evidence_json={"title_or_alias": True, "cover_match": False},
             )
         )
         job = WorkJob(kind="maintenance", dedupe_key="web-test", payload={})
@@ -85,81 +92,126 @@ def app_with_catalog():
     return create_app(sessions), sessions
 
 
-async def test_discovery_search_source_and_fragment() -> None:
+async def test_health_and_legacy_bookmarks() -> None:
     app, _ = app_with_catalog()
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
-        response = await client.get("/discovery", params={"q": "long", "source": "asura"})
-        fragment = await client.get("/discovery", headers={"HX-Request": "true"})
-    assert response.status_code == 200
-    assert "A Very Long Example" in response.text
-    assert "<!doctype html>" not in fragment.text
-
-
-async def test_library_state_progressive_post_and_redirects() -> None:
-    app, sessions = app_with_catalog()
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
-    ) as client:
-        library = await client.get("/library")
-        with sessions() as session:
-            series_id = session.query(CatalogSeries).filter_by(title="Tracked").one().id
-        response = await client.post(
-            f"/series/{series_id}/state", data={"state": "caught_up"}, follow_redirects=False
-        )
+        health = await client.get("/healthz")
         redirect = await client.get("/info", follow_redirects=False)
-    assert "Tracked" in library.text
-    assert response.status_code == 303
-    with sessions() as session:
-        assert session.get(CatalogSeries, series_id).status == "caught_up"
+    assert health.json() == {"ok": True, "architecture": "postgresql-v2"}
     assert redirect.headers["location"] == "/operations"
 
 
-async def test_operations_and_health() -> None:
-    app, _ = app_with_catalog()
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
-    ) as client:
-        assert (await client.get("/healthz")).json()["architecture"] == "postgresql-v2"
-        operations = await client.get("/operations")
-        probe = await client.post("/operations/probe", headers={"HX-Request": "true"})
-        assert operations.status_code == 200
-        assert "missing_projections" in operations.text
-        assert "Queued probe" in probe.text
-
-
-async def test_updates_matches_activity_and_library_modes() -> None:
+async def test_discovery_searches_description_and_uses_multi_source_or() -> None:
     app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        row = session.query(CatalogSeries).filter_by(status="untracked").one()
+        session.add(
+            CatalogSourceSeries(
+                series_id=row.id,
+                source="kingofshojo",
+                source_id="second-identity",
+                title=row.title,
+                normalized_title=row.normalized_title,
+                url="https://example.test/king",
+            )
+        )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
-        assert "Chapter 1" in (await client.get("/updates")).text
-        matches = await client.get("/matches")
-        assert "92%" in matches.text
-        assert "enqueued" in (await client.get("/activity")).text
-        assert (await client.get("/library", params={"view": "list"})).status_code == 200
-        with sessions() as session:
-            decision_id = session.query(CatalogMatchDecision).one().id
-        rejected = await client.post(
-            f"/matches/{decision_id}/decision",
-            data={"decision": "rejected"},
-            follow_redirects=False,
+        response = await client.get(
+            "/api/v2/discovery",
+            params=[("q", "dungeons"), ("source", "asura"), ("source", "mangafire")],
         )
-        assert rejected.status_code == 303
+    assert [item["title"] for item in response.json()["items"]] == [
+        "A Very Long Example Manga Title"
+    ]
+    assert {source["name"] for source in response.json()["items"][0]["sources"]} == {
+        "asura",
+        "kingofshojo",
+    }
 
 
-async def test_merge_decision_requires_explicit_confirmation() -> None:
+async def test_tracking_moves_series_between_discovery_and_library() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session:
+        series_id = session.query(CatalogSeries).filter_by(status="untracked").one().id
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        tracked = await client.patch(f"/api/v2/series/{series_id}", json={"status": "interested"})
+        discovery = await client.get("/api/v2/discovery")
+        library = await client.get("/api/v2/library")
+    assert tracked.json()["previous"] == "untracked"
+    assert series_id not in {item["id"] for item in discovery.json()["items"]}
+    assert series_id in {item["id"] for item in library.json()["items"]}
+
+
+async def test_updates_group_unread_tracked_chapters_by_series() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        series = session.query(CatalogSeries).filter_by(title="Tracked").one()
+        source = session.query(CatalogSourceSeries).filter_by(series_id=series.id).one()
+        second = CatalogChapter(
+            series_id=series.id, canonical_number="2", display_number="2", title="Next"
+        )
+        session.add(second)
+        session.flush()
+        session.add(
+            CatalogChapterRelease(
+                chapter_id=second.id,
+                source_series_id=source.id,
+                source="mangafire",
+                source_release_id="2",
+                title="Chapter 2",
+                url="https://example.test/tracked/2",
+                published_at=datetime(2026, 7, 11, tzinfo=timezone.utc),
+            )
+        )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/api/v2/updates")
+    assert len(response.json()["items"]) == 1
+    assert [chapter["number"] for chapter in response.json()["items"][0]["unread_chapters"]] == [
+        "2",
+        "1",
+    ]
+
+
+async def test_chapter_and_bulk_read_state() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session:
+        chapter = session.query(CatalogChapter).one()
+        chapter_id, series_id = chapter.id, chapter.series_id
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        assert (
+            await client.patch(f"/api/v2/chapters/{chapter_id}", json={"status": "reading"})
+        ).status_code == 200
+        assert (await client.post(f"/api/v2/series/{series_id}/chapters/read")).status_code == 200
+    with sessions() as session:
+        assert session.get(CatalogChapterReadingState, chapter_id).status == "read"
+
+
+async def test_matches_return_human_evidence_and_require_confirmation() -> None:
     app, sessions = app_with_catalog()
     with sessions() as session:
         decision_id = session.query(CatalogMatchDecision).one().id
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
-        response = await client.post(
-            f"/matches/{decision_id}/decision", data={"decision": "accepted"}
+        matches = await client.get("/api/v2/matches")
+        rejected = await client.post(
+            f"/api/v2/matches/{decision_id}", json={"decision": "accepted"}
         )
-        assert response.status_code == 422
+    labels = {row["label"] for row in matches.json()["items"][0]["evidence"]}
+    assert "Strong title or alias match" in labels
+    assert "Cover mismatch" in labels
+    assert rejected.status_code == 422
+    assert "evidence_json" not in matches.text
 
 
 async def test_confirmed_match_merges_complete_groups() -> None:
@@ -170,78 +222,50 @@ async def test_confirmed_match_merges_complete_groups() -> None:
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         response = await client.post(
-            f"/matches/{decision_id}/decision",
-            data={"decision": "accepted", "confirmation": "MERGE"},
-            follow_redirects=False,
-        )
-    assert response.status_code == 303
-    with sessions() as session:
-        assert session.query(CatalogSeries).count() == 1
-        assert {row.series_id for row in session.query(CatalogSourceSeries).all()} == {
-            session.query(CatalogSeries).one().id
-        }
-        assert session.query(CatalogMatchDecision).one().decision == "accepted"
-
-
-async def test_chapter_read_state_and_series_state_return_fragments() -> None:
-    app, sessions = app_with_catalog()
-    with sessions() as session:
-        chapter_id = session.query(CatalogChapter).one().id
-        series_id = session.query(CatalogSeries).filter_by(title="Tracked").one().id
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
-    ) as client:
-        chapter = await client.post(
-            f"/chapters/{chapter_id}/state",
-            data={"state": "read"},
-            headers={"HX-Request": "true"},
-        )
-        series = await client.post(
-            f"/series/{series_id}/state",
-            data={"state": "caught_up"},
-            headers={"HX-Request": "true"},
-        )
-    assert 'id="chapter-state-' in chapter.text
-    assert ">read<" in chapter.text
-    assert 'id="series-state-' in series.text
-    with sessions() as session:
-        assert session.get(CatalogChapterReadingState, chapter_id).status == "read"
-
-
-async def test_library_cursor_fragment_preserves_filter_parameters() -> None:
-    app, sessions = app_with_catalog()
-    with sessions() as session, session.begin():
-        for index in range(55):
-            session.add(
-                CatalogSeries(
-                    title=f"Extra {index}",
-                    normalized_title=f"extra {index}",
-                    status="reading",
-                )
-            )
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
-    ) as client:
-        response = await client.get(
-            "/library",
-            params={"state": "reading", "q": ""},
-            headers={"HX-Request": "true"},
-        )
-    assert "<!doctype html>" not in response.text
-    assert "state=reading" in response.text
-
-
-async def test_batch_match_rejection_returns_empty_fragment() -> None:
-    app, sessions = app_with_catalog()
-    with sessions() as session:
-        decision_id = session.query(CatalogMatchDecision).one().id
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://test"
-    ) as client:
-        response = await client.post(
-            "/matches/batch",
-            data={"decision_ids": str(decision_id), "decision": "rejected"},
-            headers={"HX-Request": "true"},
+            f"/api/v2/matches/{decision_id}",
+            json={"decision": "accepted", "confirmation": "MERGE"},
         )
     assert response.status_code == 200
-    assert response.text == ""
+    with sessions() as session:
+        assert session.query(CatalogSeries).count() == 1
+        assert len({row.series_id for row in session.query(CatalogSourceSeries).all()}) == 1
+
+
+async def test_jobs_activity_and_operations_have_human_context() -> None:
+    app, _ = app_with_catalog()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        jobs = await client.get("/api/v2/jobs")
+        activity = await client.get("/api/v2/activity")
+        operations = await client.get("/api/v2/operations")
+        probe = await client.post("/api/v2/probe")
+    description = "Run storage and database health probe"
+    assert jobs.json()["items"][0]["description"] == description
+    assert activity.json()["items"][0]["job"]["description"] == description
+    assert operations.json()["health"]["series"] == 2
+    assert probe.status_code == 200
+
+
+async def test_operations_hides_stale_worker_processes() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        session.add_all(
+            [
+                WorkerHeartbeat(
+                    worker_id="current-worker",
+                    status="running",
+                    heartbeat_at=datetime.now(timezone.utc),
+                ),
+                WorkerHeartbeat(
+                    worker_id="old-process",
+                    status="stopped",
+                    heartbeat_at=datetime.now(timezone.utc) - timedelta(hours=1),
+                ),
+            ]
+        )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/api/v2/operations")
+    assert [row["id"] for row in response.json()["workers"]] == ["current-worker"]

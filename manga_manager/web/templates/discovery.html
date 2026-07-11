@@ -1,3 +1,0 @@
-{% extends "base.html" %}{% block title %}Discovery · Manga Manager{% endblock %}{% block content %}
-<form method="get" class="filters"><input name="q" value="{{ q }}" placeholder="Search catalog"><select name="source"><option value="">All sources</option>{% for value in ['asura','mangafire','kingofshojo'] %}<option value="{{ value }}" {% if source == value %}selected{% endif %}>{{ value }}</option>{% endfor %}</select><button>Search</button></form>
-<section id="series-grid" class="cover-grid">{% include "_series_grid.html" %}</section>{% endblock %}

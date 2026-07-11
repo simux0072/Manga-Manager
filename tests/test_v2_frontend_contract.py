@@ -1,31 +1,35 @@
 from pathlib import Path
 
 
-def test_official_htmx_is_vendored_with_license() -> None:
-    runtime = Path("app/static/htmx.min.js").read_text()
-    license_text = Path("app/static/HTMX-LICENSE.txt").read_text()
-    assert len(runtime) > 50_000
-    assert runtime.startswith("var htmx=")
-    assert "Zero-Clause BSD" in license_text
+def test_react_frontend_replaces_htmx_templates() -> None:
+    package = Path("frontend/package.json").read_text()
+    assert '"react"' in package
+    assert '"@tanstack/react-query"' in package
+    assert not Path("app/static/htmx.min.js").exists()
+    assert not list(Path("manga_manager/web/templates").glob("*.html"))
 
 
-def test_responsive_shell_keeps_drawer_overlay_and_titles_wrapped() -> None:
-    css = Path("app/static/styles.css").read_text()
-    assert ".job-drawer { position: fixed" in css
-    assert ".media-card h2 { overflow-wrap: anywhere; white-space: normal" in css
-    assert "@media (max-width: 760px)" in css
-    assert ".cover-grid { grid-template-columns:repeat(2,minmax(0,1fr))" in css
-    assert ".topbar,.content { margin-left:0; }" in css
+def test_media_cards_drawer_and_mobile_shell_contract() -> None:
+    css = Path("frontend/src/styles.css").read_text()
+    assert "minmax(320px,1fr)" in css
+    assert ".job-drawer{position:fixed" in css
+    assert ".drawer-scrim{position:fixed" in css
+    assert "@media(max-width:640px)" in css
+    assert ".bottom-nav{position:fixed" in css
 
 
-def test_fragment_forms_and_sse_reconnection_contract() -> None:
-    templates = "\n".join(
-        path.read_text() for path in Path("manga_manager/web/templates").glob("*.html")
-    )
-    javascript = Path("app/static/v2.js").read_text()
-    assert "hx-post=" in templates
-    assert "hx-target=" in templates
-    assert "hx-swap=" in templates
-    assert "sessionStorage.getItem(\"jobLastEventId\")" in javascript
-    assert "?after=${lastEventId}" in javascript
-    assert 'source.addEventListener("counts"' in javascript
+def test_typeahead_multi_source_optimistic_tracking_and_sse_contract() -> None:
+    application = Path("frontend/src/App.tsx").read_text()
+    assert "useDebounced(query)" in application
+    assert "selected.includes(source)" in application
+    assert "setQueriesData({queryKey:['discovery']}" in application
+    assert "Undo" in application
+    assert "new EventSource" in application
+    assert "sessionStorage.getItem('eventCursor')" in application
+
+
+def test_every_manga_workspace_uses_cover_component() -> None:
+    application = Path("frontend/src/App.tsx").read_text()
+    for component in ("DiscoveryCard", "LibraryCard", "UpdateCard", "MatchSideCard"):
+        section = application.split(f"function {component}", 1)[1].split("function ", 1)[0]
+        assert "<Cover" in section
