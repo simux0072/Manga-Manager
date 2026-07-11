@@ -96,6 +96,12 @@ services:
       - ./storage-v2:/app/storage-v2
     restart: unless-stopped
     mem_limit: 1g
+    healthcheck:
+      test: ["CMD", "uv", "run", "--frozen", "manga-manager", "doctor"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
     networks: [v2-internal]
 
   maintenance-v2:

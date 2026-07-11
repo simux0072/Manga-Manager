@@ -106,18 +106,43 @@ Reports contain stable action keys, row evidence, before/after values, rollback 
 SHA-256 storage manifest. A second applied run has no repeatable changes. V2 operational checks are
 available through `migrate`, `doctor`, and `stage-check`.
 
+After repair, rescan known sources and validate active archives. Rescan pauses the remainder of a
+provider after its first rate limit, while successful rows retain their new check time so a later run
+resumes older work first. Archive validation caches results by manifest SHA-256 and verifies ZIP CRC,
+`ComicInfo.xml`, readable images, and one active association:
+
+```bash
+uv run manga-manager rescan-legacy manga_manager.db
+uv run manga-manager validate-legacy manga_manager.db --storage-root storage \
+  --manifest-file /tmp/manga-manager-legacy-repair.json.manifest.json \
+  --validation-cache /tmp/manga-manager-validation.cache.json \
+  --report /tmp/manga-manager-validation.json
+```
+
 Repair archives are retained by default. Delete only archives older than the 30-day rollback window:
 
 ```bash
 uv run manga-manager cleanup-repair-archives storage --retain-days 30
 ```
 
-`benchmark-workers` reports the effective pool limits. Asura concurrency two must be explicitly
-requested and is automatically reduced to one while its shared source state is in cooldown:
+`benchmark-workers` runs only the selected provider pool for a bounded duration. It stops after the
+requested number of successful jobs or a provider cooldown; Asura concurrency two is automatically
+abandoned after rate limiting. Use `--dry-run` to inspect the effective pool configuration without
+claiming jobs:
 
 ```bash
-uv run manga-manager benchmark-workers --asura-concurrency 2
+uv run manga-manager benchmark-workers --source asura --concurrency 2 --duration 300 \
+  --max-jobs 2 --report /tmp/asura-benchmark.json
 ```
+
+Provider request start times are reserved in PostgreSQL, so request spacing and cooldowns are shared
+across all worker processes. Downloaded pages retain a worker-wide byte reservation until the ordered
+CBZ writer consumes them; buffered pages therefore remain inside the 256 MiB in-flight budget.
+
+The v2 library stores series state and chapter-level `unread`, `reading`, or `read` progress. Discovery,
+Library, Updates, Matches, and Operations preserve ordinary links/forms while using self-hosted fragment
+updates when JavaScript is available. Saved Library filters are browser-local because the private service
+has no user/session model.
 
 Backup checklist:
 

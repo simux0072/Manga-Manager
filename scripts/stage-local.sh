@@ -19,6 +19,23 @@ teardown() {
   fi
 }
 
+wait_for_job() {
+  job_id="$1"
+  attempts=0
+  while :; do
+    status=$(docker exec "$postgres" psql -U manga -d manga_manager -Atc \
+      "SELECT status FROM job WHERE id=$job_id")
+    case "$status" in
+      succeeded) return 0 ;;
+      failed|cancelled) docker exec "$postgres" psql -U manga -d manga_manager -c \
+        "SELECT id,status,error_code,error_message FROM job WHERE id=$job_id"; return 1 ;;
+    esac
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt "${STAGE_JOB_WAIT_ATTEMPTS:-120}" ] || return 1
+    sleep 1
+  done
+}
+
 if [ "${1:-}" = "down" ]; then
   teardown "${2:-}"
   exit 0
@@ -55,6 +72,8 @@ docker run -d --name "$web" --network "$network" --memory 256m -p "${STAGE_PORT:
   -e "V2_DATABASE_URL=$database_url" -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" \
   uv run --frozen uvicorn manga_manager.web.app:app --host 0.0.0.0 --port 8000 >/dev/null
 docker run -d --name "$worker" --network "$network" --memory 1g \
+  --health-cmd "uv run --frozen manga-manager doctor" --health-interval 30s \
+  --health-timeout 10s --health-start-period 30s --health-retries 3 \
   -e "V2_DATABASE_URL=$database_url" -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" \
   uv run --frozen manga-manager worker >/dev/null
 
@@ -66,10 +85,17 @@ done
 docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
   -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" uv run --frozen manga-manager stage-check --json
 
+probe_output=$(docker run --rm --network "$network" -e "V2_DATABASE_URL=$database_url" "$image" \
+  uv run --frozen manga-manager enqueue-probe)
+probe_id=$(printf '%s\n' "$probe_output" | sed -n 's/^job_id=\([0-9][0-9]*\).*/\1/p')
+[ -n "$probe_id" ] && wait_for_job "$probe_id"
+docker run --rm --memory 1g "$image" uv run --frozen python scripts/stress-download-memory.py
+
 if [ -n "${STAGE_SMOKE_SOURCE:-}" ]; then
-  docker run --rm --network "$network" -e "V2_DATABASE_URL=$database_url" "$image" \
-    uv run --frozen manga-manager enqueue-pull "$STAGE_SMOKE_SOURCE"
-  sleep 5
+  smoke_output=$(docker run --rm --network "$network" -e "V2_DATABASE_URL=$database_url" "$image" \
+    uv run --frozen manga-manager enqueue-pull "$STAGE_SMOKE_SOURCE")
+  smoke_id=$(printf '%s\n' "$smoke_output" | sed -n 's/^job_id=\([0-9][0-9]*\).*/\1/p')
+  [ -n "$smoke_id" ] && wait_for_job "$smoke_id"
   docker run --rm --network "$network" -e "V2_DATABASE_URL=$database_url" "$image" \
     uv run --frozen manga-manager stage-check --json
 fi
@@ -88,4 +114,8 @@ until docker exec "$web" uv run --frozen python -c "import json,urllib.request; 
   attempt=$((attempt + 1)); [ "$attempt" -lt 30 ] || { docker logs "$web"; exit 1; }
   sleep 1
 done
+recovery_output=$(docker run --rm --network "$network" -e "V2_DATABASE_URL=$database_url" "$image" \
+  uv run --frozen manga-manager enqueue-probe)
+recovery_id=$(printf '%s\n' "$recovery_output" | sed -n 's/^job_id=\([0-9][0-9]*\).*/\1/p')
+[ -n "$recovery_id" ] && wait_for_job "$recovery_id"
 printf '%s\n' "staging ready: http://127.0.0.1:${STAGE_PORT:-18000}" "teardown: scripts/stage-local.sh down"

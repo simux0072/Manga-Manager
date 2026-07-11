@@ -44,7 +44,23 @@ jobs:
         with:
           context: .
           platforms: linux/arm64
+          load: true
           push: false
           tags: manga-manager:arm64-ci
           cache-from: type=gha,scope=arm64
           cache-to: type=gha,mode=max,scope=arm64
+      - name: Run ARM64 migration and doctor under QEMU
+        run: |
+          docker run -d --name arm64-postgres --network host \
+            -e POSTGRES_DB=manga_manager -e POSTGRES_USER=manga -e POSTGRES_PASSWORD=manga \
+            postgres:16-alpine
+          for attempt in $(seq 1 30); do
+            docker exec arm64-postgres pg_isready -U manga -d manga_manager && break
+            sleep 1
+          done
+          docker run --rm --platform linux/arm64 --network host \
+            -e V2_DATABASE_URL=postgresql+psycopg://manga:manga@127.0.0.1:5432/manga_manager \
+            manga-manager:arm64-ci uv run --frozen manga-manager migrate
+          docker run --rm --platform linux/arm64 --network host \
+            -e V2_DATABASE_URL=postgresql+psycopg://manga:manga@127.0.0.1:5432/manga_manager \
+            manga-manager:arm64-ci uv run --frozen manga-manager doctor

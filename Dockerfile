@@ -14,6 +14,7 @@ COPY manga_manager ./manga_manager
 COPY alembic.ini ./
 COPY alembic.v2.ini ./
 COPY alembic ./alembic
+COPY scripts ./scripts
 RUN uv sync --frozen --no-dev
 
 EXPOSE 8000

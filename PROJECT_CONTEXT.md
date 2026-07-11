@@ -1,6 +1,6 @@
 # Manga Manager Project Context
 
-Last updated: 2026-07-10
+Last updated: 2026-07-11
 
 ## PostgreSQL v2 transition
 
@@ -12,6 +12,14 @@ Last updated: 2026-07-10
   runs create a SQLite backup before deterministic changes.
 - `scripts/stage-local.sh` is the local rehearsal path when Compose is unavailable. Pi and Traefik
   cutover remains deferred.
+- The current schema head is `0009_canonical_provider_unique`. It adds reading state and shared
+  request scheduling, and enforces at most one identity from each provider per canonical series.
+- Provider requests use PostgreSQL-backed global pacing/cooldowns. Chapter downloads use leased
+  provider permits, an ordered bounded page window, streaming CBZ output, and a 256 MiB worker-wide
+  in-flight byte budget.
+- `validate-legacy` verifies ZIP CRCs, `ComicInfo.xml`, readable images, and one active artifact and
+  projection per archive. `rescan-legacy --source-series-id` performs bounded targeted verification
+  without rebuilding match candidates for the complete legacy catalogue.
 - PostgreSQL jobs carry indexed source, series, and pool routing. Renewable permit leases enforce
   provider and global capacities across worker processes, while a partial unique index and advisory
   lock enforce one leased chapter job per canonical series.
@@ -30,23 +38,21 @@ access controls. It should only be used where the user has the right to archive 
 
 ## Current Product Shape
 
-The application is a FastAPI server with server-rendered HTML pages:
+The current v2 application is a FastAPI server with server-rendered Jinja/HTMX pages:
 
-- `/` shows newly discovered series as a compact update list with covers, recent chapters, and source
-  health.
-- `/library` shows a Today panel, tracked/interested series, source filters, and local reading state.
-- `/new-chapters` shows unread downloaded chapters for tracked series, with local and Kavita links
-  when available.
-- `/info` shows operations health, source cooldowns, live job counts, grouped job details, and
-  maintenance actions.
+- `/` and `/discover` show cursor-paginated discovery with source/search filters and tracking actions.
+- `/library` provides cover-grid and compact-list modes, saved filters, reading state, and progress.
+- `/updates` shows the chronological release feed with open/read actions.
+- `/operations` shows source, queue, worker, storage, and database health plus maintenance actions.
 - `/matches` shows possible cross-source series matches for manual merge/separation.
 - `/healthz` returns JSON with app, scheduler, and source health.
-- POST routes handle polling, queueing downloads, running downloads, retrying failed jobs, status
-  changes, and match decisions.
+- POST routes handle source pulls, queueing, retries, status/reading changes, and match decisions.
 - GET routes handle Kavita-oriented series/chapter opening. Mapped items redirect to Kavita; unmapped
   items queue focused imports and return with a pending state if Kavita is not ready.
 
-The UI is intentionally small and operational. The backend services contain most of the project logic.
+HTMX fragment responses progressively enhance ordinary links and forms. Delta SSE carries job/count
+changes; comment heartbeats do not trigger refreshes. The legacy `app/` layer remains only as a
+migration and source-rescan compatibility surface while the deployed web/worker use `manga_manager/`.
 
 ## Main Plan
 
