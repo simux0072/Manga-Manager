@@ -24,11 +24,13 @@ class WorkerService:
         handlers: Mapping[JobKind, JobHandler],
         settings: V2Settings,
         registry: WorkerRegistry | None = None,
+        pools: set[str] | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.handlers = dict(handlers)
         self.settings = settings
         self.registry = registry or WorkerRegistry()
+        self.pools = pools
 
     async def run(self, stop: asyncio.Event) -> None:
         specs = self._pool_specs()
@@ -69,6 +71,8 @@ class WorkerService:
         ]
         specs: list[tuple[int, str, set[JobKind]]] = []
         for pool, count, kinds in requested:
+            if self.pools is not None and pool not in self.pools:
+                continue
             if not kinds.intersection(self.handlers):
                 continue
             for _ in range(count):

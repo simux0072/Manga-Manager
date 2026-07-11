@@ -43,6 +43,7 @@ class V2Settings(BaseSettings):
     max_page_bytes: int = Field(default=25 * 1024 * 1024, ge=1)
     max_chapter_bytes: int = Field(default=750 * 1024 * 1024, ge=1)
     max_pages_per_chapter: int = Field(default=2_000, ge=1)
+    min_download_pages: int = Field(default=3, ge=1, le=100)
     min_free_bytes: int = Field(default=5 * 1024 * 1024 * 1024, ge=0)
 
     def require_database_url(self) -> str:

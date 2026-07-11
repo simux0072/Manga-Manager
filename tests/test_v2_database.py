@@ -42,6 +42,7 @@ def test_v2_migration_builds_job_constraints_and_indexes(tmp_path: Path) -> None
         "job_permit",
         "match_decision_v2",
         "catalog_observation_v2",
+        "chapter_reading_state_v2",
     } == set(inspector.get_table_names())
     indexes = {index["name"] for index in inspector.get_indexes("job")}
     assert {
@@ -65,4 +66,4 @@ def test_v2_migration_builds_job_constraints_and_indexes(tmp_path: Path) -> None
     sessions = create_session_factory(engine)
     with sessions() as session:
         version = session.scalar(text("SELECT version_num FROM alembic_version"))
-    assert version == "0007_catalog_integrity_search"
+    assert version == "0009_canonical_provider_unique"

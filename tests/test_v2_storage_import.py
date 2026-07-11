@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import asyncio
 import zipfile
 from pathlib import Path
 
@@ -87,6 +88,29 @@ def test_storage_requires_comic_info(tmp_path: Path) -> None:
         assert "ComicInfo.xml" in str(exc)
     else:
         raise AssertionError("archive without ComicInfo.xml was accepted")
+
+
+def test_download_storage_rejects_cover_only_page(tmp_path: Path) -> None:
+    store = ContentAddressedStorage(
+        tmp_path / "storage-v2",
+        max_page_bytes=1024 * 1024,
+        max_chapter_bytes=10 * 1024 * 1024,
+        max_pages=100,
+        min_download_pages=3,
+    )
+
+    async def pages():
+        yield png_bytes("red")
+
+    async def run() -> None:
+        try:
+            await store.store_pages(pages(), comic_info_xml="<ComicInfo/>")
+        except ValueError as exc:
+            assert "minimum is 3" in str(exc)
+        else:
+            raise AssertionError("cover-only download was accepted")
+
+    asyncio.run(run())
 
 
 def test_cbz_import_dry_run_full_duplicate_and_conflict(tmp_path: Path) -> None:

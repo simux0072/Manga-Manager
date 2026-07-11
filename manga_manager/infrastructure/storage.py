@@ -40,6 +40,7 @@ class ContentAddressedStorage:
         max_page_bytes: int,
         max_chapter_bytes: int,
         max_pages: int,
+        min_download_pages: int = 1,
         min_free_bytes: int = 0,
     ) -> None:
         self.root = root
@@ -49,6 +50,7 @@ class ContentAddressedStorage:
         self.max_page_bytes = max_page_bytes
         self.max_chapter_bytes = max_chapter_bytes
         self.max_pages = max_pages
+        self.min_download_pages = min_download_pages
         self.min_free_bytes = min_free_bytes
 
     def ensure_directories(self) -> None:
@@ -153,8 +155,11 @@ class ContentAddressedStorage:
                     archive.writestr(f"{image_count:04d}.{extension}", page)
                     if progress is not None:
                         progress(image_count)
-            if image_count == 0:
-                raise ValueError("chapter contains no images")
+            if image_count < self.min_download_pages:
+                raise ValueError(
+                    f"chapter contains {image_count} images; minimum is "
+                    f"{self.min_download_pages}"
+                )
             return self.store_existing(staging)
         finally:
             staging.unlink(missing_ok=True)

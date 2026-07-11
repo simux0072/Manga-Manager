@@ -225,6 +225,7 @@ class CatalogSourceSeries(JobBase):
     __tablename__ = "source_series_v2"
     __table_args__ = (
         UniqueConstraint("source", "source_id", name="uq_source_series_v2_identity"),
+        UniqueConstraint("series_id", "source", name="uq_source_series_v2_series_source"),
         Index("ix_source_series_v2_source_checked", "source", "last_checked_at"),
     )
 
@@ -310,6 +311,24 @@ class CatalogChapter(JobBase):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class CatalogChapterReadingState(JobBase):
+    __tablename__ = "chapter_reading_state_v2"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('unread', 'reading', 'read')",
+            name="ck_chapter_reading_state_v2_status",
+        ),
+        Index("ix_chapter_reading_state_v2_status_updated", "status", "updated_at"),
+    )
+
+    chapter_id: Mapped[int] = mapped_column(
+        ForeignKey("chapter_v2.id", ondelete="CASCADE"), primary_key=True
+    )
+    status: Mapped[str] = mapped_column(String(20), default="unread", index=True)
+    read_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class CatalogChapterRelease(JobBase):
     __tablename__ = "chapter_release_v2"
     __table_args__ = (
@@ -358,6 +377,7 @@ class CatalogSourceState(JobBase):
         JSON().with_variant(JSONB(none_as_null=True), "postgresql"), default=list
     )
     cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_request_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 

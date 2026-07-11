@@ -16,6 +16,7 @@ from manga_manager.infrastructure.db_models import (
     CatalogChapter,
     CatalogChapterRelease,
     CatalogExternalIdentifier,
+    CatalogMatchDecision,
     CatalogSeries,
     CatalogSeriesAlias,
     CatalogSourceSeries,
@@ -64,6 +65,7 @@ class CatalogRepository:
             )
             session.add(source_series)
             session.flush()
+            self._record_match_candidates(session, source_series, item)
         else:
             series = session.get(CatalogSeries, source_series.series_id)
             if series is None:
@@ -141,23 +143,58 @@ class CatalogRepository:
                 )
             )
             if identifier is not None:
-                return session.get(CatalogSeries, identifier.series_id)
+                already_has_source = session.scalar(
+                    select(CatalogSourceSeries.id).where(
+                        CatalogSourceSeries.series_id == identifier.series_id,
+                        CatalogSourceSeries.source == item.source,
+                    )
+                )
+                if already_has_source is None:
+                    return session.get(CatalogSeries, identifier.series_id)
 
-        normalized = normalize_title(item.title)
+        return None
+
+    def _record_match_candidates(
+        self, session: Session, source_series: CatalogSourceSeries, item: SeriesItem
+    ) -> None:
+        normalized_values = {normalize_title(item.title)} | {
+            normalize_title(alias) for alias in item.aliases
+        }
+        normalized_values.discard("")
         candidates = session.scalars(
-            select(CatalogSeries).where(CatalogSeries.normalized_title == normalized)
+            select(CatalogSourceSeries)
+            .where(CatalogSourceSeries.id != source_series.id)
+            .where(CatalogSourceSeries.source != source_series.source)
+            .where(CatalogSourceSeries.normalized_title.in_(normalized_values))
+            .order_by(CatalogSourceSeries.id)
         ).all()
-        eligible = []
         for candidate in candidates:
-            already_has_source = session.scalar(
-                select(CatalogSourceSeries.id)
-                .where(CatalogSourceSeries.series_id == candidate.id)
-                .where(CatalogSourceSeries.source == item.source)
-                .limit(1)
+            left_id, right_id = sorted((candidate.id, source_series.id))
+            existing = session.scalar(
+                select(CatalogMatchDecision.id).where(
+                    CatalogMatchDecision.left_source_series_id == left_id,
+                    CatalogMatchDecision.right_source_series_id == right_id,
+                )
             )
-            if already_has_source is None:
-                eligible.append(candidate)
-        return eligible[0] if len(eligible) == 1 else None
+            if existing is not None:
+                continue
+            same_cover = bool(
+                item.cover_url
+                and candidate.cover_url
+                and normalized_url(item.cover_url) == normalized_url(candidate.cover_url)
+            )
+            session.add(
+                CatalogMatchDecision(
+                    left_source_series_id=left_id,
+                    right_source_series_id=right_id,
+                    confidence=0.94 if same_cover else 0.70,
+                    evidence_json={
+                        "title_or_alias": sorted(normalized_values),
+                        "cover_match": same_cover,
+                        "policy": "manual_review_required_without_shared_external_id",
+                    },
+                )
+            )
 
     def _sync_aliases(
         self,
@@ -288,3 +325,7 @@ class CatalogRepository:
             state = CatalogSourceState(source=source)
             session.add(state)
         return state
+
+
+def normalized_url(value: str) -> str:
+    return value.strip().lower().split("?", 1)[0].rstrip("/")

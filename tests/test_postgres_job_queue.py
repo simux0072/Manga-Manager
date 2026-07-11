@@ -178,7 +178,7 @@ def test_v2_migrations_round_trip_on_postgresql(sessions) -> None:
     command.upgrade(config, "head")
     with Session(create_engine(DATABASE_URL)) as session:
         assert session.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0007_catalog_integrity_search"
+            "0009_canonical_provider_unique"
         )
         indexes = set(
             session.scalars(
