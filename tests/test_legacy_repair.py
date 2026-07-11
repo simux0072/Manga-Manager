@@ -133,6 +133,10 @@ def full_legacy_database(path: Path) -> Path:
           series_id INTEGER REFERENCES series(id),
           kavita_sync_job_id INTEGER
         );
+        CREATE TABLE series_progress (
+          id INTEGER PRIMARY KEY, series_id INTEGER NOT NULL UNIQUE REFERENCES series(id),
+          status TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', rating INTEGER
+        );
         INSERT INTO series VALUES (1, 'Merged', 'merged', '', '', '', 'new');
         INSERT INTO source_series VALUES
           (1, 1, 'asura', 'first', 'First', 'first', 'https://asura.test/comics/first', '', '', '', '{}'),
@@ -142,6 +146,7 @@ def full_legacy_database(path: Path) -> Path:
           (1, 1, 1, 'asura', '1', 'Chapter 1', 'https://asura.test/comics/first/chapter/1'),
           (2, 1, 2, 'asura', '1', 'Chapter 1', 'https://asura.test/comics/second/chapter/1');
         INSERT INTO downloaded_file VALUES (1, 1, 2, 'asura', 'second.cbz', 1, NULL);
+        INSERT INTO series_progress VALUES (1, 1, 'reading', 'keep me', 5);
         """
     )
     connection.commit()
@@ -170,6 +175,11 @@ def test_repair_splits_conflicting_provider_identity_and_reassigns_artifact(
         ).fetchone()
         assert chapter_series == second_series
         assert file_chapter != 1
+        progress = connection.execute(
+            "SELECT status, note, rating FROM series_progress WHERE series_id=?",
+            (second_series,),
+        ).fetchone()
+        assert progress == ("reading", "keep me", 5)
 
 
 def test_repair_consolidates_evidenced_helper_release(tmp_path: Path) -> None:
@@ -270,3 +280,23 @@ def test_storage_manifest_cache_is_resumable_and_invalidates_changed_files(
     chapter.write_bytes(b"changed")
     third = repair.manifest(cache)
     assert third[0]["sha256"] != first[0]["sha256"]
+
+
+def test_url_number_disagreement_is_consolidated_into_numeric_release(
+    tmp_path: Path,
+) -> None:
+    database = full_legacy_database(tmp_path / "legacy.db")
+    with sqlite3.connect(database) as connection:
+        connection.execute("INSERT INTO chapter VALUES (2, 1, '80', 'False', 'asura', '', '')")
+        connection.execute(
+            "INSERT INTO chapter_release VALUES (3, 2, 1, 'asura', '80', 'First Chapter', 'https://asura.test/comics/first/chapter/1')"
+        )
+        connection.commit()
+    actions, _ = LegacyRepair(database).repair(apply=True, backup_dir=tmp_path / "backups")
+    assert any(
+        item.action == "consolidate URL-disagreed release into numeric chapter" and item.applied
+        for item in actions
+    )
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT 1 FROM chapter_release WHERE id=3").fetchone() is None
+        assert connection.execute("SELECT 1 FROM chapter WHERE id=2").fetchone() is None

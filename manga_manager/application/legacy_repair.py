@@ -15,7 +15,7 @@ from typing import Any
 LATEST_PREFIX = re.compile(r"^\s*Latest:\s*(Chapter\s+.+)$", re.IGNORECASE)
 TEMPLATE_CHAPTER = re.compile(r"\{\{\s*(?:number|date)\s*\}\}", re.IGNORECASE)
 HELPER_NUMBER = re.compile(r"^(?:first|latest)\s+chapter$", re.IGNORECASE)
-URL_CHAPTER_NUMBER = re.compile(r"(?:chapter|ch)[-_/ ]+(\d+(?:\.\d+)?)", re.IGNORECASE)
+URL_CHAPTER_NUMBER = re.compile(r"(?:chapter|ch)[-_/ ]+(\d+)(?:[.-](\d+))?", re.IGNORECASE)
 
 
 @dataclass(frozen=True, slots=True)
@@ -94,6 +94,14 @@ class LegacyRepair:
                     )
                     applied.add(item.key)
                 elif item.action == "consolidate helper release into numeric chapter":
+                    self._consolidate_helper_release(
+                        connection,
+                        int(item.row_id),
+                        int(item.evidence["target_release_id"]),
+                        int(item.evidence["target_chapter_id"]),
+                    )
+                    applied.add(item.key)
+                elif item.action == "consolidate URL-disagreed release into numeric chapter":
                     self._consolidate_helper_release(
                         connection,
                         int(item.row_id),
@@ -348,6 +356,37 @@ class LegacyRepair:
                             else "associate helper release with evidenced numeric chapter",
                         )
                     )
+                else:
+                    numeric = evidenced_chapter_number(row["url"] or "", "")
+                    release_number = normalized_chapter_number(row["number"] or "")
+                    if (
+                        numeric
+                        and release_number
+                        and numeric != release_number
+                        and row["source_series_id"] is not None
+                    ):
+                        target = connection.execute(
+                            "SELECT id, chapter_id FROM chapter_release "
+                            "WHERE source_series_id=? AND number=? AND id<>? ORDER BY id LIMIT 1",
+                            (row["source_series_id"], numeric, row["id"]),
+                        ).fetchone()
+                        if target and target["chapter_id"]:
+                            actions.append(
+                                self._action(
+                                    "url-number-disagreement",
+                                    "release",
+                                    "chapter_release",
+                                    row["id"],
+                                    {
+                                        "number": row["number"],
+                                        "url": row["url"],
+                                        "evidenced_number": numeric,
+                                        "target_release_id": target["id"],
+                                        "target_chapter_id": target["chapter_id"],
+                                    },
+                                    "consolidate URL-disagreed release into numeric chapter",
+                                )
+                            )
         if "series" in tables:
             series_columns = {
                 column["name"] for column in connection.execute("PRAGMA table_info(series)")
@@ -453,6 +492,25 @@ class LegacyRepair:
             "UPDATE source_series SET series_id=? WHERE id=?",
             (new_series_id, source_series_id),
         )
+        if table_exists(connection, "series_progress"):
+            progress = connection.execute(
+                "SELECT * FROM series_progress WHERE series_id=?", (source["series_id"],)
+            ).fetchone()
+            if progress is not None:
+                progress_columns = [
+                    row["name"]
+                    for row in connection.execute("PRAGMA table_info(series_progress)")
+                    if row["name"] != "id"
+                ]
+                progress_values = [
+                    new_series_id if column == "series_id" else progress[column]
+                    for column in progress_columns
+                ]
+                connection.execute(
+                    f"INSERT OR IGNORE INTO series_progress ({', '.join(progress_columns)}) "
+                    f"VALUES ({', '.join('?' for _ in progress_columns)})",
+                    progress_values,
+                )
         releases = connection.execute(
             "SELECT r.id AS release_id, r.chapter_id, r.number, c.* "
             "FROM chapter_release r LEFT JOIN chapter c ON c.id=r.chapter_id "
@@ -523,6 +581,11 @@ class LegacyRepair:
                 else None
             )
             if not remaining and not files:
+                if table_exists(connection, "activity_event"):
+                    connection.execute(
+                        "UPDATE activity_event SET chapter_id=NULL WHERE chapter_id=?",
+                        (old_chapter_id,),
+                    )
                 connection.execute("DELETE FROM chapter WHERE id=?", (old_chapter_id,))
 
     def _consolidate_helper_release(
@@ -749,7 +812,7 @@ def normalized_identity(source_id: str | None, url: str | None) -> str:
 def evidenced_chapter_number(url: str, title: str) -> str | None:
     match = URL_CHAPTER_NUMBER.search(url)
     if match:
-        return match.group(1).rstrip("0").rstrip(".") if "." in match.group(1) else match.group(1)
+        return f"{match.group(1)}.{match.group(2)}" if match.group(2) else match.group(1)
     title_match = re.search(r"\bchapter\s+(\d+(?:\.\d+)?)\b", title, re.IGNORECASE)
     if title_match:
         return (
@@ -758,6 +821,14 @@ def evidenced_chapter_number(url: str, title: str) -> str | None:
             else title_match.group(1)
         )
     return None
+
+
+def normalized_chapter_number(value: str) -> str | None:
+    match = re.fullmatch(r"\s*(\d+(?:\.\d+)?)\s*", value)
+    if not match:
+        return None
+    number = match.group(1)
+    return number.rstrip("0").rstrip(".") if "." in number else number
 
 
 def write_manifest_cache(path: Path, records: list[dict[str, Any]]) -> None:
