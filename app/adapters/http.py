@@ -4,6 +4,8 @@ import asyncio
 from email.utils import parsedate_to_datetime
 import time
 import weakref
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -16,6 +18,26 @@ _page_semaphores: dict[str, asyncio.Semaphore] = {}
 _request_schedulers: dict[str, tuple[asyncio.Lock, float]] = {}
 _worker_page_semaphores: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 WORKER_INFLIGHT_BYTE_BUDGET = 256 * 1024 * 1024
+_provider_waiter: Callable[[str, float], Awaitable[None]] | None = None
+
+
+@dataclass(slots=True)
+class ReservedPage:
+    content: bytes
+    semaphore: asyncio.Semaphore
+    released: bool = False
+
+    def release(self) -> None:
+        if not self.released:
+            self.semaphore.release()
+            self.released = True
+
+
+def configure_provider_waiter(
+    waiter: Callable[[str, float], Awaitable[None]] | None,
+) -> None:
+    global _provider_waiter
+    _provider_waiter = waiter
 
 
 class HttpSourceClient:
@@ -121,6 +143,9 @@ class HttpSourceClient:
     async def wait_for_throttle(self) -> None:
         if self.throttle_seconds <= 0:
             return
+        if _provider_waiter is not None:
+            await _provider_waiter(source_for_base_url(self.base_url), self.throttle_seconds)
+            return
         lock, last_request_at = _request_schedulers.setdefault(self.base_url, (asyncio.Lock(), 0.0))
         async with lock:
             # Fetch again after waiting for the lock; another client may have updated it.
@@ -164,13 +189,19 @@ async def iter_ordered_bytes(
     source_semaphore = page_semaphore_for_client(client)
     worker_semaphore = worker_page_semaphore()
 
-    async def fetch(url: str) -> bytes:
+    async def fetch(url: str) -> ReservedPage:
         async with semaphore:
             async with source_semaphore:
-                async with worker_semaphore:
-                    return await client.get_bytes(url, referer=referer)
+                await worker_semaphore.acquire()
+                try:
+                    return ReservedPage(
+                        await client.get_bytes(url, referer=referer), worker_semaphore
+                    )
+                except BaseException:
+                    worker_semaphore.release()
+                    raise
 
-    tasks: dict[int, asyncio.Task[bytes]] = {}
+    tasks: dict[int, asyncio.Task[ReservedPage]] = {}
     next_index = 0
 
     def fill_window() -> None:
@@ -185,13 +216,19 @@ async def iter_ordered_bytes(
             task = tasks.pop(index)
             page = await task
             fill_window()
-            yield page
+            try:
+                yield page.content
+            finally:
+                page.release()
     except Exception:
         raise
     finally:
         for task in tasks.values():
             task.cancel()
-        await asyncio.gather(*tasks.values(), return_exceptions=True)
+        results = await asyncio.gather(*tasks.values(), return_exceptions=True)
+        for result in results:
+            if isinstance(result, ReservedPage):
+                result.release()
 
 
 def worker_page_semaphore() -> asyncio.Semaphore:
@@ -221,6 +258,16 @@ def page_concurrency_for_base_url(base_url: str) -> int:
     if "kingofshojo" in base_url:
         return settings.kingofshojo_page_concurrency
     return 1
+
+
+def source_for_base_url(base_url: str) -> str:
+    if "asura" in base_url:
+        return "asura"
+    if "mangafire" in base_url:
+        return "mangafire"
+    if "kingofshojo" in base_url:
+        return "kingofshojo"
+    return base_url
 
 
 def is_partial_body_error(exc: BaseException) -> bool:

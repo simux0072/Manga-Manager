@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import io
 import os
 import sqlite3
 import time
+import zipfile
 from pathlib import Path
+
+from PIL import Image
 
 from manga_manager.application.legacy_repair import LegacyRepair, write_legacy_report
 from manga_manager.cli import main
@@ -182,6 +186,35 @@ def test_repair_splits_conflicting_provider_identity_and_reassigns_artifact(
         assert progress == ("reading", "keep me", 5)
 
 
+def test_repair_consolidates_duplicate_provider_identity_and_dependents(tmp_path: Path) -> None:
+    database = full_legacy_database(tmp_path / "legacy.db")
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "UPDATE source_series SET source_id='first', url='https://asura.test/comics/first/' "
+            "WHERE id=2"
+        )
+        connection.execute("INSERT INTO download_job VALUES (1, 2, 'queued')")
+        connection.execute("INSERT INTO activity_event VALUES (1, 1, 1, 1, NULL)")
+        connection.commit()
+
+    actions, _ = LegacyRepair(database).repair(apply=True, backup_dir=tmp_path / "backups")
+
+    assert any(
+        item.action == "consolidate duplicate provider identity" and item.applied
+        for item in actions
+    )
+    with sqlite3.connect(database) as connection:
+        assert connection.execute("SELECT count(*) FROM source_series").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM chapter_release").fetchone()[0] == 1
+        assert connection.execute(
+            "SELECT chapter_release_id, chapter_id FROM downloaded_file WHERE id=1"
+        ).fetchone() == (1, 1)
+        assert connection.execute(
+            "SELECT download_job_id FROM activity_event WHERE id=1"
+        ).fetchone()[0] is None
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+
+
 def test_repair_consolidates_evidenced_helper_release(tmp_path: Path) -> None:
     database = full_legacy_database(tmp_path / "legacy.db")
     with sqlite3.connect(database) as connection:
@@ -300,3 +333,24 @@ def test_url_number_disagreement_is_consolidated_into_numeric_release(
     with sqlite3.connect(database) as connection:
         assert connection.execute("SELECT 1 FROM chapter_release WHERE id=3").fetchone() is None
         assert connection.execute("SELECT 1 FROM chapter WHERE id=2").fetchone() is None
+
+
+def test_archive_validation_is_cached_and_checks_comicinfo_images(tmp_path: Path) -> None:
+    database = full_legacy_database(tmp_path / "legacy.db")
+    storage = tmp_path / "storage"
+    storage.mkdir()
+    image_data = io.BytesIO()
+    Image.new("RGB", (20, 40), "red").save(image_data, format="JPEG")
+    with zipfile.ZipFile(storage / "second.cbz", "w") as archive:
+        archive.writestr("ComicInfo.xml", "<ComicInfo/>")
+        archive.writestr("001.jpg", image_data.getvalue())
+    cache = tmp_path / "validation-cache.json"
+    repair = LegacyRepair(database, storage_root=storage)
+    manifest = repair.manifest(tmp_path / "manifest.json")
+
+    first = repair.validate_archives(manifest, cache)
+    second = repair.validate_archives(manifest, cache)
+
+    assert first == second
+    assert first[0]["valid"] is True
+    assert first[0]["images"] == 1

@@ -18,6 +18,7 @@ from manga_manager.domain.jobs import JobKind, SourcePullPayload
 from manga_manager.infrastructure.db_models import (
     CatalogChapter,
     CatalogChapterRelease,
+    CatalogMatchDecision,
     CatalogSeries,
     CatalogSourceSeries,
     CatalogSourceState,
@@ -25,6 +26,7 @@ from manga_manager.infrastructure.db_models import (
     JobEvent,
 )
 from manga_manager.infrastructure.job_queue import JobQueue
+from manga_manager.infrastructure.catalog_repository import CatalogRepository
 
 
 class TrackingSessionFactory:
@@ -176,3 +178,55 @@ async def test_source_pull_reads_persisted_frontier(sessions: TrackingSessionFac
     )
     await handler(claimed_context(sessions))
     assert adapter.frontier == [FrontierSentinel(source_id="known", latest_chapter="9")]
+
+
+def test_exact_title_without_external_id_creates_pending_match(
+    sessions: TrackingSessionFactory,
+) -> None:
+    repository = CatalogRepository()
+    with sessions() as session, session.begin():
+        first = repository.ingest(
+            session,
+            SeriesItem("asura", "one", "Shared Title", "https://asura.test/one"),
+            [],
+        )
+        second = repository.ingest(
+            session,
+            SeriesItem("mangafire", "two", "Shared Title", "https://mf.test/two"),
+            [],
+        )
+        assert first.series_id != second.series_id
+        decision = session.scalar(select(CatalogMatchDecision))
+        assert decision is not None
+        assert decision.decision == "pending"
+        assert decision.evidence_json["cover_match"] is False
+
+
+def test_shared_external_id_never_adds_second_identity_from_same_provider(
+    sessions: TrackingSessionFactory,
+) -> None:
+    repository = CatalogRepository()
+    with sessions() as session, session.begin():
+        first = repository.ingest(
+            session,
+            SeriesItem(
+                "asura",
+                "one",
+                "First",
+                "https://asura.test/one",
+                external_ids={"mal": "42"},
+            ),
+            [],
+        )
+        second = repository.ingest(
+            session,
+            SeriesItem(
+                "asura",
+                "two",
+                "Second",
+                "https://asura.test/two",
+                external_ids={"mal": "42"},
+            ),
+            [],
+        )
+        assert first.series_id != second.series_id

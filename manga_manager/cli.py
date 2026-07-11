@@ -21,10 +21,12 @@ from manga_manager.application.legacy_repair import (
 from manga_manager.application.cbz_import import LegacyCbzImporter, write_report
 from manga_manager.application.chapter_download import ChapterDownloadHandler
 from manga_manager.application.kavita_sync import KavitaSyncHandler
+from manga_manager.application.maintenance import MaintenanceHandler
 from manga_manager.domain.jobs import (
     ChapterDownloadPayload,
     JobKind,
     KavitaSyncPayload,
+    MaintenancePayload,
     SourcePullPayload,
 )
 from manga_manager.infrastructure.database import (
@@ -52,9 +54,16 @@ def build_parser() -> argparse.ArgumentParser:
     stage = subcommands.add_parser("stage-check", help="verify staged database and storage health")
     stage.add_argument("--json", action="store_true", dest="json_output")
     benchmark = subcommands.add_parser(
-        "benchmark-workers", help="report safe worker-pool benchmark settings"
+        "benchmark-workers", help="run a bounded worker-pool benchmark"
     )
-    benchmark.add_argument("--asura-concurrency", type=int, choices=[1, 2], default=1)
+    benchmark.add_argument(
+        "--source", choices=["asura", "mangafire", "kingofshojo"], default="asura"
+    )
+    benchmark.add_argument("--concurrency", type=int, choices=[1, 2], default=1)
+    benchmark.add_argument("--duration", type=int, default=60, help="maximum seconds")
+    benchmark.add_argument("--max-jobs", type=int, default=2)
+    benchmark.add_argument("--report", type=Path)
+    benchmark.add_argument("--dry-run", action="store_true")
     cleanup = subcommands.add_parser(
         "cleanup-repair-archives", help="delete repair archives older than the retention window"
     )
@@ -65,6 +74,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rescan.add_argument("database", type=Path)
     rescan.add_argument("--limit", type=int)
+    rescan.add_argument("--source-series-id", type=int, action="append", default=[])
+    validate = subcommands.add_parser(
+        "validate-legacy", help="validate active legacy CBZ archives with a resumable cache"
+    )
+    validate.add_argument("database", type=Path)
+    validate.add_argument("--storage-root", type=Path, required=True)
+    validate.add_argument("--report", type=Path, required=True)
+    validate.add_argument("--manifest-file", type=Path)
+    validate.add_argument("--validation-cache", type=Path)
     for name, help_text in (
         ("audit-legacy", "audit a legacy SQLite catalog without changing it"),
         ("repair-legacy", "repair safe legacy defects; defaults to dry-run"),
@@ -94,6 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands.add_parser("reconcile-storage", help="repair the projected library from blobs")
     kavita = subcommands.add_parser("enqueue-kavita", help="enqueue one series for Kavita sync")
     kavita.add_argument("series_id", type=int)
+    subcommands.add_parser("enqueue-probe", help="enqueue a deterministic staging probe")
     return parser
 
 
@@ -115,9 +134,38 @@ def main(argv: Sequence[str] | None = None) -> int:
         database = sqlite_path(args.database)
         legacy_engine = create_engine(f"sqlite:///{database}", connect_args={"timeout": 30})
         with Session(legacy_engine, expire_on_commit=False) as session:
-            result = asyncio.run(repair_known_series(session, limit=args.limit))
+            result = asyncio.run(
+                repair_known_series(
+                    session,
+                    limit=args.limit,
+                    source_series_ids=args.source_series_id or None,
+                )
+            )
         print(json.dumps(result, sort_keys=True))
         return 0
+    if args.command == "validate-legacy":
+        repair = LegacyRepair(args.database, storage_root=args.storage_root)
+        manifest_path = args.manifest_file or args.report.with_suffix(".manifest.json")
+        validation_path = args.validation_cache or args.report.with_suffix(".cache.json")
+        manifest = repair.manifest(manifest_path)
+        results = repair.validate_archives(manifest, validation_path)
+        payload = {
+            "database": str(repair.database),
+            "storage_root": str(args.storage_root.resolve()),
+            "summary": {
+                "archives": len(results),
+                "valid": sum(bool(row["valid"]) for row in results),
+                "invalid": sum(not row["valid"] for row in results),
+                "one_page_fractional_review": sum(
+                    bool(row["review_one_page_fractional"]) for row in results
+                ),
+            },
+            "archives": results,
+        }
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        print(json.dumps(payload["summary"], sort_keys=True))
+        return 0 if payload["summary"]["invalid"] == 0 else 1
     if args.command in {"audit-legacy", "repair-legacy"}:
         repair = LegacyRepair(args.database, storage_root=args.storage_root)
         apply = args.command == "repair-legacy" and args.apply
@@ -227,13 +275,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(" ".join(f"{key}={value}" for key, value in payload.items()))
         return 0 if payload["ok"] else 1
     if args.command == "benchmark-workers":
-        requested = args.asura_concurrency
+        if args.duration < 1 or args.max_jobs < 1:
+            parser.error("--duration and --max-jobs must be positive")
+        requested = args.concurrency
         with engine.connect() as connection:
             row = connection.execute(
                 text(
                     "SELECT health_status, cooldown_until > now() AS cooling FROM source_state_v2 "
-                    "WHERE source='asura'"
-                )
+                    "WHERE source=:source"
+                ),
+                {"source": args.source},
             ).first()
         effective = requested
         abandoned = False
@@ -241,12 +292,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             effective = 1
             abandoned = True
         payload = {
-            "requested_asura_concurrency": requested,
-            "effective_asura_concurrency": effective,
+            "source": args.source,
+            "requested_concurrency": requested,
+            "effective_concurrency": effective,
             "abandoned_on_rate_limit": abandoned,
             "global_chapter_ceiling": settings.global_chapter_concurrency,
-            "pool_limits": {**settings.pool_limits(), "download:asura": effective},
+            "pool_limits": {
+                **settings.pool_limits(),
+                f"download:{args.source}": effective,
+            },
         }
+        if not args.dry_run and not abandoned:
+            payload.update(
+                asyncio.run(
+                    run_worker_benchmark(
+                        settings,
+                        engine,
+                        source=args.source,
+                        concurrency=effective,
+                        duration=args.duration,
+                        max_jobs=args.max_jobs,
+                    )
+                )
+            )
+        if args.report:
+            args.report.parent.mkdir(parents=True, exist_ok=True)
+            args.report.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         print(json.dumps(payload, sort_keys=True))
         return 0
     if args.command == "enqueue-pull":
@@ -317,6 +388,18 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         print(f"job_id={job.id} created={str(created).lower()}")
         return 0
+    if args.command == "enqueue-probe":
+        sessions = create_session_factory(engine)
+        with sessions() as session, session.begin():
+            job, created = JobQueue().enqueue(
+                session,
+                kind=JobKind.MAINTENANCE,
+                dedupe_key="stage-probe",
+                payload=MaintenancePayload(action="stage_probe"),
+                priority=1,
+            )
+        print(f"job_id={job.id} created={str(created).lower()}")
+        return 0
     if args.command == "worker":
         logging.basicConfig(
             level=logging.INFO,
@@ -327,12 +410,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 async def run_worker(settings: V2Settings, engine) -> int:
+    from app.adapters.http import configure_provider_waiter
+    from manga_manager.infrastructure.provider_scheduler import ProviderRequestScheduler
+
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
     for signum in (signal.SIGINT, signal.SIGTERM):
         with suppress_not_implemented():
             loop.add_signal_handler(signum, stop.set)
     sessions = create_session_factory(engine)
+    request_scheduler = ProviderRequestScheduler(sessions)
+    configure_provider_waiter(request_scheduler.wait)
     source_pull = SourcePullHandler(session_factory=sessions)
     chapter_download = ChapterDownloadHandler(
         session_factory=sessions,
@@ -348,12 +436,14 @@ async def run_worker(settings: V2Settings, engine) -> int:
         session_factory=sessions,
         library_root=settings.storage_root / "library",
     )
+    maintenance = MaintenanceHandler(session_factory=sessions)
     service = WorkerService(
         session_factory=sessions,
         handlers={
             JobKind.SOURCE_PULL: source_pull,
             JobKind.CHAPTER_DOWNLOAD: chapter_download,
             JobKind.KAVITA_SYNC: kavita_sync,
+            JobKind.MAINTENANCE: maintenance,
         },
         settings=settings,
     )
@@ -362,8 +452,90 @@ async def run_worker(settings: V2Settings, engine) -> int:
         session_factory=sessions,
         settings=settings,
     )
-    await asyncio.gather(service.run(stop), scheduler.run(stop))
+    try:
+        await asyncio.gather(service.run(stop), scheduler.run(stop))
+    finally:
+        configure_provider_waiter(None)
     return 0
+
+
+async def run_worker_benchmark(
+    settings: V2Settings,
+    engine,
+    *,
+    source: str,
+    concurrency: int,
+    duration: int,
+    max_jobs: int,
+) -> dict[str, object]:
+    from app.adapters.http import configure_provider_waiter
+    from manga_manager.infrastructure.provider_scheduler import ProviderRequestScheduler
+
+    field = f"{source}_download_concurrency"
+    benchmark_settings = settings.model_copy(update={field: concurrency})
+    sessions = create_session_factory(engine)
+    scheduler = ProviderRequestScheduler(sessions)
+    configure_provider_waiter(scheduler.wait)
+    handler = ChapterDownloadHandler(
+        session_factory=sessions,
+        storage=create_storage(benchmark_settings),
+        cooldowns={
+            name: benchmark_settings.source_cooldown(name)
+            for name in ("asura", "mangafire", "kingofshojo")
+        }
+        | {"default": benchmark_settings.source_cooldown("default")},
+        circuit_breaker_failures=benchmark_settings.circuit_breaker_failures,
+    )
+    service = WorkerService(
+        session_factory=sessions,
+        handlers={JobKind.CHAPTER_DOWNLOAD: handler},
+        settings=benchmark_settings,
+        pools={f"download:{source}"},
+    )
+    with engine.connect() as connection:
+        start_event_id = connection.scalar(text("SELECT coalesce(max(id), 0) FROM job_event")) or 0
+    stop = asyncio.Event()
+    task = asyncio.create_task(service.run(stop))
+    started = time.monotonic()
+    completed = 0
+    rate_limited = False
+    try:
+        while time.monotonic() - started < duration:
+            await asyncio.sleep(0.5)
+            with engine.connect() as connection:
+                completed = int(
+                    connection.scalar(
+                        text(
+                            "SELECT count(*) FROM job_event e JOIN job j ON j.id=e.job_id "
+                            "WHERE e.id>:after AND e.event_type='succeeded' AND j.source=:source"
+                        ),
+                        {"after": start_event_id, "source": source},
+                    )
+                    or 0
+                )
+                state = connection.execute(
+                    text(
+                        "SELECT health_status, cooldown_until > now() AS cooling "
+                        "FROM source_state_v2 WHERE source=:source"
+                    ),
+                    {"source": source},
+                ).first()
+            rate_limited = bool(
+                state is not None and (state.health_status == "cooldown" or state.cooling)
+            )
+            if completed >= max_jobs or rate_limited:
+                break
+    finally:
+        stop.set()
+        await task
+        configure_provider_waiter(None)
+    return {
+        "completed_jobs": completed,
+        "elapsed_seconds": round(time.monotonic() - started, 3),
+        "rate_limited": rate_limited,
+        "abandoned_on_rate_limit": rate_limited and concurrency > 1,
+        "final_concurrency": 1 if rate_limited and concurrency > 1 else concurrency,
+    }
 
 
 def create_storage(settings: V2Settings) -> ContentAddressedStorage:
@@ -372,6 +544,7 @@ def create_storage(settings: V2Settings) -> ContentAddressedStorage:
         max_page_bytes=settings.max_page_bytes,
         max_chapter_bytes=settings.max_chapter_bytes,
         max_pages=settings.max_pages_per_chapter,
+        min_download_pages=settings.min_download_pages,
         min_free_bytes=settings.min_free_bytes,
     )
 

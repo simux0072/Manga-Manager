@@ -2540,14 +2540,15 @@ async def cache_cover_image(
         return None
 
 
-async def refresh_missing_covers(session: Session, limit: int = 100) -> int:
+async def refresh_missing_covers(
+    session: Session, limit: int = 100, source_series_ids: list[int] | None = None
+) -> int:
     refreshed = 0
     results: list[CoverCacheResult] = []
-    rows = session.scalars(
-        select(SourceSeries)
-        .where(SourceSeries.cover_url != "")
-        .order_by(SourceSeries.id.asc())
-    ).all()
+    query = select(SourceSeries).where(SourceSeries.cover_url != "")
+    if source_series_ids:
+        query = query.where(SourceSeries.id.in_(source_series_ids))
+    rows = session.scalars(query.order_by(SourceSeries.id.asc())).all()
     for source_series in rows:
         if refreshed >= limit:
             break
@@ -3383,7 +3384,11 @@ def remove_legacy_bad_chapters(session: Session) -> int:
     return removed
 
 
-async def repair_known_series(session: Session, limit: int | None = None) -> dict[str, int]:
+async def repair_known_series(
+    session: Session,
+    limit: int | None = None,
+    source_series_ids: list[int] | None = None,
+) -> dict[str, int]:
     cleanup = cleanup_bad_discovery_rows(session)
     metadata_cleanup = cleanup_polluted_metadata(session)
     removed_chapters = cleanup["chapters"] + remove_legacy_bad_chapters(session)
@@ -3398,21 +3403,41 @@ async def repair_known_series(session: Session, limit: int | None = None) -> dic
             SourceSeries.id.asc(),
         )
     )
+    if source_series_ids:
+        query = query.where(SourceSeries.id.in_(source_series_ids))
     if limit is not None:
         query = query.limit(limit)
     rows = session.scalars(query).all()
+    rate_limited_sources: set[str] = set()
     for source_series in rows:
+        if source_series.source in rate_limited_sources:
+            continue
         try:
             count = await rescan_source_series(session, source_series.id)
+        except SourceRateLimited as exc:
+            rate_limited_sources.add(source_series.source)
+            logger.warning(
+                "repair rescan paused source=%s after rate limit: %s",
+                source_series.source,
+                exc,
+            )
+            continue
         except Exception as exc:
             logger.warning("repair rescan failed for source_series=%s: %s", source_series.id, exc)
             continue
         rescanned += 1
         if count:
             refreshed += count
-    covers = await refresh_missing_covers(session, limit=limit or 10_000)
+    covers = await refresh_missing_covers(
+        session,
+        limit=limit or 10_000,
+        source_series_ids=source_series_ids,
+    )
     removed_chapters += remove_legacy_bad_chapters(session)
-    matches = regenerate_match_candidates(session)
+    # Candidate regeneration scans the complete legacy catalogue and is intentionally
+    # kept out of targeted rescans.  On large SQLite catalogues that O(n²) pass can
+    # take hours and is unrelated to refreshing the explicitly requested identities.
+    matches = 0 if source_series_ids else regenerate_match_candidates(session)
     recovered_jobs = recover_stale_download_jobs(session)
     result = {
         "rescanned": rescanned,
@@ -3424,6 +3449,7 @@ async def repair_known_series(session: Session, limit: int | None = None) -> dic
         "metadata_covers": metadata_cleanup["covers"],
         "matches": matches,
         "recovered_jobs": recovered_jobs,
+        "rate_limited_sources": len(rate_limited_sources),
     }
     record_activity(
         session,

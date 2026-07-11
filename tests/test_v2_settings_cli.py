@@ -33,3 +33,30 @@ def test_cli_exposes_transition_commands() -> None:
     kavita = parser.parse_args(["enqueue-kavita", "7"])
     assert kavita.command == "enqueue-kavita"
     assert kavita.series_id == 7
+    assert parser.parse_args(["enqueue-probe"]).command == "enqueue-probe"
+    benchmark = parser.parse_args(
+        [
+            "benchmark-workers",
+            "--source",
+            "asura",
+            "--concurrency",
+            "2",
+            "--duration",
+            "30",
+            "--max-jobs",
+            "2",
+            "--dry-run",
+        ]
+    )
+    assert benchmark.concurrency == 2
+    validate = parser.parse_args(
+        [
+            "validate-legacy",
+            "legacy.db",
+            "--storage-root",
+            "storage",
+            "--report",
+            "report.json",
+        ]
+    )
+    assert validate.command == "validate-legacy"

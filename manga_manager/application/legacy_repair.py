@@ -1,15 +1,19 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import os
 import re
 import shutil
 import sqlite3
+import zipfile
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from PIL import Image
 
 
 LATEST_PREFIX = re.compile(r"^\s*Latest:\s*(Chapter\s+.+)$", re.IGNORECASE)
@@ -91,6 +95,13 @@ class LegacyRepair:
                 elif item.action == "split conflicting provider identity":
                     self._split_provider_identity(
                         connection, int(item.evidence["source_series_id"])
+                    )
+                    applied.add(item.key)
+                elif item.action == "consolidate duplicate provider identity":
+                    self._consolidate_provider_identity(
+                        connection,
+                        int(item.evidence["source_series_id"]),
+                        int(item.evidence["kept_source_series_id"]),
                     )
                     applied.add(item.key)
                 elif item.action == "consolidate helper release into numeric chapter":
@@ -179,6 +190,100 @@ class LegacyRepair:
         if cache_path is not None:
             write_manifest_cache(cache_path, records)
         return records
+
+    def validate_archives(
+        self,
+        manifest: list[dict[str, Any]],
+        cache_path: Path | None = None,
+    ) -> list[dict[str, Any]]:
+        if self.storage_root is None:
+            raise ValueError("storage_root is required for archive validation")
+        manifest_by_path = {record["path"]: record for record in manifest}
+        cached: dict[str, dict[str, Any]] = {}
+        if cache_path is not None and cache_path.is_file():
+            try:
+                cached = {
+                    record["path"]: record
+                    for record in json.loads(cache_path.read_text(encoding="utf-8"))
+                }
+            except (KeyError, TypeError, json.JSONDecodeError):
+                cached = {}
+        connection = sqlite3.connect(f"file:{self.database}?mode=ro", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            rows = connection.execute(
+                "SELECT d.path, count(*) AS associations, min(d.source) AS source, "
+                "min(r.number) AS number FROM downloaded_file d "
+                "JOIN chapter_release r ON r.id=d.chapter_release_id "
+                "WHERE d.active=1 GROUP BY d.path ORDER BY d.path"
+            ).fetchall()
+        finally:
+            connection.close()
+        results: list[dict[str, Any]] = []
+        for index, row in enumerate(rows, start=1):
+            relative = self._relative_storage_path(row["path"])
+            manifest_record = manifest_by_path.get(relative)
+            checksum = manifest_record.get("sha256", "") if manifest_record else ""
+            previous = cached.get(relative)
+            if previous and previous.get("sha256") == checksum:
+                result = previous
+            else:
+                errors: list[str] = []
+                image_count = 0
+                path = self.storage_root / relative
+                try:
+                    with zipfile.ZipFile(path) as archive:
+                        names = [name for name in archive.namelist() if not name.endswith("/")]
+                        if "ComicInfo.xml" not in names:
+                            errors.append("missing ComicInfo.xml")
+                        else:
+                            archive.read("ComicInfo.xml")
+                        images = [
+                            name
+                            for name in names
+                            if Path(name).suffix.lower()
+                            in {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"}
+                        ]
+                        image_count = len(images)
+                        if not images:
+                            errors.append("contains no images")
+                        for name in images:
+                            with Image.open(io.BytesIO(archive.read(name))) as image:
+                                image.verify()
+                        for name in names:
+                            if name != "ComicInfo.xml" and name not in images:
+                                archive.read(name)
+                except (OSError, ValueError, zipfile.BadZipFile) as exc:
+                    errors.append(str(exc))
+                if int(row["associations"]) != 1:
+                    errors.append(f"active associations={row['associations']}")
+                review = bool(
+                    row["source"] == "mangafire"
+                    and image_count == 1
+                    and re.search(r"\.(?:1|5)$", row["number"] or "")
+                )
+                result = {
+                    "path": relative,
+                    "sha256": checksum,
+                    "valid": not errors,
+                    "errors": errors,
+                    "images": image_count,
+                    "review_one_page_fractional": review,
+                }
+            results.append(result)
+            if cache_path is not None and index % 25 == 0:
+                write_manifest_cache(cache_path, results)
+        if cache_path is not None:
+            write_manifest_cache(cache_path, results)
+        return results
+
+    def _relative_storage_path(self, value: str) -> str:
+        path = Path(value)
+        if path.is_absolute():
+            path = path.resolve().relative_to(self.storage_root)
+        elif path.parts and path.parts[0] == self.storage_root.name:
+            path = Path(*path.parts[1:])
+        return path.as_posix()
 
     @staticmethod
     def cleanup_archives(storage_root: Path, *, retain_days: int = 30) -> list[Path]:
@@ -588,6 +693,68 @@ class LegacyRepair:
                     )
                 connection.execute("DELETE FROM chapter WHERE id=?", (old_chapter_id,))
 
+    def _consolidate_provider_identity(
+        self,
+        connection: sqlite3.Connection,
+        duplicate_source_series_id: int,
+        kept_source_series_id: int,
+    ) -> None:
+        duplicate = connection.execute(
+            "SELECT series_id, source FROM source_series WHERE id=?",
+            (duplicate_source_series_id,),
+        ).fetchone()
+        kept = connection.execute(
+            "SELECT series_id, source FROM source_series WHERE id=?", (kept_source_series_id,)
+        ).fetchone()
+        if duplicate is None:
+            return
+        if kept is None or duplicate["series_id"] != kept["series_id"]:
+            raise RuntimeError("duplicate provider identities must belong to the same series")
+        if duplicate["source"] != kept["source"]:
+            raise RuntimeError("duplicate provider identities must use the same provider")
+
+        releases = connection.execute(
+            "SELECT id, number FROM chapter_release WHERE source_series_id=? ORDER BY id",
+            (duplicate_source_series_id,),
+        ).fetchall()
+        for release in releases:
+            target = connection.execute(
+                "SELECT id, chapter_id FROM chapter_release "
+                "WHERE source_series_id=? AND number=? ORDER BY id LIMIT 1",
+                (kept_source_series_id, release["number"]),
+            ).fetchone()
+            if target is None:
+                connection.execute(
+                    "UPDATE chapter_release SET source_series_id=? WHERE id=?",
+                    (kept_source_series_id, release["id"]),
+                )
+                if table_exists(connection, "chapter_fingerprint"):
+                    connection.execute(
+                        "UPDATE chapter_fingerprint SET source_series_id=? WHERE chapter_release_id=?",
+                        (kept_source_series_id, release["id"]),
+                    )
+                continue
+            self._consolidate_helper_release(
+                connection, int(release["id"]), int(target["id"]), int(target["chapter_id"])
+            )
+
+        if table_exists(connection, "cover_fingerprint"):
+            connection.execute(
+                "DELETE FROM cover_fingerprint WHERE source_series_id=?",
+                (duplicate_source_series_id,),
+            )
+        if table_exists(connection, "manual_match_rule"):
+            connection.execute(
+                "UPDATE manual_match_rule SET source_series_id=? WHERE source_series_id=?",
+                (kept_source_series_id, duplicate_source_series_id),
+            )
+        if table_exists(connection, "match_candidate"):
+            connection.execute(
+                "DELETE FROM match_candidate WHERE source_series_id=?",
+                (duplicate_source_series_id,),
+            )
+        connection.execute("DELETE FROM source_series WHERE id=?", (duplicate_source_series_id,))
+
     def _consolidate_helper_release(
         self,
         connection: sqlite3.Connection,
@@ -719,6 +886,12 @@ class LegacyRepair:
         if self.storage_root is None or not value:
             return None
         candidate = Path(value)
+        if (
+            not candidate.is_absolute()
+            and candidate.parts
+            and candidate.parts[0] == self.storage_root.name
+        ):
+            candidate = Path(*candidate.parts[1:])
         candidate = (
             candidate.resolve()
             if candidate.is_absolute()
