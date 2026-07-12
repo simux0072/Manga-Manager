@@ -71,11 +71,26 @@ fi
 if [ -n "${STAGE_LEGACY_DATABASE:-}" ]; then
   legacy_database=$(cd "$(dirname "$STAGE_LEGACY_DATABASE")" && pwd)/$(basename "$STAGE_LEGACY_DATABASE")
   legacy_storage=$(cd "${STAGE_LEGACY_STORAGE_ROOT:-storage}" && pwd)
-  docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
-    -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" -v "$legacy_database:/legacy/catalog.db:ro" \
-    -v "$legacy_storage:/legacy/storage:ro" "$image" uv run --frozen manga-manager \
-    migrate-legacy-library /legacy/catalog.db --storage-root /legacy/storage \
-    --report /data/legacy-library-import.json --apply
+  case "$legacy_database:$legacy_storage:$data_dir" in
+    "$PWD"/*:"$PWD"/*:"$PWD"/*)
+      container_database="/host/${legacy_database#"$PWD"/}"
+      container_storage="/host/${legacy_storage#"$PWD"/}"
+      container_data="/host/${data_dir#"$PWD"/}"
+      docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+        -e "V2_STORAGE_ROOT=$container_data" -v "$PWD:/host" "$image" uv run --frozen \
+        manga-manager migrate-legacy-library "$container_database" \
+        --storage-root "$container_storage" \
+        --report "$container_data/legacy-library-import.json" --apply
+      ;;
+    *)
+      docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+        -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" \
+        -v "$legacy_database:/legacy/catalog.db:ro" \
+        -v "$legacy_storage:/legacy/storage:ro" "$image" uv run --frozen manga-manager \
+        migrate-legacy-library /legacy/catalog.db --storage-root /legacy/storage \
+        --report /data/legacy-library-import.json --apply
+      ;;
+  esac
   docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
     -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" \
     uv run --frozen manga-manager reconcile-storage

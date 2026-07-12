@@ -101,7 +101,6 @@ class ContentAddressedStorage:
 
     def store_existing(self, source: Path) -> StoredBlob:
         self.ensure_directories()
-        self.require_free_space(source.stat().st_size)
         validated = self.validate_cbz(source)
         relative = Path("blobs") / validated.checksum[:2] / f"{validated.checksum}.cbz"
         destination = self.root / relative
@@ -112,6 +111,9 @@ class ContentAddressedStorage:
                 try:
                     os.link(source, temporary)
                 except OSError:
+                    # Imports prefer same-filesystem hardlinks, which allocate no archive data.
+                    # Enforce the download watermark only when a real copy is required.
+                    self.require_free_space(validated.byte_count)
                     shutil.copy2(source, temporary)
                 if file_checksum(temporary) != validated.checksum:
                     raise ValueError("stored blob checksum does not match source")

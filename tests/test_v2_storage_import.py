@@ -68,6 +68,22 @@ def test_content_addressed_storage_is_idempotent_and_materializes_projection(
     assert projection.read_bytes() == source.read_bytes()
 
 
+def test_existing_archive_hardlink_does_not_consume_download_watermark(
+    tmp_path: Path, monkeypatch
+) -> None:
+    source = tmp_path / "chapter.cbz"
+    make_cbz(source)
+    store = storage(tmp_path)
+
+    def reject_copy(_required_bytes: int) -> None:
+        raise AssertionError("free-space watermark should only be checked for a copy")
+
+    monkeypatch.setattr(store, "require_free_space", reject_copy)
+    blob = store.store_existing(source)
+    destination = store.root / blob.relative_path
+    assert destination.stat().st_ino == source.stat().st_ino
+
+
 def test_storage_rejects_unsafe_zip_member(tmp_path: Path) -> None:
     source = tmp_path / "unsafe.cbz"
     with zipfile.ZipFile(source, "w") as archive:
