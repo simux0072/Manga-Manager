@@ -13,12 +13,18 @@ Last updated: 2026-07-12
   runs create a SQLite backup before deterministic changes.
 - `scripts/stage-local.sh` is the local rehearsal path when Compose is unavailable. Pi and Traefik
   cutover remains deferred.
-- The current schema head is `0011_classify_legacy_failures`. It repairs nullable source
-  counters, adds description/alias search indexes, classifies known historical failures, and retains
-  the canonical provider uniqueness invariant.
+- The current schema head is `0014_matching_evidence`. It includes durable download plans and job
+  progress, learned provider policies/request samples, perceptual cover evidence, and alternate
+  same-provider listing provenance while retaining the canonical provider uniqueness invariant.
 - Provider requests use PostgreSQL-backed global pacing/cooldowns. Chapter downloads use leased
   provider permits, an ordered bounded page window, streaming CBZ output, and a 256 MiB worker-wide
   in-flight byte budget.
+- Tracking creates a priority barrier for the first two and latest two chapters, followed by bounded
+  ascending backfill. Newly discovered chapters outrank backlog, and untracking cancels only work
+  that has not begun.
+- Provider exploration starts only after seven clean days, requires useful request/download work,
+  and automatically restores the stable tier on limiting signals. Asura tier two requires two clean
+  runs. Recovery probes and `Retry-After` observations continuously refine cooldowns.
 - `validate-legacy` verifies ZIP CRCs, `ComicInfo.xml`, readable images, and one active artifact and
   projection per archive. `rescan-legacy --source-series-id` performs bounded targeted verification
   without rebuilding match candidates for the complete legacy catalogue.
@@ -27,6 +33,10 @@ Last updated: 2026-07-12
   lock enforce one leased chapter job per canonical series.
 - The v2 web application includes Discovery, Library, Updates, Matches, Activity, and Operations.
   Match acceptance validates both complete provider sets before transactional reassignment.
+  All catalog timelines use automatic cursor pagination, while jobs expose durable phase/current/
+  total/byte progress. Library filter presets are stored locally in the browser.
+- Kavita sees the same projected library through a shared bind mount. Mapping precedence is existing
+  Kavita ID, external ID, folder path, then unique title/alias; tracking state mirrors Want to Read.
 
 ## Purpose
 
@@ -649,7 +659,8 @@ UV_CACHE_DIR=.uv-cache uv sync --extra dev
 Run the app:
 
 ```bash
-UV_CACHE_DIR=.uv-cache uv run uvicorn app.main:app --reload
+V2_DATABASE_URL=postgresql+psycopg://manga:manga@127.0.0.1:5432/manga_manager \
+  UV_CACHE_DIR=.uv-cache uv run uvicorn manga_manager.web.app:app --reload
 ```
 
 Open:
@@ -665,9 +676,8 @@ cp .env.example .env
 docker compose up --build
 ```
 
-For Docker usage, leave `DATABASE_URL` unset in `.env` to use the Compose Postgres default. Set it
-only when intentionally overriding the database. The Docker image includes a `/healthz` healthcheck
-and reports unhealthy when scheduler creation, startup, or job inspection fails.
+For Docker usage, Compose supplies `V2_DATABASE_URL` and runs the migration process before web and
+worker. The Docker image includes a `/healthz` healthcheck.
 
 ## Important Development Notes
 
@@ -684,10 +694,9 @@ and reports unhealthy when scheduler creation, startup, or job inspection fails.
 
 ## Remaining Work
 
-High priority:
-
-- Add/update Alembic revisions for any future model changes instead of relying on compatibility code.
-- Consider a real Postgres migration smoke test for CI or release validation.
+Production cutover to the Raspberry Pi/Traefik stack remains intentionally deferred. Before that
+cutover, run the direct-Docker staging rehearsal (including the identity-preserving legacy import),
+configure Kavita credentials/path mapping, and retain the paired PostgreSQL/storage rollback set.
 - Confirm the configured Kavita series/chapter URL templates against the exact Kavita version in use.
 
 Medium priority:

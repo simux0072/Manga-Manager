@@ -21,6 +21,7 @@ from manga_manager.infrastructure.db_models import (
     CatalogSeriesAlias,
     CatalogSourceSeries,
     CatalogSourceState,
+    ProviderPolicy,
 )
 
 
@@ -115,6 +116,9 @@ class CatalogRepository:
         state.cooldown_until = None
         state.last_poll_at = utcnow()
         state.updated_at = utcnow()
+        policy = session.get(ProviderPolicy, source)
+        if policy is not None and policy.clean_since is None:
+            policy.clean_since = utcnow()
         session.flush()
 
     def record_poll_failure(
@@ -136,6 +140,17 @@ class CatalogRepository:
         state.cooldown_until = cooldown_until
         state.last_poll_at = utcnow()
         state.updated_at = utcnow()
+        policy = session.get(ProviderPolicy, source)
+        if policy is not None:
+            policy.clean_since = None
+            if cooldown_until is not None:
+                seconds = max(60, int((cooldown_until - utcnow()).total_seconds()))
+                policy.cooldown_seconds = max(policy.cooldown_seconds, seconds)
+                metadata = dict(policy.metadata_json or {})
+                metadata.update(
+                    {"recovery_probe_step": 0, "next_recovery_probe": (utcnow() + timedelta(minutes=1)).isoformat(), "recovery_probe_successes": 0}
+                )
+                policy.metadata_json = metadata
         session.flush()
 
     def _matching_series(self, session: Session, item: SeriesItem) -> CatalogSeries | None:

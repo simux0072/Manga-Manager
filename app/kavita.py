@@ -34,9 +34,22 @@ class KavitaReadProgress:
 
 
 class KavitaClient:
-    def __init__(self, base_url: str, api_key: str) -> None:
+    def __init__(
+        self,
+        base_url: str,
+        api_key: str,
+        *,
+        local_library_root: Path | None = None,
+        kavita_library_root: Path | None = None,
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.api_key = api_key
+        self.local_library_root = local_library_root or settings.library_root
+        self.kavita_library_root = (
+            kavita_library_root
+            if kavita_library_root is not None
+            else settings.kavita_library_root
+        )
 
     @property
     def configured(self) -> bool:
@@ -69,7 +82,7 @@ class KavitaClient:
     async def scan_folder(self, folder_path: Path) -> None:
         if not self.configured:
             return
-        kavita_folder_path = kavita_path_for_local(folder_path)
+        kavita_folder_path = self.kavita_path_for_local(folder_path)
         async with httpx.AsyncClient(timeout=20) as client:
             response = await client.post(
                 f"{self.base_url}/api/Library/scan-folder",
@@ -186,6 +199,15 @@ class KavitaClient:
             )
             response.raise_for_status()
 
+    def kavita_path_for_local(self, local_path: Path) -> Path:
+        if self.kavita_library_root is None:
+            return local_path
+        try:
+            relative = local_path.resolve().relative_to(self.local_library_root.resolve())
+        except ValueError:
+            return local_path
+        return self.kavita_library_root / relative
+
     def series_url(self, library_id: int, series_id: int) -> str:
         return settings.kavita_series_url_template.format(
             base_url=self.base_url,
@@ -275,5 +297,13 @@ def local_path_for_kavita(kavita_path: str) -> Path:
     return settings.library_root / relative
 
 
-def configured_kavita_client() -> KavitaClient:
-    return KavitaClient(settings.kavita_url, settings.kavita_api_key)
+def configured_kavita_client(
+    local_library_root: Path | None = None,
+    kavita_library_root: Path | None = None,
+) -> KavitaClient:
+    return KavitaClient(
+        settings.kavita_url,
+        settings.kavita_api_key,
+        local_library_root=local_library_root,
+        kavita_library_root=kavita_library_root,
+    )

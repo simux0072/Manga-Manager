@@ -1,5 +1,6 @@
 import asyncio
 import json
+import shutil
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from collections.abc import Callable
@@ -11,7 +12,15 @@ from pydantic import BaseModel
 from sqlalchemy import and_, func, or_, select
 from sqlalchemy.orm import Session, aliased, sessionmaker
 
-from manga_manager.domain.jobs import JobKind, MaintenancePayload, SourcePullPayload
+from app.kavita import configured_kavita_client
+
+from manga_manager.domain.jobs import (
+    JobKind,
+    KavitaSyncPayload,
+    MaintenancePayload,
+    SourcePullPayload,
+)
+from manga_manager.application.download_plans import DownloadPlanCoordinator
 
 from manga_manager.infrastructure.db_models import (
     CatalogChapter,
@@ -26,10 +35,13 @@ from manga_manager.infrastructure.db_models import (
     JobEvent,
     JobPermit,
     LibraryProjection,
+    ProviderBenchmarkRun,
+    ProviderPolicy,
     WorkerHeartbeat,
     WorkJob,
 )
 from manga_manager.infrastructure.job_queue import JobQueue
+from manga_manager.settings import V2Settings
 
 
 TRACKED_STATES = ("interested", "reading", "caught_up", "paused")
@@ -190,6 +202,20 @@ def create_api_router(
             previous = row.status
             row.status = change.status
             row.updated_at = utcnow()
+            coordinator = DownloadPlanCoordinator()
+            if change.status in TRACKED_STATES:
+                coordinator.track(session, row.id)
+            else:
+                coordinator.untrack(session, row.id)
+            if row.kavita_series_id is not None:
+                JobQueue().enqueue(
+                    session,
+                    kind=JobKind.KAVITA_SYNC,
+                    dedupe_key=f"series:{row.id}",
+                    payload=KavitaSyncPayload(series_id=row.id),
+                    priority=10,
+                    series_key=str(row.id),
+                )
         return {
             "item": serialize_series(session, [row], include_progress=True)[0],
             "previous": previous,
@@ -322,17 +348,22 @@ def create_api_router(
         }
 
     @router.get("/matches")
-    async def matches(session: SessionDep):
+    async def matches(
+        session: SessionDep,
+        cursor: int = Query(default=0, ge=0),
+        limit: int = Query(default=24, ge=1, le=100),
+    ):
         left = aliased(CatalogSourceSeries)
         right = aliased(CatalogSourceSeries)
-        rows = session.execute(
+        query = (
             select(CatalogMatchDecision, left, right)
             .join(left, left.id == CatalogMatchDecision.left_source_series_id)
             .join(right, right.id == CatalogMatchDecision.right_source_series_id)
             .where(CatalogMatchDecision.decision == "pending")
-            .order_by(CatalogMatchDecision.confidence.desc(), CatalogMatchDecision.id)
-            .limit(100)
-        ).all()
+        )
+        if cursor:
+            query = query.where(CatalogMatchDecision.id > cursor)
+        rows = session.execute(query.order_by(CatalogMatchDecision.id).limit(limit)).all()
         canonical_ids = {
             source.series_id for _, left_row, right_row in rows for source in (left_row, right_row)
         }
@@ -365,7 +396,8 @@ def create_api_router(
                     },
                 }
                 for decision, left_row, right_row in rows
-            ]
+            ],
+            "next_cursor": rows[-1][0].id if len(rows) == limit else None,
         }
 
     @router.post("/matches/{decision_id}")
@@ -487,6 +519,18 @@ def create_api_router(
         permit_counts = dict(
             session.execute(select(JobPermit.pool, func.count()).group_by(JobPermit.pool)).all()
         )
+        settings = V2Settings()
+        try:
+            disk = shutil.disk_usage(settings.storage_root)
+        except OSError:
+            disk = shutil.disk_usage(".")
+        database_bytes = 0
+        if session.bind is not None and session.bind.dialect.name == "postgresql":
+            database_bytes = int(
+                session.scalar(select(func.pg_database_size(func.current_database()))) or 0
+            )
+        policies = session.scalars(select(ProviderPolicy).order_by(ProviderPolicy.source)).all()
+        kavita = configured_kavita_client(local_library_root=settings.storage_root / "library")
         return {
             "job_counts": counts,
             "health": {
@@ -498,6 +542,10 @@ def create_api_router(
                     .where(ChapterArtifact.state == "active")
                 )
                 or 0,
+                "storage_free_bytes": disk.free,
+                "storage_total_bytes": disk.total,
+                "database_bytes": database_bytes,
+                "kavita_configured": int(kavita.configured),
                 "missing_projections": session.scalar(
                     select(func.count())
                     .select_from(ChapterArtifact)
@@ -535,6 +583,38 @@ def create_api_router(
                 for row in workers
             ],
             "permits": permit_counts,
+            "provider_policies": [
+                {
+                    "source": row.source,
+                    "job_limit": row.learned_job_limit,
+                    "page_limit": row.learned_page_limit,
+                    "cooldown_seconds": row.cooldown_seconds,
+                    "clean_since": row.clean_since.isoformat() if row.clean_since else None,
+                    "last_limited_at": row.last_limited_at.isoformat()
+                    if row.last_limited_at
+                    else None,
+                    "next_exploration_at": row.next_exploration_at.isoformat()
+                    if row.next_exploration_at
+                    else None,
+                }
+                for row in policies
+            ],
+            "recent_benchmarks": [
+                {
+                    "id": row.id,
+                    "source": row.source,
+                    "state": row.state,
+                    "tier": row.requested_tier,
+                    "requests": row.request_count,
+                    "failures": row.failure_count,
+                    "signal": row.limiting_signal,
+                }
+                for row in session.scalars(
+                    select(ProviderBenchmarkRun)
+                    .order_by(ProviderBenchmarkRun.id.desc())
+                    .limit(10)
+                )
+            ],
         }
 
     @router.post("/sources/{source}/pull")
@@ -739,6 +819,20 @@ def serialize_jobs(session: Session, rows: list[WorkJob]) -> list[dict[str, Any]
                 "created_at": row.created_at.isoformat(),
                 "updated_at": row.updated_at.isoformat(),
                 "completed_at": row.completed_at.isoformat() if row.completed_at else None,
+                "progress": {
+                    "phase": row.progress_phase,
+                    "current": row.progress_current,
+                    "total": row.progress_total,
+                    "unit": row.progress_unit,
+                    "bytes": row.progress_bytes,
+                    "message": row.progress_message,
+                    "updated_at": row.progress_updated_at.isoformat()
+                    if row.progress_updated_at
+                    else None,
+                    "percent": round(row.progress_current / row.progress_total * 100, 1)
+                    if row.progress_total
+                    else None,
+                },
                 "context": context,
             }
         )
@@ -752,7 +846,7 @@ def human_evidence(raw: dict[str, Any] | None) -> list[dict[str, str]]:
         labels.append({"tone": "positive", "label": "Shared external ID"})
     if data.get("cover_match") is True:
         labels.append({"tone": "positive", "label": "Cover match"})
-    elif data.get("cover_match") is False:
+    elif data.get("cover_compared") and data.get("cover_match") is False:
         labels.append({"tone": "warning", "label": "Cover mismatch"})
     if data.get("title_or_alias") or data.get("title_match"):
         labels.append({"tone": "positive", "label": "Strong title or alias match"})

@@ -155,7 +155,7 @@ async def test_source_pull_keeps_database_closed_during_http_and_ingests_idempot
         assert state.health_status == "healthy"
         assert state.frontier_json == [{"source_id": "series-1", "latest_chapter": "10.0"}]
         progress = session.scalars(select(JobEvent).where(JobEvent.event_type == "progress")).all()
-        assert len(progress) == 2
+        assert len(progress) == 4
 
 
 @pytest.mark.asyncio

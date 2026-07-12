@@ -53,17 +53,17 @@ class WorkerService:
             ("source_pull", 1, {JobKind.SOURCE_PULL}),
             (
                 "download:asura",
-                self.settings.asura_download_concurrency,
+                2,
                 {JobKind.CHAPTER_DOWNLOAD},
             ),
             (
                 "download:kingofshojo",
-                self.settings.kingofshojo_download_concurrency,
+                4,
                 {JobKind.CHAPTER_DOWNLOAD},
             ),
             (
                 "download:mangafire",
-                self.settings.mangafire_download_concurrency,
+                4,
                 {JobKind.CHAPTER_DOWNLOAD},
             ),
             ("kavita", 1, {JobKind.KAVITA_SYNC}),

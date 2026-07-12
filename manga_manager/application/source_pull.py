@@ -12,6 +12,7 @@ from app.adapters import adapter_for_source
 from app.adapters.base import FrontierSentinel, SourceAdapter, SourceRateLimited
 from app.domain import ChapterItem, SeriesItem
 from manga_manager.application.job_handlers import JobContext, PermanentJobError, RetryableJobError
+from manga_manager.application.cover_evidence import CoverEvidenceService
 from manga_manager.domain.jobs import SourcePullPayload
 from manga_manager.infrastructure.catalog_repository import CatalogRepository
 from manga_manager.infrastructure.job_queue import JobQueue
@@ -88,7 +89,11 @@ class SourcePullHandler:
         for index, row in enumerate(fetched, start=1):
             context.ensure_lease()
             with self.session_factory() as session, session.begin():
-                self.catalog.ingest(session, row.item, row.chapters)
+                source_series = self.catalog.ingest(session, row.item, row.chapters)
+                source_series_id = source_series.id
+            await CoverEvidenceService(self.session_factory).refresh_for_source_series(
+                source_series_id
+            )
             if index == len(fetched) or index % 10 == 0:
                 with self.session_factory() as session, session.begin():
                     if not self.queue.progress(
@@ -96,7 +101,13 @@ class SourcePullHandler:
                         job_id=context.lease.id,
                         owner=context.lease.owner,
                         message=f"ingested {index}/{len(fetched)} series",
-                        details={"processed": index, "total": len(fetched), "source": source},
+                        details={
+                            "phase": "ingest",
+                            "processed": len(fetched) + index,
+                            "total": len(fetched) * 2,
+                            "unit": "steps",
+                            "source": source,
+                        },
                     ):
                         context.lease_lost.set()
                         context.ensure_lease()
@@ -130,7 +141,7 @@ class SourcePullHandler:
         items = await adapter.list_recent_frontier(frontier)
         fetched: list[FetchedSeries] = []
         failures = 0
-        for item in items:
+        for index, item in enumerate(items, start=1):
             context.ensure_lease()
             try:
                 detail = getattr(adapter, "get_series_detail", None)
@@ -144,6 +155,23 @@ class SourcePullHandler:
                 logger.warning(
                     "source item failed source=%s url=%s: %s", item.source, item.url, exc
                 )
+            if index == len(items) or index % 5 == 0:
+                with self.session_factory() as session, session.begin():
+                    if not self.queue.progress(
+                        session,
+                        job_id=context.lease.id,
+                        owner=context.lease.owner,
+                        message=f"fetched {index}/{len(items)} series",
+                        details={
+                            "phase": "enrichment",
+                            "processed": index,
+                            "total": len(items) * 2,
+                            "unit": "steps",
+                            "source": item.source,
+                        },
+                    ):
+                        context.lease_lost.set()
+                        context.ensure_lease()
         return fetched, failures
 
     def _record_failure(

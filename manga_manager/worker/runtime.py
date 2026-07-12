@@ -13,6 +13,7 @@ from typing import ContextManager
 from sqlalchemy.orm import Session
 
 from manga_manager.application.job_handlers import (
+    DeferredJobError,
     JobContext,
     JobHandler,
     LeaseLostError,
@@ -106,6 +107,19 @@ class JobWorker:
         heartbeat = asyncio.create_task(self._heartbeat_loop(lease, lease_lost))
         try:
             await handler(context)
+        except DeferredJobError as exc:
+            now = self.clock()
+            with self.session_factory() as session, session.begin():
+                deferred = self.queue.defer(
+                    session,
+                    job_id=lease.id,
+                    owner=lease.owner,
+                    available_at=now + exc.retry_after,
+                    code=exc.code,
+                    message=exc.message,
+                    now=now,
+                )
+            return WorkerRunResult.RETRY_SCHEDULED if deferred else WorkerRunResult.LEASE_LOST
         except RetryableJobError as exc:
             return self._retry(
                 lease,

@@ -107,11 +107,20 @@ def build_parser() -> argparse.ArgumentParser:
     importer.add_argument("source", type=Path)
     importer.add_argument("--dry-run", action="store_true")
     importer.add_argument("--report", type=Path, default=Path("cbz-import-report.json"))
+    legacy_import = subcommands.add_parser(
+        "migrate-legacy-library", help="import active legacy CBZs using legacy identity evidence"
+    )
+    legacy_import.add_argument("database", type=Path)
+    legacy_import.add_argument("--storage-root", type=Path, required=True)
+    legacy_import.add_argument("--report", type=Path, default=Path("legacy-library-import.json"))
+    legacy_import.add_argument("--apply", action="store_true")
     download = subcommands.add_parser("enqueue-download", help="enqueue one chapter release")
     download.add_argument("chapter_release_id", type=int)
     subcommands.add_parser("reconcile-storage", help="repair the projected library from blobs")
     kavita = subcommands.add_parser("enqueue-kavita", help="enqueue one series for Kavita sync")
     kavita.add_argument("series_id", type=int)
+    kavita_check = subcommands.add_parser("kavita-check", help="verify Kavita auth and path mapping")
+    kavita_check.add_argument("--scan-test", action="store_true")
     subcommands.add_parser("enqueue-probe", help="enqueue a deterministic staging probe")
     return parser
 
@@ -345,6 +354,32 @@ def main(argv: Sequence[str] | None = None) -> int:
             counts[record.status] = counts.get(record.status, 0) + 1
         print(" ".join(f"{key}={value}" for key, value in sorted(counts.items())))
         return 0
+    if args.command == "migrate-legacy-library":
+        sessions = create_session_factory(engine)
+        storage = create_storage(settings)
+        completed_paths: set[str] = set()
+        if args.apply and args.report.is_file():
+            try:
+                previous = json.loads(args.report.read_text(encoding="utf-8"))
+                completed_paths = {
+                    str(row["path"])
+                    for row in previous
+                    if row.get("status") in {"activated", "duplicate", "resumed"}
+                }
+            except (OSError, ValueError, TypeError, KeyError):
+                completed_paths = set()
+        records = LegacyCbzImporter(session_factory=sessions, storage=storage).import_legacy_database(
+            args.database,
+            storage_root=args.storage_root,
+            dry_run=not args.apply,
+            completed_paths=completed_paths,
+        )
+        write_report(args.report, records)
+        counts: dict[str, int] = {}
+        for record in records:
+            counts[record.status] = counts.get(record.status, 0) + 1
+        print(" ".join(f"{key}={value}" for key, value in sorted(counts.items())))
+        return 0
     if args.command == "enqueue-download":
         if args.chapter_release_id < 1:
             parser.error("chapter_release_id must be positive")
@@ -388,6 +423,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         print(f"job_id={job.id} created={str(created).lower()}")
         return 0
+    if args.command == "kavita-check":
+        from app.kavita import configured_kavita_client
+
+        async def check_kavita():
+            client = configured_kavita_client(local_library_root=settings.storage_root / "library")
+            if not client.configured:
+                return {"ok": False, "configured": False, "reason": "Kavita is not configured"}
+            expires = await client.authkey_expires()
+            series = await client.list_series()
+            if args.scan_test:
+                await client.scan_folder_or_all(settings.storage_root / "library")
+            return {
+                "ok": True,
+                "configured": True,
+                "authkey_expires": expires,
+                "series_visible": len(series),
+                "mapped_root": str(client.kavita_path_for_local(settings.storage_root / "library")),
+                "scan_test": bool(args.scan_test),
+            }
+
+        print(json.dumps(asyncio.run(check_kavita()), sort_keys=True))
+        return 0
     if args.command == "enqueue-probe":
         sessions = create_session_factory(engine)
         with sessions() as session, session.begin():
@@ -410,8 +467,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 async def run_worker(settings: V2Settings, engine) -> int:
-    from app.adapters.http import configure_provider_waiter
+    from app.adapters.http import configure_provider_waiter, configure_request_observer
     from manga_manager.infrastructure.provider_scheduler import ProviderRequestScheduler
+    from manga_manager.infrastructure.provider_telemetry import ProviderTelemetry
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -420,7 +478,9 @@ async def run_worker(settings: V2Settings, engine) -> int:
             loop.add_signal_handler(signum, stop.set)
     sessions = create_session_factory(engine)
     request_scheduler = ProviderRequestScheduler(sessions)
+    telemetry = ProviderTelemetry(sessions)
     configure_provider_waiter(request_scheduler.wait)
+    configure_request_observer(telemetry.active_observer)
     source_pull = SourcePullHandler(session_factory=sessions)
     chapter_download = ChapterDownloadHandler(
         session_factory=sessions,
@@ -456,6 +516,7 @@ async def run_worker(settings: V2Settings, engine) -> int:
         await asyncio.gather(service.run(stop), scheduler.run(stop))
     finally:
         configure_provider_waiter(None)
+        configure_request_observer(None)
     return 0
 
 
@@ -468,14 +529,18 @@ async def run_worker_benchmark(
     duration: int,
     max_jobs: int,
 ) -> dict[str, object]:
-    from app.adapters.http import configure_provider_waiter
+    from app.adapters.http import configure_provider_waiter, configure_request_observer
     from manga_manager.infrastructure.provider_scheduler import ProviderRequestScheduler
+    from manga_manager.infrastructure.provider_telemetry import ProviderTelemetry
 
     field = f"{source}_download_concurrency"
     benchmark_settings = settings.model_copy(update={field: concurrency})
     sessions = create_session_factory(engine)
     scheduler = ProviderRequestScheduler(sessions)
+    telemetry = ProviderTelemetry(sessions)
+    run_id = telemetry.begin(source, concurrency)
     configure_provider_waiter(scheduler.wait)
+    configure_request_observer(telemetry.observer(run_id))
     handler = ChapterDownloadHandler(
         session_factory=sessions,
         storage=create_storage(benchmark_settings),
@@ -529,13 +594,25 @@ async def run_worker_benchmark(
         stop.set()
         await task
         configure_provider_waiter(None)
-    return {
+        configure_request_observer(None)
+    result = {
         "completed_jobs": completed,
         "elapsed_seconds": round(time.monotonic() - started, 3),
         "rate_limited": rate_limited,
         "abandoned_on_rate_limit": rate_limited and concurrency > 1,
         "final_concurrency": 1 if rate_limited and concurrency > 1 else concurrency,
+        "benchmark_run_id": run_id,
     }
+    policy = telemetry.finish(run_id, rate_limited=rate_limited, report=result)
+    result["learned_policy"] = {
+        "job_limit": policy.learned_job_limit,
+        "page_limit": policy.learned_page_limit,
+        "cooldown_seconds": policy.cooldown_seconds,
+        "next_exploration_at": policy.next_exploration_at.isoformat()
+        if policy.next_exploration_at
+        else None,
+    }
+    return result
 
 
 def create_storage(settings: V2Settings) -> ContentAddressedStorage:

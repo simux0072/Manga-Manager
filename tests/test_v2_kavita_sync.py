@@ -45,6 +45,7 @@ class FakeKavitaClient:
     def __init__(self, sessions: TrackingSessions) -> None:
         self.sessions = sessions
         self.scanned: Path | None = None
+        self.wanted: list[int] = []
 
     async def scan_folder_or_all(self, folder_path: Path) -> None:
         assert self.sessions.active == 0
@@ -58,6 +59,12 @@ class FakeKavitaClient:
         assert self.sessions.active == 0
         assert series_id == 20
         return [KavitaChapter(id=30, number="1", volume_id=4)]
+
+    async def add_want_to_read(self, series_ids: list[int]) -> None:
+        self.wanted.extend(series_ids)
+
+    async def remove_want_to_read(self, series_ids: list[int]) -> None:
+        self.wanted = [value for value in self.wanted if value not in series_ids]
 
 
 def make_cbz(path: Path) -> None:
@@ -98,6 +105,7 @@ async def test_kavita_sync_maps_series_and_chapters_without_open_database_sessio
     with sessions() as session, session.begin():
         series = session.scalar(select(CatalogSeries))
         assert series is not None
+        series.status = "interested"
         JobQueue().enqueue(
             session,
             kind=JobKind.KAVITA_SYNC,
@@ -122,6 +130,7 @@ async def test_kavita_sync_maps_series_and_chapters_without_open_database_sessio
     )(JobContext(lease=lease, lease_lost=asyncio.Event()))
 
     assert client.scanned is not None
+    assert client.wanted == [20]
     with sessions() as session:
         series = session.get(CatalogSeries, series_id)
         chapter = session.scalar(select(CatalogChapter))

@@ -1,9 +1,18 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from sqlalchemy import select
 
-from manga_manager.application.job_handlers import JobContext, PermanentJobError
+from app.adapters import adapter_for_source
+from app.adapters.base import SourceRateLimited
+from manga_manager.application.job_handlers import (
+    DeferredJobError,
+    JobContext,
+    PermanentJobError,
+)
 from manga_manager.domain.jobs import MaintenancePayload
+from manga_manager.infrastructure.db_models import CatalogSourceState, ProviderPolicy
 from manga_manager.worker.runtime import SessionFactory
 
 
@@ -15,9 +24,78 @@ class MaintenanceHandler:
         payload = context.lease.payload
         if not isinstance(payload, MaintenancePayload):
             raise RuntimeError("maintenance handler received the wrong payload")
+        if payload.action.startswith("provider_probe_"):
+            await self._provider_probe(payload.action.removeprefix("provider_probe_"), context)
+            return
         if payload.action != "stage_probe":
             raise PermanentJobError("unknown_maintenance_action", payload.action)
         context.ensure_lease()
         with self.session_factory() as session:
             session.execute(select(1))
         context.ensure_lease()
+
+    async def _provider_probe(self, source: str, context: JobContext) -> None:
+        adapter = adapter_for_source(source)
+        if adapter is None:
+            raise DeferredJobError(
+                "provider_unavailable", source, retry_after=timedelta(minutes=5)
+            )
+        try:
+            await adapter.list_recent_frontier([])
+        except SourceRateLimited as exc:
+            delay = timedelta(minutes=self._record_probe_failure(source))
+            raise DeferredJobError("rate_limited", str(exc), retry_after=delay) from exc
+        finally:
+            await adapter.aclose()
+        context.ensure_lease()
+        now = datetime.now(timezone.utc)
+        with self.session_factory() as session, session.begin():
+            policy = session.get(ProviderPolicy, source)
+            state = session.get(CatalogSourceState, source)
+            if policy is None:
+                return
+            metadata = dict(policy.metadata_json or {})
+            successes = int(metadata.get("recovery_probe_successes") or 0) + 1
+            metadata["recovery_probe_successes"] = successes
+            if successes >= 2:
+                started = metadata.get("recovery_started_at")
+                if started:
+                    try:
+                        elapsed = int(
+                            (now - datetime.fromisoformat(str(started))).total_seconds()
+                        )
+                        policy.cooldown_seconds = max(60, min(21600, int(elapsed * 1.2)))
+                    except (TypeError, ValueError):
+                        pass
+                for key in (
+                    "next_recovery_probe",
+                    "recovery_probe_step",
+                    "recovery_probe_successes",
+                    "recovery_started_at",
+                ):
+                    metadata.pop(key, None)
+                if state is not None:
+                    state.cooldown_until = None
+                    state.health_status = "healthy"
+            else:
+                metadata["next_recovery_probe"] = (now + timedelta(seconds=30)).isoformat()
+            policy.metadata_json = metadata
+            policy.updated_at = now
+
+    def _record_probe_failure(self, source: str) -> int:
+        intervals = [1, 2, 5, 10, 20, 40, 60]
+        now = datetime.now(timezone.utc)
+        with self.session_factory() as session, session.begin():
+            policy = session.get(ProviderPolicy, source)
+            if policy is None:
+                return 5
+            metadata = dict(policy.metadata_json or {})
+            step = min(int(metadata.get("recovery_probe_step") or 0) + 1, len(intervals) - 1)
+            delay = intervals[step]
+            metadata["recovery_probe_step"] = step
+            metadata["recovery_probe_successes"] = 0
+            metadata.setdefault("recovery_started_at", now.isoformat())
+            metadata["next_recovery_probe"] = (now + timedelta(minutes=delay)).isoformat()
+            policy.metadata_json = metadata
+            policy.updated_at = now
+            return delay

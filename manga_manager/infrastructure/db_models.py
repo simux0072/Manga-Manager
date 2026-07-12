@@ -106,6 +106,15 @@ class WorkJob(JobBase):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    progress_phase: Mapped[str] = mapped_column(String(50), default="")
+    progress_current: Mapped[int] = mapped_column(Integer, default=0)
+    progress_total: Mapped[int] = mapped_column(Integer, default=0)
+    progress_unit: Mapped[str] = mapped_column(String(30), default="")
+    progress_bytes: Mapped[int] = mapped_column(Integer, default=0)
+    progress_message: Mapped[str] = mapped_column(Text, default="")
+    progress_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class JobPermit(JobBase):
@@ -250,6 +259,47 @@ class CatalogSourceSeries(JobBase):
     )
 
 
+class CatalogAlternateSourceListing(JobBase):
+    __tablename__ = "alternate_source_listing_v2"
+    __table_args__ = (
+        UniqueConstraint("source", "source_id", name="uq_alternate_source_listing_identity"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    primary_source_series_id: Mapped[int] = mapped_column(
+        ForeignKey("source_series_v2.id", ondelete="CASCADE"), index=True
+    )
+    source: Mapped[str] = mapped_column(String(50), index=True)
+    source_id: Mapped[str] = mapped_column(String(500))
+    title: Mapped[str] = mapped_column(String(500))
+    url: Mapped[str] = mapped_column(Text)
+    evidence_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON().with_variant(JSONB(none_as_null=True), "postgresql"), default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class CatalogCoverFingerprint(JobBase):
+    __tablename__ = "cover_fingerprint_v2"
+    __table_args__ = (
+        UniqueConstraint(
+            "source_series_id", "algorithm", name="uq_cover_fingerprint_v2_source_algorithm"
+        ),
+        Index("ix_cover_fingerprint_v2_hash", "algorithm", "hash_hex"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_series_id: Mapped[int] = mapped_column(
+        ForeignKey("source_series_v2.id", ondelete="CASCADE"), index=True
+    )
+    algorithm: Mapped[str] = mapped_column(String(40), default="dhash-crop-v2")
+    hash_hex: Mapped[str] = mapped_column(String(128), index=True)
+    content_sha256: Mapped[str] = mapped_column(String(64), default="")
+    width: Mapped[int] = mapped_column(Integer, default=0)
+    height: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class CatalogSeriesAlias(JobBase):
     __tablename__ = "series_alias_v2"
     __table_args__ = (
@@ -329,6 +379,63 @@ class CatalogChapterReadingState(JobBase):
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class SeriesDownloadPlan(JobBase):
+    __tablename__ = "series_download_plan"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('active', 'complete', 'cancelled')",
+            name="ck_series_download_plan_status",
+        ),
+        CheckConstraint(
+            "phase IN ('priority', 'backfill', 'complete', 'cancelled')",
+            name="ck_series_download_plan_phase",
+        ),
+        Index("ix_series_download_plan_status_phase", "status", "phase"),
+    )
+
+    series_id: Mapped[int] = mapped_column(
+        ForeignKey("series_v2.id", ondelete="CASCADE"), primary_key=True
+    )
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    phase: Mapped[str] = mapped_column(String(20), default="priority", index=True)
+    total_chapters: Mapped[int] = mapped_column(Integer, default=0)
+    satisfied_chapters: Mapped[int] = mapped_column(Integer, default=0)
+    attention_chapters: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ChapterDownloadIntent(JobBase):
+    __tablename__ = "chapter_download_intent"
+    __table_args__ = (
+        CheckConstraint(
+            "tier IN ('current', 'priority', 'backfill')",
+            name="ck_chapter_download_intent_tier",
+        ),
+        CheckConstraint(
+            "state IN ('blocked', 'pending', 'queued', 'satisfied', 'attention', 'cancelled')",
+            name="ck_chapter_download_intent_state",
+        ),
+        UniqueConstraint("series_id", "chapter_id", name="uq_chapter_download_intent_chapter"),
+        Index("ix_chapter_download_intent_plan_state", "series_id", "tier", "state"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    series_id: Mapped[int] = mapped_column(
+        ForeignKey("series_v2.id", ondelete="CASCADE"), index=True
+    )
+    chapter_id: Mapped[int] = mapped_column(
+        ForeignKey("chapter_v2.id", ondelete="CASCADE"), index=True
+    )
+    tier: Mapped[str] = mapped_column(String(20), default="backfill", index=True)
+    state: Mapped[str] = mapped_column(String(20), default="blocked", index=True)
+    job_id: Mapped[int | None] = mapped_column(
+        ForeignKey("job.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class CatalogChapterRelease(JobBase):
     __tablename__ = "chapter_release_v2"
     __table_args__ = (
@@ -380,6 +487,66 @@ class CatalogSourceState(JobBase):
     next_request_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_poll_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ProviderPolicy(JobBase):
+    __tablename__ = "provider_policy"
+
+    source: Mapped[str] = mapped_column(String(50), primary_key=True)
+    learned_job_limit: Mapped[int] = mapped_column(Integer, default=1)
+    learned_page_limit: Mapped[int] = mapped_column(Integer, default=1)
+    request_interval_seconds: Mapped[float] = mapped_column(default=0.0)
+    cooldown_seconds: Mapped[int] = mapped_column(Integer, default=300)
+    clean_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_limited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_exploration_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    successful_tier_runs: Mapped[int] = mapped_column(Integer, default=0)
+    metadata_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON().with_variant(JSONB(none_as_null=True), "postgresql"), default=dict
+    )
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ProviderBenchmarkRun(JobBase):
+    __tablename__ = "provider_benchmark_run"
+    __table_args__ = (Index("ix_provider_benchmark_source_started", "source", "started_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source: Mapped[str] = mapped_column(String(50), index=True)
+    state: Mapped[str] = mapped_column(String(20), default="running", index=True)
+    requested_tier: Mapped[int] = mapped_column(Integer, default=1)
+    stable_tier: Mapped[int] = mapped_column(Integer, default=1)
+    request_count: Mapped[int] = mapped_column(Integer, default=0)
+    success_count: Mapped[int] = mapped_column(Integer, default=0)
+    failure_count: Mapped[int] = mapped_column(Integer, default=0)
+    limiting_signal: Mapped[str] = mapped_column(Text, default="")
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    report_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON().with_variant(JSONB(none_as_null=True), "postgresql"), default=dict
+    )
+
+
+class ProviderRequestSample(JobBase):
+    __tablename__ = "provider_request_sample"
+    __table_args__ = (Index("ix_provider_sample_run_created", "run_id", "created_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    run_id: Mapped[int] = mapped_column(
+        ForeignKey("provider_benchmark_run.id", ondelete="CASCADE"), index=True
+    )
+    source: Mapped[str] = mapped_column(String(50), index=True)
+    host: Mapped[str] = mapped_column(String(255), default="")
+    status_code: Mapped[int] = mapped_column(Integer, default=0)
+    latency_ms: Mapped[int] = mapped_column(Integer, default=0)
+    byte_count: Mapped[int] = mapped_column(Integer, default=0)
+    error_code: Mapped[str] = mapped_column(String(100), default="")
+    retry_after_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    headers_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON().with_variant(JSONB(none_as_null=True), "postgresql"), default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class CatalogMatchDecision(JobBase):

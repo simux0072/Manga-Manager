@@ -20,6 +20,7 @@ from manga_manager.infrastructure.db_models import (
     CatalogSourceState,
     JobEvent,
     JobPermit,
+    ProviderPolicy,
     WorkJob,
 )
 
@@ -432,13 +433,22 @@ class JobQueue:
         )
         if job is None:
             return False
+        payload = dict(details or {})
+        job.progress_phase = str(payload.get("phase") or job.progress_phase or "working")[:50]
+        job.progress_current = max(int(payload.get("processed") or payload.get("current") or 0), 0)
+        job.progress_total = max(int(payload.get("total") or 0), 0)
+        job.progress_unit = str(payload.get("unit") or job.progress_unit or "items")[:30]
+        job.progress_bytes = max(int(payload.get("bytes") or job.progress_bytes or 0), 0)
+        job.progress_message = message[:4000]
+        job.progress_updated_at = current
+        job.updated_at = current
         self._record_event(
             session,
             job,
             "progress",
             owner=owner,
             message=message,
-            details=details,
+            details=payload,
         )
         session.flush()
         return True
@@ -473,6 +483,48 @@ class JobQueue:
         job.updated_at = current
         self._release_permits(session, job.id)
         self._record_event(session, job, "released", owner=owner, message=reason)
+        session.flush()
+        return True
+
+    def defer(
+        self,
+        session: Session,
+        *,
+        job_id: int,
+        owner: str,
+        available_at: datetime,
+        code: str,
+        message: str,
+        now: datetime | None = None,
+    ) -> bool:
+        current = now or utcnow()
+        job = session.scalar(
+            select(WorkJob)
+            .where(WorkJob.id == job_id)
+            .where(WorkJob.status == JobState.LEASED.value)
+            .where(WorkJob.lease_owner == owner)
+            .with_for_update()
+        )
+        if job is None:
+            return False
+        job.status = JobState.RETRY_WAIT.value
+        job.attempts = max(job.attempts - 1, 0)
+        job.available_at = available_at
+        job.lease_owner = ""
+        job.lease_expires_at = None
+        job.heartbeat_at = None
+        job.error_code = code
+        job.error_message = message
+        job.updated_at = current
+        self._release_permits(session, job.id)
+        self._record_event(
+            session,
+            job,
+            "retry_scheduled",
+            owner=owner,
+            message=message,
+            details={"error_code": code, "available_at": available_at.isoformat(), "blocked": True},
+        )
         session.flush()
         return True
 
@@ -555,6 +607,20 @@ class JobQueue:
         pools = sorted(set(filter(None, pools)))
         for pool in pools:
             limit = limits.get(pool)
+            if pool.startswith("download:") and job.source:
+                policy = session.get(ProviderPolicy, job.source)
+                if policy is not None and (
+                    policy.expires_at is None or aware_datetime(policy.expires_at) > now
+                ):
+                    limit = policy.learned_job_limit
+                    metadata = dict(policy.metadata_json or {})
+                    until = metadata.get("exploration_until")
+                    if until:
+                        try:
+                            if datetime.fromisoformat(str(until)) > now:
+                                limit = max(limit, int(metadata.get("exploration_tier") or limit))
+                        except ValueError:
+                            pass
             if limit is None:
                 continue
             if session.bind is not None and session.bind.dialect.name == "postgresql":
@@ -618,3 +684,7 @@ def default_pool(kind: JobKind, source: str = "") -> str:
     if kind is JobKind.NOTIFICATION:
         return "notification"
     return "maintenance"
+
+
+def aware_datetime(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)

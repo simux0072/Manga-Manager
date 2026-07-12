@@ -6,7 +6,7 @@ from urllib.parse import unquote, urljoin, urlparse
 
 from app.adapters.asura import clean_series_title, dedupe_chapters, dedupe_series
 from app.adapters.base import FrontierSentinel, SourceAdapter
-from app.adapters.http import HttpSourceClient, iter_ordered_bytes, page_concurrency_for_source
+from app.adapters.http import HttpSourceClient, enumerate_async, iter_ordered_bytes, page_concurrency_for_source
 from app.adapters.parsing import clean_chapter_title, extract_image_urls, nearby_cover_attr, parse_source_date
 from app.domain import ChapterItem, SeriesItem, normalize_chapter_number
 from app.settings import settings
@@ -182,15 +182,19 @@ class KingOfShojoAdapter(SourceAdapter):
     async def download_chapter_pages(self, chapter: ChapterItem) -> list[bytes]:
         return [page async for page in self.iter_chapter_pages(chapter)]
 
-    async def iter_chapter_pages(self, chapter: ChapterItem) -> AsyncIterator[bytes]:
+    async def iter_chapter_pages(self, chapter: ChapterItem, progress=None) -> AsyncIterator[bytes]:
         soup = await self.client.get_soup(chapter.url)
         urls = self.parse_chapter_image_urls(soup)
-        async for page in iter_ordered_bytes(
+        total_bytes = 0
+        async for index, page in enumerate_async(iter_ordered_bytes(
             self.client,
             urls,
             referer=chapter.url,
             concurrency=page_concurrency_for_source(self.source),
-        ):
+        )):
+            total_bytes += len(page)
+            if progress:
+                progress(index, len(urls), total_bytes)
             yield page
 
     def parse_chapter_image_urls(self, soup) -> list[str]:

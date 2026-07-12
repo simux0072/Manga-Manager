@@ -2,19 +2,21 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol
 
 from sqlalchemy import select
 
 from app.kavita import KavitaChapter, KavitaSeries, configured_kavita_client
-from manga_manager.application.job_handlers import JobContext, RetryableJobError
+from manga_manager.application.job_handlers import DeferredJobError, JobContext, RetryableJobError
 from manga_manager.domain.catalog import canonical_chapter_number, normalize_title
 from manga_manager.domain.jobs import KavitaSyncPayload
 from manga_manager.infrastructure.db_models import (
     CatalogChapter,
+    CatalogExternalIdentifier,
     CatalogSeries,
+    CatalogSeriesAlias,
     LibraryProjection,
 )
 from manga_manager.worker.runtime import SessionFactory
@@ -30,6 +32,10 @@ class KavitaClientProtocol(Protocol):
 
     async def series_detail(self, series_id: int) -> list[KavitaChapter]: ...
 
+    async def add_want_to_read(self, series_ids: list[int]) -> None: ...
+
+    async def remove_want_to_read(self, series_ids: list[int]) -> None: ...
+
 
 ClientFactory = Callable[[], KavitaClientProtocol]
 
@@ -40,6 +46,9 @@ class KavitaSnapshot:
     title: str
     existing_kavita_id: int | None
     folder_path: Path
+    tracked: bool
+    aliases: tuple[str, ...]
+    external_ids: dict[str, str]
 
 
 class KavitaSyncHandler:
@@ -48,11 +57,13 @@ class KavitaSyncHandler:
         *,
         session_factory: SessionFactory,
         library_root: Path,
-        client_factory: ClientFactory = configured_kavita_client,
+        client_factory: ClientFactory | None = None,
     ) -> None:
         self.session_factory = session_factory
         self.library_root = library_root
-        self.client_factory = client_factory
+        self.client_factory = client_factory or (
+            lambda: configured_kavita_client(local_library_root=self.library_root)
+        )
 
     async def __call__(self, context: JobContext) -> None:
         payload = context.lease.payload
@@ -64,15 +75,25 @@ class KavitaSyncHandler:
             raise RetryableJobError("series_missing", "series does not exist")
         client = self.client_factory()
         if not client.configured:
-            raise RetryableJobError("kavita_unconfigured", "Kavita is not configured")
+            raise DeferredJobError(
+                "kavita_unconfigured",
+                "Kavita is not configured",
+                retry_after=timedelta(hours=1),
+            )
 
         try:
             await client.scan_folder_or_all(snapshot.folder_path)
             candidates = await client.list_series()
-            match = match_series(snapshot, candidates)
+            mapper = getattr(client, "kavita_path_for_local", None)
+            kavita_folder = mapper(snapshot.folder_path) if mapper else snapshot.folder_path
+            match = match_series(snapshot, candidates, str(kavita_folder))
             if match is None:
                 raise RetryableJobError("kavita_match_missing", "Kavita series match not found")
             chapters = await client.series_detail(match.id)
+            if snapshot.tracked:
+                await client.add_want_to_read([match.id])
+            else:
+                await client.remove_want_to_read([match.id])
         except RetryableJobError:
             raise
         except Exception as exc:
@@ -119,16 +140,63 @@ class KavitaSyncHandler:
                 .limit(1)
             )
             folder = self.library_root / Path(relative).parent if relative else self.library_root
-        return KavitaSnapshot(series.id, series.title, series.kavita_series_id, folder)
+        aliases = tuple(
+            session.scalars(
+                select(CatalogSeriesAlias.display_value).where(
+                    CatalogSeriesAlias.series_id == series.id
+                )
+            ).all()
+        )
+        external_ids = dict(
+            session.execute(
+                select(CatalogExternalIdentifier.provider, CatalogExternalIdentifier.value).where(
+                    CatalogExternalIdentifier.series_id == series.id
+                )
+            ).all()
+        )
+        return KavitaSnapshot(
+            series.id,
+            series.title,
+            series.kavita_series_id,
+            folder,
+            series.status in {"interested", "reading", "caught_up", "paused"},
+            aliases,
+            external_ids,
+        )
 
 
-def match_series(snapshot: KavitaSnapshot, candidates: list[KavitaSeries]) -> KavitaSeries | None:
+def match_series(
+    snapshot: KavitaSnapshot,
+    candidates: list[KavitaSeries],
+    kavita_folder: str = "",
+) -> KavitaSeries | None:
     if snapshot.existing_kavita_id:
         for candidate in candidates:
             if candidate.id == snapshot.existing_kavita_id:
                 return candidate
-    normalized = normalize_title(snapshot.title)
+    anilist = snapshot.external_ids.get("anilist") or snapshot.external_ids.get("aniList")
+    mal = snapshot.external_ids.get("mal") or snapshot.external_ids.get("myanimelist")
+    identifier_matches = [
+        candidate
+        for candidate in candidates
+        if (anilist and candidate.anilist_id == anilist) or (mal and candidate.mal_id == mal)
+    ]
+    if len(identifier_matches) == 1:
+        return identifier_matches[0]
+    if kavita_folder:
+        folder_matches = [
+            candidate
+            for candidate in candidates
+            if candidate.folder_path and Path(candidate.folder_path) == Path(kavita_folder)
+        ]
+        if len(folder_matches) == 1:
+            return folder_matches[0]
+    normalized_values = {normalize_title(snapshot.title)} | {
+        normalize_title(alias) for alias in snapshot.aliases
+    }
     matches = [
-        candidate for candidate in candidates if normalize_title(candidate.name) == normalized
+        candidate
+        for candidate in candidates
+        if normalize_title(candidate.name) in normalized_values
     ]
     return matches[0] if len(matches) == 1 else None

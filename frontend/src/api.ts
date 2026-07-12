@@ -13,7 +13,7 @@ export const api={
   changeSeries:(id:number,status:string)=>request<{item:Series;previous:string}>(`/api/v2/series/${id}`,{method:'PATCH',body:JSON.stringify({status})}),
   changeChapter:(id:number,status:string)=>request(`/api/v2/chapters/${id}`,{method:'PATCH',body:JSON.stringify({status})}),
   readAll:(id:number)=>request(`/api/v2/series/${id}/chapters/read`,{method:'POST'}),
-  matches:()=>request<{items:Match[]}>('/api/v2/matches'),
+  matches:(cursor?:number)=>request<Page<Match,number>>(`/api/v2/matches?${params({cursor})}`),
   decideMatch:(id:number,decision:string,confirmation='')=>request(`/api/v2/matches/${id}`,{method:'POST',body:JSON.stringify({decision,confirmation})}),
   decideMatches:(ids:number[],decision:string,confirmation='')=>request('/api/v2/match-batch',{method:'POST',body:JSON.stringify({ids,decision,confirmation})}),
   jobs:(states:string[]=[],cursor?:number,limit=30)=>request<Page<Job,number>>(`/api/v2/jobs?${params({state:states,cursor,limit})}`),

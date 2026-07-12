@@ -13,13 +13,17 @@ from manga_manager.infrastructure.db_models import (
     CatalogChapter,
     CatalogChapterReadingState,
     CatalogChapterRelease,
+    CatalogAlternateSourceListing,
     CatalogExternalIdentifier,
     CatalogMatchDecision,
     CatalogSeries,
     CatalogSeriesAlias,
     CatalogSourceSeries,
+    ChapterDownloadIntent,
     ChapterArtifact,
     LibraryProjection,
+    SeriesDownloadPlan,
+    WorkJob,
 )
 from manga_manager.settings import V2Settings
 from manga_manager.web.api import create_api_router
@@ -93,6 +97,8 @@ def merge_match_groups(session: Session, decision: CatalogMatchDecision) -> None
         raise HTTPException(409, "one match identity no longer exists")
     if left.series_id == right.series_id:
         return
+    _consolidate_overlapping_provider_identities(session, left, right, decision.id)
+    session.flush()
     left_sources = set(
         session.scalars(
             select(CatalogSourceSeries.source).where(
@@ -129,6 +135,18 @@ def merge_match_groups(session: Session, decision: CatalogMatchDecision) -> None
         if target is None:
             chapter.series_id = target_series_id
             continue
+        source_intent = session.scalar(
+            select(ChapterDownloadIntent).where(ChapterDownloadIntent.chapter_id == chapter.id)
+        )
+        target_intent = session.scalar(
+            select(ChapterDownloadIntent).where(ChapterDownloadIntent.chapter_id == target.id)
+        )
+        if source_intent is not None:
+            if target_intent is None:
+                source_intent.series_id = target_series_id
+                source_intent.chapter_id = target.id
+            else:
+                session.delete(source_intent)
         session.execute(
             update(CatalogChapterRelease)
             .where(CatalogChapterRelease.chapter_id == chapter.id)
@@ -183,6 +201,23 @@ def merge_match_groups(session: Session, decision: CatalogMatchDecision) -> None
         .where(CatalogSourceSeries.series_id == source_series_id)
         .values(series_id=target_series_id)
     )
+    session.execute(
+        update(ChapterDownloadIntent)
+        .where(ChapterDownloadIntent.series_id == source_series_id)
+        .values(series_id=target_series_id)
+    )
+    source_plan = session.get(SeriesDownloadPlan, source_series_id)
+    target_plan = session.get(SeriesDownloadPlan, target_series_id)
+    if source_plan is not None:
+        if target_plan is None:
+            source_plan.series_id = target_series_id
+        else:
+            session.delete(source_plan)
+    session.execute(
+        update(WorkJob)
+        .where(WorkJob.series_key == str(source_series_id))
+        .values(series_key=str(target_series_id))
+    )
     aliases = session.scalars(
         select(CatalogSeriesAlias).where(CatalogSeriesAlias.series_id == source_series_id)
     ).all()
@@ -218,3 +253,102 @@ def merge_match_groups(session: Session, decision: CatalogMatchDecision) -> None
             target_series.latest_release_source = source_series.latest_release_source
     if source_series is not None:
         session.delete(source_series)
+
+
+def _consolidate_overlapping_provider_identities(
+    session: Session,
+    left: CatalogSourceSeries,
+    right: CatalogSourceSeries,
+    current_decision_id: int,
+) -> None:
+    left_identities = {
+        row.source: row
+        for row in session.scalars(
+            select(CatalogSourceSeries).where(CatalogSourceSeries.series_id == left.series_id)
+        )
+    }
+    right_identities = {
+        row.source: row
+        for row in session.scalars(
+            select(CatalogSourceSeries).where(CatalogSourceSeries.series_id == right.series_id)
+        )
+    }
+    for source in left_identities.keys() & right_identities.keys():
+        left_identity, right_identity = left_identities[source], right_identities[source]
+        if right.source == source:
+            keeper, duplicate = right_identity, left_identity
+        elif left.source == source:
+            keeper, duplicate = left_identity, right_identity
+        else:
+            raise HTTPException(409, f"duplicate {source} identities require separate review")
+        overlap, minimum = _chapter_overlap(session, keeper.id, duplicate.id)
+        if overlap < 2 or (minimum and overlap / minimum < 0.5):
+            raise HTTPException(
+                409, f"duplicate {source} identities lack strong chapter overlap"
+            )
+        session.add(
+            CatalogAlternateSourceListing(
+                primary_source_series_id=keeper.id,
+                source=duplicate.source,
+                source_id=duplicate.source_id,
+                title=duplicate.title,
+                url=duplicate.url,
+                evidence_json={"chapter_overlap": overlap, "compared_chapters": minimum},
+            )
+        )
+        for release in session.scalars(
+            select(CatalogChapterRelease).where(
+                CatalogChapterRelease.source_series_id == duplicate.id
+            )
+        ):
+            existing_release = session.scalar(
+                select(CatalogChapterRelease.id).where(
+                    CatalogChapterRelease.source_series_id == keeper.id,
+                    CatalogChapterRelease.source_release_id == release.source_release_id,
+                )
+            )
+            if existing_release is None:
+                release.source_series_id = keeper.id
+            else:
+                session.delete(release)
+        for alias in session.scalars(
+            select(CatalogSeriesAlias).where(CatalogSeriesAlias.source_series_id == duplicate.id)
+        ):
+            alias.source_series_id = keeper.id
+        for identifier in session.scalars(
+            select(CatalogExternalIdentifier).where(
+                CatalogExternalIdentifier.source_series_id == duplicate.id
+            )
+        ):
+            conflict = session.scalar(
+                select(CatalogExternalIdentifier.id).where(
+                    CatalogExternalIdentifier.source_series_id == keeper.id,
+                    CatalogExternalIdentifier.provider == identifier.provider,
+                )
+            )
+            if conflict is None:
+                identifier.source_series_id = keeper.id
+            else:
+                session.delete(identifier)
+        session.execute(
+            delete(CatalogMatchDecision).where(
+                CatalogMatchDecision.id != current_decision_id,
+                (CatalogMatchDecision.left_source_series_id == duplicate.id)
+                | (CatalogMatchDecision.right_source_series_id == duplicate.id),
+            )
+        )
+        session.delete(duplicate)
+
+
+def _chapter_overlap(session: Session, left_id: int, right_id: int) -> tuple[int, int]:
+    def numbers(source_series_id: int) -> set[str]:
+        return set(
+            session.scalars(
+                select(CatalogChapter.canonical_number)
+                .join(CatalogChapterRelease)
+                .where(CatalogChapterRelease.source_series_id == source_series_id)
+            ).all()
+        )
+
+    left, right = numbers(left_id), numbers(right_id)
+    return len(left & right), min(len(left), len(right))

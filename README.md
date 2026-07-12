@@ -54,8 +54,9 @@ cp .env.example .env
 docker compose up --build
 ```
 
-Leave `DATABASE_URL` unset in `.env` for the default Docker Compose Postgres database. Set
-`DATABASE_URL` only when you intentionally want to use a different database.
+Compose starts PostgreSQL, a one-shot v2 migration, the React/FastAPI web process, and the leased
+worker. `MANGA_MANAGER_PORT` defaults to 8000 and `MANGA_STORAGE_ROOT` defaults to `./storage-v2`.
+The web and worker mount that same root; mount its `library/` child into Kavita as documented below.
 
 Database migrations run automatically on service startup using Alembic.
 The Docker image includes a `/healthz` healthcheck; containers are unhealthy if scheduler creation,
@@ -66,8 +67,8 @@ metadata and file paths, while `storage/` contains covers, CBZ files, and replac
 
 ### PostgreSQL v2 staging
 
-The v2 profile separates migration, web, worker, and PostgreSQL processes with Pi-oriented memory
-limits. It publishes the v2 web application on port 8001:
+The default stack separates migration, web, worker, and PostgreSQL processes with Pi-oriented memory
+limits and publishes the v2 web application on port 8000.
 
 The web image uses a multi-stage build: Node 22 compiles the React/TypeScript client, while the final
 runtime contains only Python and the static bundle. Local frontend development and checks use:
@@ -77,10 +78,6 @@ cd frontend
 npm install
 npm test
 npm run build
-```
-
-```bash
-docker compose --profile v2 up --build
 ```
 
 On a host without Compose, the direct-Docker rehearsal builds, migrates, starts web/worker/database,
@@ -99,6 +96,12 @@ Set `STAGE_IMPORT_ROOT=/path/to/repaired-cbz` to import and reconcile a repaired
 rehearsal. Set `STAGE_SMOKE_SOURCE=asura`, `mangafire`, or `kingofshojo` only when a live provider
 smoke pull is intended. Every run performs a logical dump/restore into a disposable database and
 restarts web and worker containers before its final health check.
+
+For the identity-preserving legacy migration, use
+`STAGE_LEGACY_DATABASE=$PWD/manga_manager.db` and optionally
+`STAGE_LEGACY_STORAGE_ROOT=$PWD/storage`. This imports only active repaired artifacts, associates
+them with their provider identities where possible, writes a resumable report under the staged
+storage root, and reconciles projections before web and worker start.
 
 ### Legacy audit and repair
 
@@ -203,11 +206,12 @@ Path-mapping troubleshooting:
   `KAVITA_LIBRARY_ROOT` blank.
 - After changing paths, run `Run Kavita drain` from Library to rescan immediately runnable work.
 
-Discovery cards link into Kavita when a series or chapter is already mapped. If a newly discovered
-series is not in Kavita yet, clicking the bookmark/download control queues the newest configured
-missing chapters first, then lower-priority backfill jobs for older chapters. Clicking a chapter
-queues that exact chapter first. The scheduler or manual `Run download drain` action performs
-downloads, and `Run Kavita drain` performs scan/map work.
+Tracking a newly discovered series immediately creates a durable download plan. Chapters 1 and 2
+and the latest two available chapters are queued first (deduplicated when a short series overlaps),
+then all remaining chapters are downloaded in ascending order through a bounded rolling window.
+Chapters discovered after tracking use a higher current-release priority than backlog. Untracking
+cancels queued work but deliberately lets already leased downloads finish safely. Existing tracked
+v2 series are bootstrapped automatically by the scheduler after migration.
 Use `Run next download` or `Run Kavita sync` when you only want to process one job.
 
 The `New` page lists unread downloaded chapters for tracked series, newest first. When Kavita has
@@ -218,8 +222,7 @@ fails.
 
 Optional Kavita settings:
 
-- `KAVITA_SYNC_WANT_TO_READ`: enables scheduler-oriented Want to Read intent sync when wired into
-  scheduled work; the Library page also has a manual `Sync Want to Read` action.
+- Tracked state is mirrored to Kavita Want to Read on every successful sync; untracking removes it.
 - `KAVITA_LIBRARY_ROOT`: optional Kavita-visible path for files under `LIBRARY_ROOT`.
 - `KAVITA_SERIES_URL_TEMPLATE`: controls series deep links.
 - `KAVITA_CHAPTER_URL_TEMPLATE`: controls chapter reader deep links.
@@ -301,7 +304,8 @@ manual candidates when different sources share distinctive title tokens or alias
 catch titles with different translations.
 
 Manual source refresh actions are labeled `Pull`. Pulls run in the background and the top bar shows
-pull progress. Discovery is paginated with a `Load more` control using `DISCOVERY_PAGE_SIZE`.
+pull progress. Discovery, Library, Updates, Matches, Activity, and the job drawer use indexed cursor
+pagination with automatic near-viewport loading; accessible load buttons remain as fallbacks.
 
 Source discovery uses adaptive frontier scanning. Before each poll, Manga Manager takes the newest
 known source rows as sentinels and keeps paging until enough sentinels are seen with no newer
@@ -327,7 +331,15 @@ ordered window. The global chapter ceiling is four. These are intentionally empi
 defaults: the providers publish no numeric request quota, and bounded July 2026 checks exposed no
 rate-limit response headers. All three public origins/CDNs were Cloudflare-fronted. Increase them
 only with `benchmark-workers`; a `429`/`Retry-After` activates the shared cooldown and Asura's
-two-job benchmark automatically falls back to one. Relevant settings:
+two-job benchmark automatically falls back to one.
+
+The v2 worker also records per-request host, status, latency, bytes, retry hints, and limiting
+signals in PostgreSQL. After seven clean days it opens a bounded ten-minute/500-request exploration
+tier using real queued chapter work. A limiting response immediately restores the last stable tier
+and postpones exploration for 30 days. Asura requires two separate clean tier-2 runs before being
+promoted. Recovery probes use progressively wider intervals and two clean probes before closing a
+circuit; learned `Retry-After`/recovery time becomes the provider cooldown. Operations displays the
+effective job/page limits, cooldowns, and recent benchmark outcomes. Relevant settings:
 
 - `ASURA_REQUEST_INTERVAL_SECONDS`: delay between Asura HTTP requests.
 - `DOWNLOAD_CONCURRENCY`: maximum total running chapter download jobs.

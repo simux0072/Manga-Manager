@@ -34,6 +34,12 @@ class RetryableJobError(JobExecutionError):
         self.retry_after = retry_after
 
 
+class DeferredJobError(JobExecutionError):
+    def __init__(self, code: str, message: str, *, retry_after: timedelta) -> None:
+        super().__init__(code, message)
+        self.retry_after = retry_after
+
+
 class PermanentJobError(JobExecutionError):
     pass
 

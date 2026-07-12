@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 
 from app.domain import ChapterItem, SeriesItem
@@ -45,8 +45,17 @@ class SourceAdapter(ABC):
     async def download_chapter_pages(self, chapter: ChapterItem) -> list[bytes]:
         raise NotImplementedError
 
-    async def iter_chapter_pages(self, chapter: ChapterItem) -> AsyncIterator[bytes]:
-        for page in await self.download_chapter_pages(chapter):
+    async def iter_chapter_pages(
+        self,
+        chapter: ChapterItem,
+        progress: Callable[[int, int, int], None] | None = None,
+    ) -> AsyncIterator[bytes]:
+        pages = await self.download_chapter_pages(chapter)
+        total_bytes = 0
+        for index, page in enumerate(pages, start=1):
+            total_bytes += len(page)
+            if progress:
+                progress(index, len(pages), total_bytes)
             yield page
 
     async def aclose(self) -> None:

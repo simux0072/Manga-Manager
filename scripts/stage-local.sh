@@ -68,6 +68,18 @@ if [ -n "${STAGE_IMPORT_ROOT:-}" ]; then
     -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" \
     uv run --frozen manga-manager reconcile-storage
 fi
+if [ -n "${STAGE_LEGACY_DATABASE:-}" ]; then
+  legacy_database=$(cd "$(dirname "$STAGE_LEGACY_DATABASE")" && pwd)/$(basename "$STAGE_LEGACY_DATABASE")
+  legacy_storage=$(cd "${STAGE_LEGACY_STORAGE_ROOT:-storage}" && pwd)
+  docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+    -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" -v "$legacy_database:/legacy/catalog.db:ro" \
+    -v "$legacy_storage:/legacy/storage:ro" "$image" uv run --frozen manga-manager \
+    migrate-legacy-library /legacy/catalog.db --storage-root /legacy/storage \
+    --report /data/legacy-library-import.json --apply
+  docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+    -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" \
+    uv run --frozen manga-manager reconcile-storage
+fi
 docker run -d --name "$web" --network "$network" --memory 256m -p "${STAGE_PORT:-18000}:8000" \
   -e "V2_DATABASE_URL=$database_url" -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" \
   uv run --frozen uvicorn manga_manager.web.app:app --host 0.0.0.0 --port 8000 >/dev/null

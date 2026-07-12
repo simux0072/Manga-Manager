@@ -4,7 +4,7 @@ services:
     environment:
       POSTGRES_DB: manga_manager
       POSTGRES_USER: manga
-      POSTGRES_PASSWORD: manga
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-manga}
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -12,62 +12,33 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
+    mem_limit: 384m
+    restart: unless-stopped
+    networks: [internal]
 
-  manga-manager:
+  migrate:
     build: .
-    env_file: .env
     environment:
-      DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://manga:manga@postgres:5432/manga_manager}
-    ports:
-      - "8000:8000"
-    volumes:
-      - ./storage:/app/storage
+      V2_DATABASE_URL: postgresql+psycopg://manga:${POSTGRES_PASSWORD:-manga}@postgres:5432/manga_manager
+    command: ["uv", "run", "--frozen", "manga-manager", "migrate"]
     depends_on:
       postgres:
         condition: service_healthy
-    restart: unless-stopped
-
-  postgres-v2:
-    image: postgres:16-alpine
-    profiles: ["v2"]
-    environment:
-      POSTGRES_DB: manga_manager_v2
-      POSTGRES_USER: manga_v2
-      POSTGRES_PASSWORD: manga_v2
-    volumes:
-      - postgres-v2-data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U manga_v2 -d manga_manager_v2"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-    mem_limit: 384m
-    networks: [v2-internal]
-
-  migrate-v2:
-    build: .
-    profiles: ["v2"]
-    environment:
-      V2_DATABASE_URL: postgresql+psycopg://manga_v2:manga_v2@postgres-v2:5432/manga_manager_v2
-    command: ["uv", "run", "--frozen", "manga-manager", "migrate"]
-    depends_on:
-      postgres-v2:
-        condition: service_healthy
     restart: "no"
     mem_limit: 256m
-    networks: [v2-internal]
+    networks: [internal]
 
-  web-v2:
+  web:
     build: .
-    profiles: ["v2"]
+    env_file: .env
     environment:
-      V2_DATABASE_URL: postgresql+psycopg://manga_v2:manga_v2@postgres-v2:5432/manga_manager_v2
+      V2_DATABASE_URL: postgresql+psycopg://manga:${POSTGRES_PASSWORD:-manga}@postgres:5432/manga_manager
       V2_STORAGE_ROOT: /data
     command: ["uv", "run", "--frozen", "uvicorn", "manga_manager.web.app:app", "--host", "0.0.0.0", "--port", "8000"]
-    ports: ["8001:8000"]
-    volumes: ["./storage-v2:/data"]
+    ports: ["${MANGA_MANAGER_PORT:-8000}:8000"]
+    volumes: ["${MANGA_STORAGE_ROOT:-./storage-v2}:/data"]
     depends_on:
-      migrate-v2:
+      migrate:
         condition: service_completed_successfully
     healthcheck:
       test: ["CMD", "uv", "run", "--frozen", "python", "-c", "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=3))['ok']"]
@@ -76,24 +47,23 @@ services:
       retries: 5
     mem_limit: 256m
     restart: unless-stopped
-    networks: [v2-internal]
+    networks: [internal]
     labels:
       traefik.enable: ${TRAEFIK_ENABLE:-false}
-      traefik.http.routers.manga-manager-v2.rule: ${TRAEFIK_RULE:-Host(`manga.local`)}
+      traefik.http.routers.manga-manager.rule: ${TRAEFIK_RULE:-Host(`manga.local`)}
 
-  worker-v2:
+  worker:
     build: .
-    profiles: ["v2"]
     env_file: .env
     environment:
-      V2_DATABASE_URL: postgresql+psycopg://manga_v2:manga_v2@postgres-v2:5432/manga_manager_v2
-      V2_WORKER_ID: manga-manager-v2
+      V2_DATABASE_URL: postgresql+psycopg://manga:${POSTGRES_PASSWORD:-manga}@postgres:5432/manga_manager
+      V2_WORKER_ID: manga-manager
+      V2_STORAGE_ROOT: /data
     command: ["uv", "run", "--frozen", "manga-manager", "worker"]
     depends_on:
-      migrate-v2:
+      migrate:
         condition: service_completed_successfully
-    volumes:
-      - ./storage-v2:/app/storage-v2
+    volumes: ["${MANGA_STORAGE_ROOT:-./storage-v2}:/data"]
     restart: unless-stopped
     mem_limit: 1g
     healthcheck:
@@ -102,26 +72,25 @@ services:
       timeout: 10s
       start_period: 30s
       retries: 3
-    networks: [v2-internal]
+    networks: [internal]
 
-  maintenance-v2:
+  maintenance:
     build: .
     profiles: ["maintenance"]
     environment:
-      V2_DATABASE_URL: postgresql+psycopg://manga_v2:manga_v2@postgres-v2:5432/manga_manager_v2
+      V2_DATABASE_URL: postgresql+psycopg://manga:${POSTGRES_PASSWORD:-manga}@postgres:5432/manga_manager
       V2_STORAGE_ROOT: /data
     command: ["uv", "run", "--frozen", "manga-manager", "reconcile-storage"]
     depends_on:
-      migrate-v2:
+      migrate:
         condition: service_completed_successfully
-    volumes: ["./storage-v2:/data"]
+    volumes: ["${MANGA_STORAGE_ROOT:-./storage-v2}:/data"]
     mem_limit: 256m
     restart: "no"
-    networks: [v2-internal]
+    networks: [internal]
 
 volumes:
   postgres-data:
-  postgres-v2-data:
 
 networks:
-  v2-internal:
+  internal:

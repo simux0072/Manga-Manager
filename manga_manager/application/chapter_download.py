@@ -25,6 +25,7 @@ from manga_manager.infrastructure.db_models import (
     CatalogSeries,
     CatalogSourceSeries,
     CatalogSourceState,
+    ProviderPolicy,
 )
 from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.infrastructure.storage import ContentAddressedStorage
@@ -100,9 +101,33 @@ class ChapterDownloadHandler:
             url=snapshot.release_url,
             published_at=snapshot.published_at,
         )
+        def report_page(processed: int, total: int, byte_count: int) -> None:
+            context.ensure_lease()
+            with self.session_factory() as progress_session, progress_session.begin():
+                if not self.queue.progress(
+                    progress_session,
+                    job_id=context.lease.id,
+                    owner=context.lease.owner,
+                    message=f"downloaded {processed}/{total} pages",
+                    details={
+                        "phase": "download",
+                        "processed": processed,
+                        "total": total,
+                        "unit": "pages",
+                        "bytes": byte_count,
+                    },
+                ):
+                    context.lease_lost.set()
+                    context.ensure_lease()
         try:
+            try:
+                pages = adapter.iter_chapter_pages(item, progress=report_page)
+            except TypeError as exc:
+                if "progress" not in str(exc):
+                    raise
+                pages = adapter.iter_chapter_pages(item)
             blob = await self.storage.store_pages(
-                adapter.iter_chapter_pages(item),
+                pages,
                 comic_info_xml=comic_info(snapshot),
                 progress=lambda _count: context.ensure_lease(),
             )
@@ -174,6 +199,14 @@ class ChapterDownloadHandler:
             state.cooldown_until = cooldown_until
             state.health_status = "cooldown" if cooldown_until else "degraded"
             state.updated_at = utcnow()
+            policy = session.get(ProviderPolicy, source)
+            if policy is not None and cooldown_until is not None:
+                metadata = dict(policy.metadata_json or {})
+                metadata.update(
+                    {"recovery_probe_step": 0, "next_recovery_probe": (utcnow() + timedelta(minutes=1)).isoformat(), "recovery_probe_successes": 0}
+                )
+                policy.metadata_json = metadata
+                policy.clean_since = None
 
 
 def load_snapshot(session: Session, release_id: int) -> DownloadSnapshot | None:

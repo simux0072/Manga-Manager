@@ -7,6 +7,7 @@ import weakref
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -19,6 +20,7 @@ _request_schedulers: dict[str, tuple[asyncio.Lock, float]] = {}
 _worker_page_semaphores: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 WORKER_INFLIGHT_BYTE_BUDGET = 256 * 1024 * 1024
 _provider_waiter: Callable[[str, float], Awaitable[None]] | None = None
+_request_observer: Callable[[dict], None] | None = None
 
 
 @dataclass(slots=True)
@@ -38,6 +40,11 @@ def configure_provider_waiter(
 ) -> None:
     global _provider_waiter
     _provider_waiter = waiter
+
+
+def configure_request_observer(observer: Callable[[dict], None] | None) -> None:
+    global _request_observer
+    _request_observer = observer
 
 
 class HttpSourceClient:
@@ -86,8 +93,13 @@ class HttpSourceClient:
         if referer:
             headers["Referer"] = referer
         await self.wait_for_throttle()
+        started = time.monotonic()
         async with self.client.stream("GET", url, headers=headers) as response:
-            self.raise_for_status(response)
+            try:
+                self.raise_for_status(response)
+            except Exception as exc:
+                observe_request(self.base_url, url, response, started, 0, exc)
+                raise
             content_type = response.headers.get("content-type", "")
             if content_type and not content_type.startswith("image/"):
                 raise RuntimeError(f"unexpected content type {content_type} for {url}")
@@ -108,6 +120,7 @@ class HttpSourceClient:
                     raise RuntimeError(
                         f"image exceeds max_page_bytes ({settings.max_page_bytes}) for {url}"
                     )
+        observe_request(self.base_url, url, response, started, len(content), None)
         return bytes(content)
 
     @property
@@ -128,8 +141,18 @@ class HttpSourceClient:
         headers: dict[str, str] | None = None,
     ) -> httpx.Response:
         await self.wait_for_throttle()
-        response = await self.client.request(method, url, headers=headers)
-        self.raise_for_status(response)
+        started = time.monotonic()
+        try:
+            response = await self.client.request(method, url, headers=headers)
+        except Exception as exc:
+            observe_request(self.base_url, url, None, started, 0, exc)
+            raise
+        try:
+            self.raise_for_status(response)
+        except Exception as exc:
+            observe_request(self.base_url, url, response, started, len(response.content), exc)
+            raise
+        observe_request(self.base_url, url, response, started, len(response.content), None)
         return response
 
     def raise_for_status(self, response: httpx.Response) -> None:
@@ -231,6 +254,13 @@ async def iter_ordered_bytes(
                 result.release()
 
 
+async def enumerate_async(iterator):
+    index = 0
+    async for item in iterator:
+        index += 1
+        yield index, item
+
+
 def worker_page_semaphore() -> asyncio.Semaphore:
     loop = asyncio.get_running_loop()
     semaphore = _worker_page_semaphores.get(loop)
@@ -294,3 +324,38 @@ def retry_after_from_headers(headers: httpx.Headers) -> datetime | None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed
     return now + timedelta(seconds=max(seconds, 0))
+
+
+def observe_request(
+    base_url: str,
+    url: str,
+    response: httpx.Response | None,
+    started: float,
+    byte_count: int,
+    error: BaseException | None,
+) -> None:
+    if _request_observer is None:
+        return
+    headers = response.headers if response is not None else httpx.Headers()
+    retry_at = retry_after_from_headers(headers)
+    retry_seconds = (
+        max(0, int((retry_at - datetime.now(timezone.utc)).total_seconds()))
+        if retry_at
+        else None
+    )
+    _request_observer(
+        {
+            "source": source_for_base_url(base_url),
+            "host": urlparse(url).hostname or "",
+            "status_code": response.status_code if response is not None else 0,
+            "latency_ms": max(0, int((time.monotonic() - started) * 1000)),
+            "byte_count": byte_count,
+            "error_code": type(error).__name__ if error else "",
+            "retry_after_seconds": retry_seconds,
+            "headers": {
+                key: headers[key]
+                for key in ("retry-after", "server", "cf-cache-status", "cache-control")
+                if key in headers
+            },
+        }
+    )

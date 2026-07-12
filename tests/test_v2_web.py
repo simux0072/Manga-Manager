@@ -5,6 +5,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from manga_manager.infrastructure.db_models import (
+    CatalogAlternateSourceListing,
     CatalogChapter,
     CatalogChapterReadingState,
     CatalogChapterRelease,
@@ -209,7 +210,7 @@ async def test_matches_return_human_evidence_and_require_confirmation() -> None:
         )
     labels = {row["label"] for row in matches.json()["items"][0]["evidence"]}
     assert "Strong title or alias match" in labels
-    assert "Cover mismatch" in labels
+    assert "Cover mismatch" not in labels
     assert rejected.status_code == 422
     assert "evidence_json" not in matches.text
 
@@ -229,6 +230,59 @@ async def test_confirmed_match_merges_complete_groups() -> None:
     with sessions() as session:
         assert session.query(CatalogSeries).count() == 1
         assert len({row.series_id for row in session.query(CatalogSourceSeries).all()}) == 1
+
+
+async def test_merge_consolidates_strong_same_provider_duplicate_before_group_merge() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        left = session.query(CatalogSeries).filter_by(title="A Very Long Example Manga Title").one()
+        right = session.query(CatalogSeries).filter_by(title="Tracked").one()
+        duplicate = CatalogSourceSeries(
+            series_id=left.id,
+            source="mangafire",
+            source_id="alternate-slug",
+            title="Tracked alternate",
+            normalized_title="tracked alternate",
+            url="https://example.test/alternate",
+        )
+        session.add(duplicate)
+        session.flush()
+        keeper = session.query(CatalogSourceSeries).filter_by(
+            series_id=right.id, source="mangafire"
+        ).one()
+        for number in ("2", "3"):
+            for series, identity, suffix in (
+                (left, duplicate, "alternate"),
+                (right, keeper, "tracked"),
+            ):
+                chapter = CatalogChapter(
+                    series_id=series.id, canonical_number=number, display_number=number
+                )
+                session.add(chapter)
+                session.flush()
+                session.add(
+                    CatalogChapterRelease(
+                        chapter_id=chapter.id,
+                        source_series_id=identity.id,
+                        source="mangafire",
+                        source_release_id=f"{suffix}-{number}",
+                        url=f"https://example.test/{suffix}/{number}",
+                    )
+                )
+        decision_id = session.query(CatalogMatchDecision).one().id
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            f"/api/v2/matches/{decision_id}",
+            json={"decision": "accepted", "confirmation": "MERGE"},
+        )
+    assert response.status_code == 200, response.text
+    with sessions() as session:
+        assert session.query(CatalogSeries).count() == 1
+        assert session.query(CatalogSourceSeries).filter_by(source="mangafire").count() == 1
+        alternate = session.query(CatalogAlternateSourceListing).one()
+        assert alternate.source_id == "alternate-slug"
 
 
 async def test_jobs_activity_and_operations_have_human_context() -> None:

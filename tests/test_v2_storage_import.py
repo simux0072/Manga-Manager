@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import asyncio
+import sqlite3
 import zipfile
 from pathlib import Path
 
@@ -18,6 +19,7 @@ from manga_manager.infrastructure.db_models import (
     ChapterArtifact,
     JobBase,
     LibraryProjection,
+    CatalogSourceSeries,
 )
 from manga_manager.infrastructure.storage import ContentAddressedStorage
 
@@ -176,3 +178,59 @@ def test_reconciler_repairs_missing_projection_and_reports_orphan_blob(tmp_path:
     assert report.repaired == 1
     assert report.orphan_blobs == 1
     assert projected_path.is_file()
+
+
+def test_identity_preserving_legacy_import_is_resumable(tmp_path: Path) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    JobBase.metadata.create_all(engine)
+    sessions = sessionmaker(engine, expire_on_commit=False)
+    with sessions() as session, session.begin():
+        series = CatalogSeries(title="Example Series", normalized_title="example series")
+        session.add(series)
+        session.flush()
+        session.add(
+            CatalogSourceSeries(
+                series_id=series.id,
+                source="mangafire",
+                source_id="example",
+                title=series.title,
+                normalized_title=series.normalized_title,
+                url="https://example.test",
+            )
+        )
+    archive = tmp_path / "legacy.cbz"
+    make_cbz(archive)
+    legacy = tmp_path / "legacy.db"
+    connection = sqlite3.connect(legacy)
+    connection.executescript(
+        """
+        CREATE TABLE series(id INTEGER PRIMARY KEY, title TEXT);
+        CREATE TABLE chapter(id INTEGER PRIMARY KEY, series_id INTEGER, number TEXT);
+        CREATE TABLE source_series(id INTEGER PRIMARY KEY, source TEXT, source_id TEXT);
+        CREATE TABLE chapter_release(id INTEGER PRIMARY KEY, source_series_id INTEGER);
+        CREATE TABLE downloaded_file(
+          id INTEGER PRIMARY KEY, path TEXT, source TEXT, chapter_id INTEGER,
+          chapter_release_id INTEGER, active INTEGER
+        );
+        INSERT INTO series VALUES(1, 'Example Series');
+        INSERT INTO chapter VALUES(1, 1, '1');
+        INSERT INTO source_series VALUES(1, 'mangafire', 'example');
+        INSERT INTO chapter_release VALUES(1, 1);
+        """
+    )
+    connection.execute(
+        "INSERT INTO downloaded_file VALUES(1, ?, 'mangafire', 1, 1, 1)",
+        (str(archive),),
+    )
+    connection.commit()
+    connection.close()
+    importer = LegacyCbzImporter(session_factory=sessions, storage=storage(tmp_path))
+    first = importer.import_legacy_database(legacy, storage_root=tmp_path, dry_run=False)
+    second = importer.import_legacy_database(
+        legacy,
+        storage_root=tmp_path,
+        dry_run=False,
+        completed_paths={str(archive)},
+    )
+    assert first[0].status == "activated"
+    assert second[0].status == "resumed"
