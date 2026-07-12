@@ -1341,13 +1341,15 @@ def test_env_example_does_not_override_compose_database_url():
     assert not any(line.startswith("DATABASE_URL=") for line in active_env_lines)
 
 
-def test_docker_compose_keeps_postgres_database_url_fallback():
+def test_docker_compose_supplies_v2_postgres_database_url():
     compose_text = Path("docker-compose.yml").read_text()
 
-    assert (
-        "DATABASE_URL: ${DATABASE_URL:-postgresql+psycopg://manga:manga@postgres:5432/"
-        "manga_manager}" in compose_text
+    database_url = (
+        "V2_DATABASE_URL: postgresql+psycopg://manga:${POSTGRES_PASSWORD:-manga}"
+        "@postgres:5432/manga_manager"
     )
+    assert compose_text.count(database_url) == 4
+    assert "manga_manager.web.app:app" in compose_text
 
 
 def test_enable_source_resets_disabled_health(monkeypatch):
