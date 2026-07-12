@@ -71,6 +71,7 @@ class FakeFullAsyncClient:
                         "name": "Example",
                         "libraryId": 2,
                         "folderPath": "/library/Manga/Example",
+                        "lowestFolderPath": "/library/Manga/Example/Specific",
                         "malId": "11",
                     }
                 ]
@@ -111,6 +112,7 @@ async def test_kavita_client_folder_scan_series_and_want_to_read(monkeypatch, tm
         "abortOnNoSeriesMatch": False,
     }
     assert series[0].id == 7
+    assert series[0].folder_path == "/library/Manga/Example/Specific"
     assert series[0].mal_id == "11"
     assert chapters[0].id == 42
     assert chapters[0].number == "12"

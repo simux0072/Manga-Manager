@@ -229,7 +229,9 @@ def parse_series(item: dict) -> KavitaSeries:
         id=int(item.get("id") or 0),
         name=str(item.get("name") or item.get("localizedName") or item.get("originalName") or ""),
         library_id=item.get("libraryId"),
-        folder_path=str(item.get("folderPath") or item.get("lowestFolderPath") or ""),
+        # folderPath may be the shared library parent for every series. Kavita's
+        # lowestFolderPath identifies the actual series directory and is safe matching evidence.
+        folder_path=str(item.get("lowestFolderPath") or item.get("folderPath") or ""),
         mal_id=str(item.get("malId") or ""),
         anilist_id=str(item.get("aniListId") or ""),
     )
