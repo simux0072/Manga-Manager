@@ -96,12 +96,18 @@ if [ -n "${STAGE_LEGACY_DATABASE:-}" ]; then
     uv run --frozen manga-manager reconcile-storage
 fi
 docker run -d --name "$web" --network "$network" --memory 256m -p "${STAGE_PORT:-18000}:8000" \
-  -e "V2_DATABASE_URL=$database_url" -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" \
+  -e "V2_DATABASE_URL=$database_url" -e V2_STORAGE_ROOT=/data \
+  -e "KAVITA_URL=${KAVITA_URL:-}" -e "KAVITA_API_KEY=${KAVITA_API_KEY:-}" \
+  -e "KAVITA_LIBRARY_ROOT=${KAVITA_LIBRARY_ROOT:-}" \
+  -v "$data_dir:/data" "$image" \
   uv run --frozen uvicorn manga_manager.web.app:app --host 0.0.0.0 --port 8000 >/dev/null
 docker run -d --name "$worker" --network "$network" --memory 1g \
   --health-cmd "uv run --frozen manga-manager doctor" --health-interval 30s \
   --health-timeout 10s --health-start-period 30s --health-retries 3 \
-  -e "V2_DATABASE_URL=$database_url" -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" \
+  -e "V2_DATABASE_URL=$database_url" -e V2_STORAGE_ROOT=/data \
+  -e "KAVITA_URL=${KAVITA_URL:-}" -e "KAVITA_API_KEY=${KAVITA_API_KEY:-}" \
+  -e "KAVITA_LIBRARY_ROOT=${KAVITA_LIBRARY_ROOT:-}" \
+  -v "$data_dir:/data" "$image" \
   uv run --frozen manga-manager worker >/dev/null
 
 attempt=0

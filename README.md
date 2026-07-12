@@ -103,6 +103,10 @@ For the identity-preserving legacy migration, use
 them with their provider identities where possible, writes a resumable report under the staged
 storage root, and reconciles projections before web and worker start.
 
+To include Kavita in the direct-Docker rehearsal, export `KAVITA_URL`, `KAVITA_API_KEY`, and
+`KAVITA_LIBRARY_ROOT` before running the script. The URL must be reachable from the staging Docker
+network, and the Kavita root must be its view of `storage-v2-stage/library` (for example `/manga`).
+
 ### Legacy audit and repair
 
 Audit and the default repair mode are read-only. `--apply` creates a consistent SQLite backup before
