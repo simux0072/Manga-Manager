@@ -18,8 +18,7 @@ class V2Settings(BaseSettings):
 
     database_url: str = ""
     worker_id: str = Field(default_factory=default_worker_id, min_length=1, max_length=180)
-    worker_concurrency: int = Field(default=1, ge=1, le=32)
-    global_chapter_concurrency: int = Field(default=4, ge=1, le=32)
+    global_chapter_concurrency: int = Field(default=8, ge=1, le=32)
     # Normal workers are deliberately fixed at one. benchmark-workers uses a scoped,
     # non-validated model copy for the explicit two-job Asura experiment.
     asura_download_concurrency: int = Field(default=1, ge=1, le=1)
@@ -77,7 +76,9 @@ class V2Settings(BaseSettings):
 
     def pool_limits(self) -> dict[str, int]:
         return {
-            "source_pull": 1,
+            "pull:asura": 1,
+            "pull:mangafire": 1,
+            "pull:kingofshojo": 1,
             "download:asura": self.asura_download_concurrency,
             "download:mangafire": self.mangafire_download_concurrency,
             "download:kingofshojo": self.kingofshojo_download_concurrency,

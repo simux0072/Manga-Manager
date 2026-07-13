@@ -10,6 +10,11 @@ image="$project:local"
 data_dir="${STAGE_STORAGE_ROOT:-$PWD/storage-v2-stage}"
 db_volume="$project-db"
 database_url="postgresql+psycopg://manga:manga@$postgres:5432/manga_manager"
+stage_min_free_bytes="${STAGE_MIN_FREE_BYTES:-1073741824}"
+mode="${1:-rehearse}"
+build_requested=false
+if [ "$mode" = "serve" ] && [ "${2:-}" = "--build" ]; then build_requested=true; fi
+if [ "$mode" != "serve" ] && [ "$mode" != "down" ]; then build_requested=true; fi
 
 teardown() {
   docker rm -f "$worker" "$web" "$postgres" 2>/dev/null || true
@@ -36,13 +41,35 @@ wait_for_job() {
   done
 }
 
-if [ "${1:-}" = "down" ]; then
+if [ "$mode" = "down" ]; then
   teardown "${2:-}"
   exit 0
 fi
 
 mkdir -p "$data_dir"
-docker build --platform "${STAGE_PLATFORM:-linux/amd64}" -t "$image" .
+if [ -n "${STAGE_LEGACY_DATABASE:-}" ]; then
+  legacy_storage_preflight=$(cd "${STAGE_LEGACY_STORAGE_ROOT:-storage}" && pwd)
+  sample_file=$(find "$legacy_storage_preflight" -type f -name '*.cbz' -print -quit)
+  [ -n "$sample_file" ] || {
+    echo "legacy staging preflight failed: no CBZ files under $legacy_storage_preflight" >&2
+    exit 1
+  }
+  link_probe="$data_dir/.hardlink-preflight.$$"
+  if ! ln "$sample_file" "$link_probe" 2>/dev/null; then
+    echo "legacy staging preflight failed: source and staging storage do not support hardlinks" >&2
+    echo "refusing a copy-based import that could exhaust the disk" >&2
+    exit 1
+  fi
+  rm -f "$link_probe"
+  free_kib=$(df -Pk "$data_dir" | awk 'NR==2 {print $4}')
+  [ "${free_kib:-0}" -ge 1048576 ] || {
+    echo "legacy staging preflight failed: less than 1 GiB free for database and cover metadata" >&2
+    exit 1
+  }
+fi
+if [ "$build_requested" = true ] || ! docker image inspect "$image" >/dev/null 2>&1; then
+  docker build --platform "${STAGE_PLATFORM:-linux/amd64}" -t "$image" .
+fi
 docker network inspect "$network" >/dev/null 2>&1 || docker network create "$network" >/dev/null
 docker volume inspect "$db_volume" >/dev/null 2>&1 || docker volume create "$db_volume" >/dev/null
 docker rm -f "$postgres" "$web" "$worker" 2>/dev/null || true
@@ -52,7 +79,10 @@ docker run -d --name "$postgres" --network "$network" --memory 384m \
 
 attempt=0
 until docker exec "$postgres" pg_isready -h 127.0.0.1 -U manga -d manga_manager >/dev/null 2>&1; do
-  attempt=$((attempt + 1)); [ "$attempt" -lt 40 ] || { docker logs "$postgres"; exit 1; }
+  attempt=$((attempt + 1)); [ "$attempt" -lt "${STAGE_POSTGRES_WAIT_ATTEMPTS:-300}" ] || {
+    docker logs "$postgres"
+    exit 1
+  }
   sleep 1
 done
 
@@ -77,14 +107,15 @@ if [ -n "${STAGE_LEGACY_DATABASE:-}" ]; then
       container_storage="/host/${legacy_storage#"$PWD"/}"
       container_data="/host/${data_dir#"$PWD"/}"
       docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
-        -e "V2_STORAGE_ROOT=$container_data" -v "$PWD:/host" "$image" uv run --frozen \
+        -e "V2_STORAGE_ROOT=$container_data" -e V2_MIN_FREE_BYTES=0 \
+        -v "$PWD:/host" "$image" uv run --frozen \
         manga-manager migrate-legacy-library "$container_database" \
         --storage-root "$container_storage" \
         --report "$container_data/legacy-library-import.json" --apply
       ;;
     *)
       docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
-        -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" \
+        -e V2_STORAGE_ROOT=/data -e V2_MIN_FREE_BYTES=0 -v "$data_dir:/data" \
         -v "$legacy_database:/legacy/catalog.db:ro" \
         -v "$legacy_storage:/legacy/storage:ro" "$image" uv run --frozen manga-manager \
         migrate-legacy-library /legacy/catalog.db --storage-root /legacy/storage \
@@ -92,11 +123,12 @@ if [ -n "${STAGE_LEGACY_DATABASE:-}" ]; then
       ;;
   esac
   docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
-    -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" \
+    -e V2_STORAGE_ROOT=/data -e V2_MIN_FREE_BYTES=0 -v "$data_dir:/data" "$image" \
     uv run --frozen manga-manager reconcile-storage
 fi
 docker run -d --name "$web" --network "$network" --memory 256m -p "${STAGE_PORT:-18000}:8000" \
   -e "V2_DATABASE_URL=$database_url" -e V2_STORAGE_ROOT=/data \
+  -e "V2_MIN_FREE_BYTES=$stage_min_free_bytes" \
   -e "KAVITA_URL=${KAVITA_URL:-}" -e "KAVITA_API_KEY=${KAVITA_API_KEY:-}" \
   -e "KAVITA_LIBRARY_ROOT=${KAVITA_LIBRARY_ROOT:-}" \
   -v "$data_dir:/data" "$image" \
@@ -105,6 +137,7 @@ docker run -d --name "$worker" --network "$network" --memory 1g \
   --health-cmd "uv run --frozen manga-manager doctor" --health-interval 30s \
   --health-timeout 10s --health-start-period 30s --health-retries 3 \
   -e "V2_DATABASE_URL=$database_url" -e V2_STORAGE_ROOT=/data \
+  -e "V2_MIN_FREE_BYTES=$stage_min_free_bytes" \
   -e "KAVITA_URL=${KAVITA_URL:-}" -e "KAVITA_API_KEY=${KAVITA_API_KEY:-}" \
   -e "KAVITA_LIBRARY_ROOT=${KAVITA_LIBRARY_ROOT:-}" \
   -v "$data_dir:/data" "$image" \
@@ -115,6 +148,11 @@ until docker exec "$web" uv run --frozen python -c "import json,urllib.request; 
   attempt=$((attempt + 1)); [ "$attempt" -lt 30 ] || { docker logs "$web"; exit 1; }
   sleep 1
 done
+if [ "$mode" = "serve" ]; then
+  printf '%s\n' "Manga Manager: http://127.0.0.1:${STAGE_PORT:-18000}" \
+    "Stop: scripts/stage-local.sh down"
+  exit 0
+fi
 docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
   -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" uv run --frozen manga-manager stage-check --json
 
@@ -137,7 +175,8 @@ fi
 docker exec "$postgres" pg_dump -U manga -d manga_manager -Fc -f /tmp/stage-rollback.dump
 docker exec "$postgres" dropdb -U manga --if-exists manga_manager_restore
 docker exec "$postgres" createdb -U manga manga_manager_restore
-docker exec "$postgres" pg_restore -U manga -d manga_manager_restore /tmp/stage-rollback.dump
+docker exec "$postgres" pg_restore --single-transaction -U manga -d manga_manager_restore \
+  /tmp/stage-rollback.dump
 docker exec "$postgres" psql -U manga -d manga_manager_restore -Atc "SELECT version_num FROM alembic_version"
 docker exec "$postgres" dropdb -U manga manga_manager_restore
 

@@ -10,7 +10,12 @@ from bs4 import BeautifulSoup
 
 from app.adapters.asura import dedupe_chapters, dedupe_series
 from app.adapters.base import FrontierSentinel, SourceAdapter
-from app.adapters.http import HttpSourceClient, enumerate_async, iter_ordered_bytes, page_concurrency_for_source
+from app.adapters.http import (
+    HttpSourceClient,
+    enumerate_async,
+    iter_ordered_bytes,
+    page_concurrency_for_source,
+)
 from app.adapters.parsing import image_attr, parse_source_date
 from app.domain import ChapterItem, SeriesItem, normalize_chapter_number
 from app.settings import settings
@@ -32,6 +37,7 @@ class MangaFireAdapter(SourceAdapter):
         self.client = HttpSourceClient(
             self.base_url,
             throttle_seconds=settings.mangafire_request_interval_seconds,
+            source=self.source,
         )
 
     async def aclose(self) -> None:
@@ -55,10 +61,12 @@ class MangaFireAdapter(SourceAdapter):
         sentinel_map = {sentinel.source_id: sentinel.latest_chapter for sentinel in sentinels}
         required_hits = min(settings.source_frontier_required_hits, len(sentinel_map))
         hits = 0
-        max_pages = settings.mangafire_recent_pages if sentinels else min(3, settings.mangafire_recent_pages)
+        max_pages = min(3, settings.mangafire_recent_pages)
         for page in range(1, max_pages + 1):
             parsed = self.parse_recent_series(
-                await self.fetch_recent_titles_page(page=page, limit=settings.mangafire_recent_limit)
+                await self.fetch_recent_titles_page(
+                    page=page, limit=settings.mangafire_recent_limit
+                )
             )
             if not parsed:
                 break
@@ -68,12 +76,14 @@ class MangaFireAdapter(SourceAdapter):
                 break
         return dedupe_series(items)
 
-    async def list_recent_frontier_html(self, sentinels: list[FrontierSentinel]) -> list[SeriesItem]:
+    async def list_recent_frontier_html(
+        self, sentinels: list[FrontierSentinel]
+    ) -> list[SeriesItem]:
         items: list[SeriesItem] = []
         sentinel_map = {sentinel.source_id: sentinel.latest_chapter for sentinel in sentinels}
         required_hits = min(settings.source_frontier_required_hits, len(sentinel_map))
         hits = 0
-        max_pages = settings.mangafire_recent_pages if sentinels else min(3, settings.mangafire_recent_pages)
+        max_pages = min(3, settings.mangafire_recent_pages)
         for page in range(1, max_pages + 1):
             path = "/" if page == 1 else f"/latest-updates?page={page}"
             parsed = self.parse_updated_page(await self.client.get_soup(path))
@@ -124,7 +134,9 @@ class MangaFireAdapter(SourceAdapter):
             return merge_series_items(source_series, detail)
         return merge_series_items(
             source_series,
-            self.parse_series_detail_html(await self.client.get_soup(source_series.url), source_series),
+            self.parse_series_detail_html(
+                await self.client.get_soup(source_series.url), source_series
+            ),
         )
 
     def parse_updated_page(self, soup: BeautifulSoup) -> list[SeriesItem]:
@@ -171,7 +183,9 @@ class MangaFireAdapter(SourceAdapter):
             )
         return dedupe_series(items)
 
-    def parse_updated_chapters_for_link(self, link, source_id: str, series_href: str) -> list[ChapterItem]:
+    def parse_updated_chapters_for_link(
+        self, link, source_id: str, series_href: str
+    ) -> list[ChapterItem]:
         container = link
         for parent in link.parents:
             if getattr(parent, "name", None) in {"article", "li", "div"}:
@@ -188,7 +202,9 @@ class MangaFireAdapter(SourceAdapter):
             number = normalize_chapter_number(label)
             if not chapter_id or not number:
                 continue
-            container_text = chapter_link.parent.get_text(" ", strip=True) if chapter_link.parent else label
+            container_text = (
+                chapter_link.parent.get_text(" ", strip=True) if chapter_link.parent else label
+            )
             chapters.append(
                 ChapterItem(
                     source=self.source,
@@ -201,9 +217,15 @@ class MangaFireAdapter(SourceAdapter):
             )
         return dedupe_chapters(chapters)
 
-    def parse_series_detail_html(self, soup: BeautifulSoup, source_series: SeriesItem) -> SeriesItem:
+    def parse_series_detail_html(
+        self, soup: BeautifulSoup, source_series: SeriesItem
+    ) -> SeriesItem:
         title_tag = soup.select_one("h1, [class*='title']")
-        title = clean_updated_title(title_tag.get_text(" ", strip=True)) if title_tag else source_series.title
+        title = (
+            clean_updated_title(title_tag.get_text(" ", strip=True))
+            if title_tag
+            else source_series.title
+        )
         description = ""
         for selector in (
             ".synopsis",
@@ -372,12 +394,14 @@ class MangaFireAdapter(SourceAdapter):
         payload = await self.client.get_json(f"/api/chapters/{chapter_id}")
         urls = self.parse_chapter_image_urls(payload)
         total_bytes = 0
-        async for index, page in enumerate_async(iter_ordered_bytes(
-            self.client,
-            urls,
-            referer=chapter.url,
-            concurrency=page_concurrency_for_source(self.source),
-        )):
+        async for index, page in enumerate_async(
+            iter_ordered_bytes(
+                self.client,
+                urls,
+                referer=chapter.url,
+                concurrency=page_concurrency_for_source(self.source),
+            )
+        ):
             total_bytes += len(page)
             if progress:
                 progress(index, len(urls), total_bytes)

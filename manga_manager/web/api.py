@@ -21,6 +21,7 @@ from manga_manager.domain.jobs import (
     SourcePullPayload,
 )
 from manga_manager.application.download_plans import DownloadPlanCoordinator
+from manga_manager.application.kavita_sync import KavitaSyncPlanner
 
 from manga_manager.infrastructure.db_models import (
     CatalogChapter,
@@ -36,7 +37,9 @@ from manga_manager.infrastructure.db_models import (
     JobPermit,
     LibraryProjection,
     ProviderBenchmarkRun,
+    ProviderEndpointState,
     ProviderPolicy,
+    StorageState,
     WorkerHeartbeat,
     WorkJob,
 )
@@ -67,6 +70,21 @@ class BatchMatchChange(MatchChange):
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def storage_health(session: Session) -> dict[str, int]:
+    state = session.get(StorageState, 1)
+    if state is None:
+        return {
+            "storage_paused": 0,
+            "storage_reserved_bytes": 0,
+            "storage_min_free_bytes": V2Settings().min_free_bytes,
+        }
+    return {
+        "storage_paused": int(state.paused),
+        "storage_reserved_bytes": state.reserved_bytes,
+        "storage_min_free_bytes": state.min_free_bytes,
+    }
 
 
 def create_api_router(
@@ -491,7 +509,7 @@ def create_api_router(
                     "job": jobs_by_id[job.id],
                     "type": event.event_type,
                     "status": event.status,
-                    "message": event.message,
+                    "message": event.message or jobs_by_id[job.id]["error_message"],
                     "details": event.details or {},
                     "created_at": event.created_at.isoformat(),
                 }
@@ -530,6 +548,11 @@ def create_api_router(
                 session.scalar(select(func.pg_database_size(func.current_database()))) or 0
             )
         policies = session.scalars(select(ProviderPolicy).order_by(ProviderPolicy.source)).all()
+        endpoint_states = session.scalars(
+            select(ProviderEndpointState).order_by(
+                ProviderEndpointState.source, ProviderEndpointState.traffic_class
+            )
+        ).all()
         kavita = configured_kavita_client(local_library_root=settings.storage_root / "library")
         return {
             "job_counts": counts,
@@ -557,6 +580,7 @@ def create_api_router(
                     )
                 )
                 or 0,
+                **storage_health(session),
             },
             "sources": [
                 {
@@ -569,6 +593,7 @@ def create_api_router(
                     if row.cooldown_until
                     else None,
                     "enabled": row.manual_enabled,
+                    "frontier_metrics": (row.cursor_json or {}).get("last_pull", {}),
                 }
                 for row in sources
             ],
@@ -588,6 +613,7 @@ def create_api_router(
                     "source": row.source,
                     "job_limit": row.learned_job_limit,
                     "page_limit": row.learned_page_limit,
+                    "request_interval_seconds": row.request_interval_seconds,
                     "cooldown_seconds": row.cooldown_seconds,
                     "clean_since": row.clean_since.isoformat() if row.clean_since else None,
                     "last_limited_at": row.last_limited_at.isoformat()
@@ -598,6 +624,19 @@ def create_api_router(
                     else None,
                 }
                 for row in policies
+            ],
+            "provider_endpoints": [
+                {
+                    "source": row.source,
+                    "traffic_class": row.traffic_class,
+                    "request_interval_seconds": row.request_interval_seconds,
+                    "failures": row.consecutive_failures,
+                    "cooldown_until": row.cooldown_until.isoformat()
+                    if row.cooldown_until
+                    else None,
+                    "last_error": row.last_error,
+                }
+                for row in endpoint_states
             ],
             "recent_benchmarks": [
                 {
@@ -610,9 +649,7 @@ def create_api_router(
                     "signal": row.limiting_signal,
                 }
                 for row in session.scalars(
-                    select(ProviderBenchmarkRun)
-                    .order_by(ProviderBenchmarkRun.id.desc())
-                    .limit(10)
+                    select(ProviderBenchmarkRun).order_by(ProviderBenchmarkRun.id.desc()).limit(10)
                 )
             ],
         }
@@ -642,6 +679,12 @@ def create_api_router(
                 priority=1,
             )
         return {"job": serialize_jobs(session, [job])[0]}
+
+    @router.post("/operations/kavita-sync")
+    async def sync_pending_kavita(session: SessionDep, limit: int = Query(100, ge=1, le=500)):
+        with session.begin():
+            pending, created = KavitaSyncPlanner().enqueue_pending(session, limit=limit)
+        return {"pending": pending, "created": created}
 
     @router.post("/jobs/{job_id}/retry")
     async def retry_job(job_id: int, session: SessionDep):
@@ -797,6 +840,8 @@ def serialize_jobs(session: Session, rows: list[WorkJob]) -> list[dict[str, Any]
             description = (
                 f"Pull latest releases from {row.source or row.payload.get('source', 'source')}"
             )
+        elif row.kind == "source_refresh":
+            description = f"Refresh {row.payload.get('title', 'source series')}"
         elif row.kind == "kavita_sync":
             description = "Synchronize downloaded manga with Kavita"
         elif row.kind == "maintenance":
@@ -814,7 +859,7 @@ def serialize_jobs(session: Session, rows: list[WorkJob]) -> list[dict[str, Any]
                 "attempt": row.attempts,
                 "max_attempts": row.max_attempts,
                 "error_code": row.error_code,
-                "error_message": row.error_message,
+                "error_message": operational_error_message(row.error_code, row.error_message),
                 "available_at": row.available_at.isoformat(),
                 "created_at": row.created_at.isoformat(),
                 "updated_at": row.updated_at.isoformat(),
@@ -837,6 +882,17 @@ def serialize_jobs(session: Session, rows: list[WorkJob]) -> list[dict[str, Any]
             }
         )
     return result
+
+
+def operational_error_message(code: str, message: str) -> str:
+    if message.strip():
+        return message
+    defaults = {
+        "source_network_error": "Provider network request failed; retry is scheduled.",
+        "rate_limited": "Provider rate limit reached; waiting for the shared cooldown.",
+        "kavita_unconfigured": "Kavita is not configured for this worker.",
+    }
+    return defaults.get(code, code.replace("_", " ").capitalize() if code else "")
 
 
 def human_evidence(raw: dict[str, Any] | None) -> list[dict[str, str]]:

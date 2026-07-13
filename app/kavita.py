@@ -46,9 +46,7 @@ class KavitaClient:
         self.api_key = api_key
         self.local_library_root = local_library_root or settings.library_root
         self.kavita_library_root = (
-            kavita_library_root
-            if kavita_library_root is not None
-            else settings.kavita_library_root
+            kavita_library_root if kavita_library_root is not None else settings.kavita_library_root
         )
 
     @property
@@ -188,6 +186,24 @@ class KavitaClient:
     async def remove_want_to_read(self, series_ids: list[int]) -> None:
         await self.update_want_to_read("remove-series", series_ids)
 
+    async def upload_series_cover(self, series_id: int, data_url: str) -> None:
+        await self._upload_cover("series", series_id, data_url)
+
+    async def upload_chapter_cover(self, chapter_id: int, data_url: str) -> None:
+        await self._upload_cover("chapter", chapter_id, data_url)
+
+    async def _upload_cover(self, entity: str, entity_id: int, data_url: str) -> None:
+        if not self.configured or not data_url:
+            return
+        encoded = data_url.split(",", 1)[1] if data_url.startswith("data:") else data_url
+        async with httpx.AsyncClient(timeout=30) as client:
+            response = await client.post(
+                f"{self.base_url}/api/Upload/{entity}",
+                headers=self.headers(),
+                json={"id": entity_id, "url": encoded},
+            )
+            response.raise_for_status()
+
     async def update_want_to_read(self, action: str, series_ids: list[int]) -> None:
         if not self.configured or not series_ids:
             return
@@ -274,29 +290,6 @@ def parse_read_progress(
             or 0
         ),
     )
-
-
-def kavita_path_for_local(local_path: Path) -> Path:
-    kavita_root = settings.kavita_library_root
-    if kavita_root is None:
-        return local_path
-    try:
-        relative = local_path.resolve().relative_to(settings.library_root.resolve())
-    except ValueError:
-        return local_path
-    return kavita_root / relative
-
-
-def local_path_for_kavita(kavita_path: str) -> Path:
-    path = Path(kavita_path)
-    kavita_root = settings.kavita_library_root
-    if kavita_root is None:
-        return path
-    try:
-        relative = path.resolve().relative_to(kavita_root.resolve())
-    except ValueError:
-        return path
-    return settings.library_root / relative
 
 
 def configured_kavita_client(

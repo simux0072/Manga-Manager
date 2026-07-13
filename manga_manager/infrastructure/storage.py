@@ -32,6 +32,17 @@ class StoredBlob:
     image_count: int
 
 
+class StorageCapacityError(OSError):
+    def __init__(self, *, free_bytes: int, incoming_bytes: int, min_free_bytes: int) -> None:
+        self.free_bytes = free_bytes
+        self.incoming_bytes = incoming_bytes
+        self.min_free_bytes = min_free_bytes
+        super().__init__(
+            "storage capacity unavailable: "
+            f"free={free_bytes} incoming={incoming_bytes} reserve={min_free_bytes}"
+        )
+
+
 class ContentAddressedStorage:
     def __init__(
         self,
@@ -63,41 +74,45 @@ class ContentAddressedStorage:
         if byte_count > self.max_chapter_bytes:
             raise ValueError(f"archive exceeds max chapter bytes: {byte_count}")
         checksum = file_checksum(path)
-        with zipfile.ZipFile(path) as archive:
-            corrupt = archive.testzip()
-            if corrupt:
-                raise ValueError(f"corrupt zip member: {corrupt}")
-            images = []
-            total_uncompressed = 0
-            has_comic_info = False
-            for info in archive.infolist():
-                member = PurePosixPath(info.filename)
-                if member.is_absolute() or ".." in member.parts:
-                    raise ValueError(f"unsafe zip member: {info.filename}")
-                if member.as_posix().lower() == "comicinfo.xml":
-                    has_comic_info = True
-                if member.suffix.lower() not in IMAGE_SUFFIXES:
-                    continue
-                if info.file_size > self.max_page_bytes:
-                    raise ValueError(f"page exceeds max page bytes: {info.filename}")
-                total_uncompressed += info.file_size
-                if total_uncompressed > self.max_chapter_bytes:
-                    raise ValueError("uncompressed images exceed max chapter bytes")
-                images.append(info)
-            if not has_comic_info:
-                raise ValueError("archive is missing ComicInfo.xml")
-            if not images:
-                raise ValueError("archive contains no chapter images")
-            if len(images) > self.max_pages:
-                raise ValueError(f"archive contains too many pages: {len(images)}")
-            for info in images:
-                data = archive.read(info)
-                try:
-                    with Image.open(io.BytesIO(data)) as image:
-                        image.verify()
-                except Exception as exc:
-                    raise ValueError(f"invalid image member: {info.filename}") from exc
-        return ValidatedCbz(checksum, byte_count, len(images))
+        image_count = 0
+        total_uncompressed = 0
+        has_comic_info = False
+        try:
+            with zipfile.ZipFile(path) as archive:
+                for info in archive.infolist():
+                    member = PurePosixPath(info.filename)
+                    if member.is_absolute() or ".." in member.parts:
+                        raise ValueError(f"unsafe zip member: {info.filename}")
+                    if info.is_dir():
+                        continue
+                    total_uncompressed += info.file_size
+                    if total_uncompressed > self.max_chapter_bytes:
+                        raise ValueError("uncompressed archive exceeds max chapter bytes")
+                    is_image = member.suffix.lower() in IMAGE_SUFFIXES
+                    if is_image and info.file_size > self.max_page_bytes:
+                        raise ValueError(f"page exceeds max page bytes: {info.filename}")
+                    # Reading each member once verifies its ZIP CRC. Reuse image bytes for
+                    # Pillow validation instead of archive.testzip() followed by a second read.
+                    data = archive.read(info)
+                    if member.as_posix().lower() == "comicinfo.xml":
+                        has_comic_info = True
+                    if not is_image:
+                        continue
+                    image_count += 1
+                    if image_count > self.max_pages:
+                        raise ValueError(f"archive contains too many pages: {image_count}")
+                    try:
+                        with Image.open(io.BytesIO(data)) as image:
+                            image.verify()
+                    except Exception as exc:
+                        raise ValueError(f"invalid image member: {info.filename}") from exc
+        except (zipfile.BadZipFile, RuntimeError) as exc:
+            raise ValueError(f"invalid ZIP archive: {exc}") from exc
+        if not has_comic_info:
+            raise ValueError("archive is missing ComicInfo.xml")
+        if not image_count:
+            raise ValueError("archive contains no chapter images")
+        return ValidatedCbz(checksum, byte_count, image_count)
 
     def store_existing(self, source: Path) -> StoredBlob:
         self.ensure_directories()
@@ -190,7 +205,11 @@ class ContentAddressedStorage:
         existing = self.root if self.root.exists() else self.root.parent
         usage = shutil.disk_usage(existing)
         if usage.free - incoming_bytes < self.min_free_bytes:
-            raise OSError("storage free-space watermark would be crossed")
+            raise StorageCapacityError(
+                free_bytes=usage.free,
+                incoming_bytes=incoming_bytes,
+                min_free_bytes=self.min_free_bytes,
+            )
 
 
 def file_checksum(path: Path) -> str:

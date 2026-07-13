@@ -19,13 +19,11 @@ RUN uv sync --frozen --no-dev --no-install-project
 
 COPY app ./app
 COPY manga_manager ./manga_manager
-COPY alembic.ini ./
 COPY alembic.v2.ini ./
-COPY alembic ./alembic
 COPY scripts ./scripts
 COPY --from=frontend-build /frontend/dist ./frontend/dist
 RUN uv sync --frozen --no-dev
 
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 CMD ["uv", "run", "--frozen", "python", "-c", "import json, sys, urllib.request; response = urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3); sys.exit(0 if json.load(response).get('ok') else 1)"]
-CMD ["uv", "run", "--frozen", "uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["uv", "run", "--frozen", "uvicorn", "manga_manager.web.app:app", "--host", "0.0.0.0", "--port", "8000"]

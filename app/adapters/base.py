@@ -20,10 +20,17 @@ class ChapterTemporarilyUnavailable(RuntimeError):
 
 
 class SourceRateLimited(RuntimeError):
-    def __init__(self, message: str, retry_after=None, source: str = "") -> None:
+    def __init__(
+        self,
+        message: str,
+        retry_after=None,
+        source: str = "",
+        traffic_class: str = "origin",
+    ) -> None:
         super().__init__(message)
         self.retry_after = retry_after
         self.source = source
+        self.traffic_class = traffic_class
 
 
 class SourceAdapter(ABC):

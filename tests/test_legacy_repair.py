@@ -209,9 +209,12 @@ def test_repair_consolidates_duplicate_provider_identity_and_dependents(tmp_path
         assert connection.execute(
             "SELECT chapter_release_id, chapter_id FROM downloaded_file WHERE id=1"
         ).fetchone() == (1, 1)
-        assert connection.execute(
-            "SELECT download_job_id FROM activity_event WHERE id=1"
-        ).fetchone()[0] is None
+        assert (
+            connection.execute("SELECT download_job_id FROM activity_event WHERE id=1").fetchone()[
+                0
+            ]
+            is None
+        )
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
 
 

@@ -50,7 +50,21 @@ class WorkerService:
 
     def _pool_specs(self) -> list[tuple[int, str, set[JobKind]]]:
         requested = [
-            ("source_pull", 1, {JobKind.SOURCE_PULL}),
+            (
+                "pull:asura",
+                1,
+                {JobKind.SOURCE_PULL, JobKind.SOURCE_REFRESH, JobKind.MAINTENANCE},
+            ),
+            (
+                "pull:mangafire",
+                1,
+                {JobKind.SOURCE_PULL, JobKind.SOURCE_REFRESH, JobKind.MAINTENANCE},
+            ),
+            (
+                "pull:kingofshojo",
+                1,
+                {JobKind.SOURCE_PULL, JobKind.SOURCE_REFRESH, JobKind.MAINTENANCE},
+            ),
             (
                 "download:asura",
                 2,

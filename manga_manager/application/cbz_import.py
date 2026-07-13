@@ -166,7 +166,11 @@ class LegacyCbzImporter:
         candidates = [raw_path]
         if not raw_path.is_absolute():
             candidates.extend(
-                [storage_root.parent / raw_path, storage_root / raw_path, storage_root / raw_path.name]
+                [
+                    storage_root.parent / raw_path,
+                    storage_root / raw_path,
+                    storage_root / raw_path.name,
+                ]
             )
         for candidate in candidates:
             if candidate.is_file():

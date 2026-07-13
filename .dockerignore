@@ -1,4 +1,7 @@
 .git
+.env
+.env.*
+.local
 .venv
 .pytest_cache
 .ruff_cache
@@ -10,6 +13,7 @@ storage
 storage-v2
 storage-v2-stage
 backups
+logs
 reports
 *.db
 *.db-*

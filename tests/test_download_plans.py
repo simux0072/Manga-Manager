@@ -15,6 +15,9 @@ from manga_manager.infrastructure.db_models import (
     ChapterDownloadIntent,
     JobBase,
     WorkJob,
+    ArtifactBlob,
+    ChapterArtifact,
+    ChapterReleaseAttempt,
 )
 
 
@@ -101,3 +104,91 @@ def test_priority_terminal_jobs_release_backfill_and_untrack_only_cancels_queued
     session.commit()
     assert leased.status == "leased"
     assert not session.scalars(select(WorkJob).where(WorkJob.status == "queued")).all()
+
+
+def test_fallback_artifact_is_queued_for_preferred_source_upgrade() -> None:
+    session, series_id = populated_session(chapter_count=1)
+    chapter = session.scalar(select(CatalogChapter))
+    assert chapter is not None
+    session.commit()
+    with session.begin():
+        asura = CatalogSourceSeries(
+            series_id=series_id,
+            source="asura",
+            source_id="asura-example",
+            title="Example",
+            normalized_title="example",
+            url="https://asura.test/example",
+        )
+        session.add(asura)
+        session.flush()
+        session.add(
+            CatalogChapterRelease(
+                chapter_id=chapter.id,
+                source_series_id=asura.id,
+                source="asura",
+                source_release_id="asura-1",
+                url="https://asura.test/example/1",
+            )
+        )
+        session.add(ArtifactBlob(checksum="a" * 64, relative_path="blobs/a.cbz", byte_count=1))
+        session.add(
+            ChapterArtifact(
+                chapter_id=chapter.id,
+                blob_checksum="a" * 64,
+                state="active",
+                provenance="fallback",
+                source="mangafire",
+                image_count=10,
+            )
+        )
+    with session.begin():
+        created = DownloadPlanCoordinator().enqueue_preferred_upgrades(session, [series_id])
+    assert created == 1
+    upgrade = session.scalar(select(WorkJob).where(WorkJob.dedupe_key.like("upgrade:%")))
+    assert upgrade is not None and upgrade.source == "asura" and upgrade.priority == 250
+
+
+def test_cooling_provider_reroutes_all_waiting_chapters_to_alternates() -> None:
+    session, series_id = populated_session(chapter_count=2)
+    chapters = session.scalars(select(CatalogChapter).order_by(CatalogChapter.id)).all()
+    session.commit()
+    with session.begin():
+        asura = CatalogSourceSeries(
+            series_id=series_id,
+            source="asura",
+            source_id="asura-example",
+            title="Example",
+            normalized_title="example",
+            url="https://asura.test/example",
+        )
+        session.add(asura)
+        session.flush()
+        for chapter in chapters:
+            session.add(
+                CatalogChapterRelease(
+                    chapter_id=chapter.id,
+                    source_series_id=asura.id,
+                    source="asura",
+                    source_release_id=f"asura-{chapter.canonical_number}",
+                    url=f"https://asura.test/example/{chapter.canonical_number}",
+                )
+            )
+        DownloadPlanCoordinator().track(session, series_id)
+
+    assert {job.source for job in session.scalars(select(WorkJob)).all()} == {"asura"}
+    session.commit()
+    retry_after = datetime.now(timezone.utc) + timedelta(minutes=15)
+    with session.begin():
+        rerouted = DownloadPlanCoordinator().bypass_cooling_source(
+            session, source="asura", retry_after=retry_after
+        )
+
+    assert rerouted == 2
+    active = session.scalars(
+        select(WorkJob).where(WorkJob.status.in_(["queued", "retry_wait"]))
+    ).all()
+    assert len(active) == 2 and {job.source for job in active} == {"mangafire"}
+    attempts = session.scalars(select(ChapterReleaseAttempt)).all()
+    assert len(attempts) == 2
+    assert all(row.outcome == "fallback_queued" for row in attempts)

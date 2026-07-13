@@ -283,9 +283,7 @@ def _consolidate_overlapping_provider_identities(
             raise HTTPException(409, f"duplicate {source} identities require separate review")
         overlap, minimum = _chapter_overlap(session, keeper.id, duplicate.id)
         if overlap < 2 or (minimum and overlap / minimum < 0.5):
-            raise HTTPException(
-                409, f"duplicate {source} identities lack strong chapter overlap"
-            )
+            raise HTTPException(409, f"duplicate {source} identities lack strong chapter overlap")
         session.add(
             CatalogAlternateSourceListing(
                 primary_source_series_id=keeper.id,

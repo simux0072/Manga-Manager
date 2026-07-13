@@ -7,11 +7,14 @@ from datetime import datetime, timezone
 from sqlalchemy import Engine, select, text
 
 from app.settings import settings as adapter_settings
+from app.kavita import configured_kavita_client
 from manga_manager.application.download_plans import DownloadPlanCoordinator
+from manga_manager.application.kavita_sync import KavitaSyncPlanner
 from manga_manager.domain.jobs import JobKind, MaintenancePayload, SourcePullPayload
 from manga_manager.infrastructure.db_models import CatalogSourceState, ProviderPolicy
 from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.infrastructure.provider_telemetry import ProviderTelemetry
+from manga_manager.infrastructure.storage_capacity import StorageCapacityCoordinator
 from manga_manager.infrastructure.scheduler_leadership import (
     SchedulerLeadership,
     try_acquire_scheduler_leadership,
@@ -41,6 +44,9 @@ class SourcePollScheduler:
         self.settings = settings
         self.queue = queue or JobQueue()
         self.telemetry = ProviderTelemetry(session_factory)
+        self.storage_capacity = StorageCapacityCoordinator(
+            settings.storage_root, settings.min_free_bytes
+        )
 
     async def run(self, stop: asyncio.Event) -> None:
         leadership: SchedulerLeadership | None = None
@@ -68,26 +74,49 @@ class SourcePollScheduler:
         current = now or utcnow()
         count = 0
         defaults = {
-            "asura": (self.settings.asura_download_concurrency, 1, 2),
-            "mangafire": (self.settings.mangafire_download_concurrency, 4, 4),
-            "kingofshojo": (self.settings.kingofshojo_download_concurrency, 4, 4),
+            "asura": (
+                self.settings.asura_download_concurrency,
+                1,
+                2,
+                max(2.0, adapter_settings.asura_request_interval_seconds),
+            ),
+            "mangafire": (
+                self.settings.mangafire_download_concurrency,
+                4,
+                4,
+                adapter_settings.mangafire_request_interval_seconds,
+            ),
+            "kingofshojo": (
+                self.settings.kingofshojo_download_concurrency,
+                4,
+                4,
+                adapter_settings.kingofshojo_request_interval_seconds,
+            ),
         }
-        for source, (jobs, pages, ceiling) in defaults.items():
+        for source, (jobs, pages, ceiling, interval) in defaults.items():
             self.telemetry.ensure_policy(
                 source,
                 job_limit=jobs,
                 page_limit=pages,
                 cooldown_seconds=int(self.settings.source_cooldown(source).total_seconds()),
+                request_interval_seconds=interval,
             )
             self.telemetry.start_due_exploration(source, ceiling=ceiling, now=current)
         self.telemetry.finalize_due(now=current)
+        self.telemetry.cleanup_samples(now=current)
         with self.session_factory() as policy_session:
             for policy in policy_session.scalars(select(ProviderPolicy)).all():
                 field = f"{policy.source}_page_concurrency"
                 if hasattr(adapter_settings, field):
                     setattr(adapter_settings, field, policy.learned_page_limit)
         with self.session_factory() as session, session.begin():
+            self.storage_capacity.refresh(session)
             DownloadPlanCoordinator(self.queue).bootstrap(session)
+            kavita = configured_kavita_client(
+                local_library_root=self.settings.storage_root / "library"
+            )
+            if kavita.configured:
+                KavitaSyncPlanner(self.queue).enqueue_pending(session, limit=25)
             for policy in session.scalars(select(ProviderPolicy)).all():
                 next_probe = (policy.metadata_json or {}).get("next_recovery_probe")
                 if next_probe:
@@ -102,6 +131,8 @@ class SourcePollScheduler:
                             dedupe_key=f"provider-probe:{policy.source}",
                             payload=MaintenancePayload(action=f"provider_probe_{policy.source}"),
                             priority=2,
+                            source=policy.source,
+                            pool=f"pull:{policy.source}",
                         )
                         count += int(created)
             for source, interval in self.settings.source_intervals().items():

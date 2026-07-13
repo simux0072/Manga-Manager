@@ -5,7 +5,11 @@ import httpx
 from bs4 import BeautifulSoup
 
 from app.adapters.asura import AsuraAdapter
-from app.adapters.http import HttpSourceClient
+from app.adapters.http import (
+    HttpSourceClient,
+    configure_provider_waiter,
+    configure_request_observer,
+)
 from app.adapters.base import FrontierSentinel, SourceRateLimited
 from app.adapters.kingofshojo import KingOfShojoAdapter
 from app.adapters.mangafire import MangaFireAdapter
@@ -872,3 +876,49 @@ async def test_ordered_page_fetch_uses_bounded_sliding_window():
     client.release_first.set()
     assert await first_page == b"https://mangafire.window.test/0"
     await iterator.aclose()
+
+
+async def test_shared_provider_scheduler_runs_even_when_static_interval_is_zero():
+    calls: list[tuple[str, str, float]] = []
+
+    async def waiter(source: str, traffic_class: str, interval: float) -> None:
+        calls.append((source, traffic_class, interval))
+
+    configure_provider_waiter(waiter)
+    client = HttpSourceClient("https://mangafire.to", throttle_seconds=0)
+    try:
+        await client.wait_for_throttle("https://cdn.mangafire.to/page.webp")
+    finally:
+        configure_provider_waiter(None)
+        await client.client.aclose()
+
+    assert calls == [("mangafire", "cdn", 0)]
+
+
+async def test_cover_cdn_request_is_attributed_to_explicit_provider():
+    observations: list[dict] = []
+
+    async def handler(request):
+        return httpx.Response(
+            200,
+            headers={"content-type": "image/jpeg"},
+            content=b"cover",
+            request=request,
+        )
+
+    configure_request_observer(observations.append)
+    client = HttpSourceClient(
+        "https://i0.wp.com",
+        source="kingofshojo",
+        provider_origin_url="https://kingofshojo.com",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        assert await client.get_bytes("https://i0.wp.com/cover.jpg") == b"cover"
+    finally:
+        configure_request_observer(None)
+        await client.aclose()
+
+    assert observations[0]["source"] == "kingofshojo"
+    assert observations[0]["host"] == "i0.wp.com"
+    assert observations[0]["traffic_class"] == "cdn"

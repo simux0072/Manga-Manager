@@ -24,3 +24,7 @@ frontend/*.tsbuildinfo
 frontend/vite.config.js
 frontend/vite.config.d.ts
 logs/
+.local/
+.env
+.env.*
+!.env.example

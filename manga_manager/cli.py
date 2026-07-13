@@ -11,16 +11,15 @@ from pathlib import Path
 
 from sqlalchemy import text
 
-from manga_manager.application.source_pull import SourcePullHandler
+from manga_manager.application.source_pull import SourcePullHandler, SourceRefreshHandler
 from manga_manager.application.storage_reconcile import StorageReconciler
 from manga_manager.application.legacy_repair import (
     LegacyRepair,
-    sqlite_path,
     write_legacy_report,
 )
 from manga_manager.application.cbz_import import LegacyCbzImporter, write_report
 from manga_manager.application.chapter_download import ChapterDownloadHandler
-from manga_manager.application.kavita_sync import KavitaSyncHandler
+from manga_manager.application.kavita_sync import KavitaSyncHandler, KavitaSyncPlanner
 from manga_manager.application.maintenance import MaintenanceHandler
 from manga_manager.domain.jobs import (
     ChapterDownloadPayload,
@@ -59,7 +58,8 @@ def build_parser() -> argparse.ArgumentParser:
     benchmark.add_argument(
         "--source", choices=["asura", "mangafire", "kingofshojo"], default="asura"
     )
-    benchmark.add_argument("--concurrency", type=int, choices=[1, 2], default=1)
+    benchmark.add_argument("--concurrency", type=int, choices=[1, 2, 3, 4], default=1)
+    benchmark.add_argument("--traffic", choices=["origin", "cdn", "both"], default="both")
     benchmark.add_argument("--duration", type=int, default=60, help="maximum seconds")
     benchmark.add_argument("--max-jobs", type=int, default=2)
     benchmark.add_argument("--report", type=Path)
@@ -69,12 +69,6 @@ def build_parser() -> argparse.ArgumentParser:
     )
     cleanup.add_argument("storage_root", type=Path)
     cleanup.add_argument("--retain-days", type=int, default=30)
-    rescan = subcommands.add_parser(
-        "rescan-legacy", help="rescan legacy sources, covers, chapters, matches, and stale jobs"
-    )
-    rescan.add_argument("database", type=Path)
-    rescan.add_argument("--limit", type=int)
-    rescan.add_argument("--source-series-id", type=int, action="append", default=[])
     validate = subcommands.add_parser(
         "validate-legacy", help="validate active legacy CBZ archives with a resumable cache"
     )
@@ -119,7 +113,13 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands.add_parser("reconcile-storage", help="repair the projected library from blobs")
     kavita = subcommands.add_parser("enqueue-kavita", help="enqueue one series for Kavita sync")
     kavita.add_argument("series_id", type=int)
-    kavita_check = subcommands.add_parser("kavita-check", help="verify Kavita auth and path mapping")
+    kavita_pending = subcommands.add_parser(
+        "enqueue-kavita-pending", help="enqueue tracked downloaded series not yet synchronized"
+    )
+    kavita_pending.add_argument("--limit", type=int, default=100)
+    kavita_check = subcommands.add_parser(
+        "kavita-check", help="verify Kavita auth and path mapping"
+    )
     kavita_check.add_argument("--scan-test", action="store_true")
     subcommands.add_parser("enqueue-probe", help="enqueue a deterministic staging probe")
     return parser
@@ -131,26 +131,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "cleanup-repair-archives":
         removed = LegacyRepair.cleanup_archives(args.storage_root, retain_days=args.retain_days)
         print(f"removed={len(removed)} retain_days={args.retain_days}")
-        return 0
-    if args.command == "rescan-legacy":
-        if args.limit is not None and args.limit < 1:
-            parser.error("--limit must be positive")
-        from sqlalchemy import create_engine
-        from sqlalchemy.orm import Session
-
-        from app.services import repair_known_series
-
-        database = sqlite_path(args.database)
-        legacy_engine = create_engine(f"sqlite:///{database}", connect_args={"timeout": 30})
-        with Session(legacy_engine, expire_on_commit=False) as session:
-            result = asyncio.run(
-                repair_known_series(
-                    session,
-                    limit=args.limit,
-                    source_series_ids=args.source_series_id or None,
-                )
-            )
-        print(json.dumps(result, sort_keys=True))
         return 0
     if args.command == "validate-legacy":
         repair = LegacyRepair(args.database, storage_root=args.storage_root)
@@ -286,6 +266,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "benchmark-workers":
         if args.duration < 1 or args.max_jobs < 1:
             parser.error("--duration and --max-jobs must be positive")
+        if args.source == "asura" and args.concurrency > 2:
+            parser.error("Asura benchmarks are capped at concurrency two")
         requested = args.concurrency
         with engine.connect() as connection:
             row = connection.execute(
@@ -297,11 +279,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             ).first()
         effective = requested
         abandoned = False
-        if requested == 2 and row is not None and (row.health_status == "cooldown" or row.cooling):
+        if requested > 1 and row is not None and (row.health_status == "cooldown" or row.cooling):
             effective = 1
             abandoned = True
         payload = {
             "source": args.source,
+            "traffic": args.traffic,
             "requested_concurrency": requested,
             "effective_concurrency": effective,
             "abandoned_on_rate_limit": abandoned,
@@ -319,6 +302,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         engine,
                         source=args.source,
                         concurrency=effective,
+                        traffic=args.traffic,
                         duration=args.duration,
                         max_jobs=args.max_jobs,
                     )
@@ -368,7 +352,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 }
             except (OSError, ValueError, TypeError, KeyError):
                 completed_paths = set()
-        records = LegacyCbzImporter(session_factory=sessions, storage=storage).import_legacy_database(
+        records = LegacyCbzImporter(
+            session_factory=sessions, storage=storage
+        ).import_legacy_database(
             args.database,
             storage_root=args.storage_root,
             dry_run=not args.apply,
@@ -422,6 +408,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 priority=10,
             )
         print(f"job_id={job.id} created={str(created).lower()}")
+        return 0
+    if args.command == "enqueue-kavita-pending":
+        if args.limit < 1:
+            parser.error("--limit must be positive")
+        sessions = create_session_factory(engine)
+        with sessions() as session, session.begin():
+            pending, created = KavitaSyncPlanner().enqueue_pending(session, limit=args.limit)
+        print(f"pending={pending} created={created}")
         return 0
     if args.command == "kavita-check":
         from app.kavita import configured_kavita_client
@@ -482,6 +476,7 @@ async def run_worker(settings: V2Settings, engine) -> int:
     configure_provider_waiter(request_scheduler.wait)
     configure_request_observer(telemetry.active_observer)
     source_pull = SourcePullHandler(session_factory=sessions)
+    source_refresh = SourceRefreshHandler(session_factory=sessions)
     chapter_download = ChapterDownloadHandler(
         session_factory=sessions,
         storage=create_storage(settings),
@@ -501,6 +496,7 @@ async def run_worker(settings: V2Settings, engine) -> int:
         session_factory=sessions,
         handlers={
             JobKind.SOURCE_PULL: source_pull,
+            JobKind.SOURCE_REFRESH: source_refresh,
             JobKind.CHAPTER_DOWNLOAD: chapter_download,
             JobKind.KAVITA_SYNC: kavita_sync,
             JobKind.MAINTENANCE: maintenance,
@@ -526,6 +522,7 @@ async def run_worker_benchmark(
     *,
     source: str,
     concurrency: int,
+    traffic: str,
     duration: int,
     max_jobs: int,
 ) -> dict[str, object]:
@@ -540,7 +537,13 @@ async def run_worker_benchmark(
     telemetry = ProviderTelemetry(sessions)
     run_id = telemetry.begin(source, concurrency)
     configure_provider_waiter(scheduler.wait)
-    configure_request_observer(telemetry.observer(run_id))
+    benchmark_observer = telemetry.observer(run_id)
+
+    def observe_selected_traffic(sample: dict) -> None:
+        if traffic == "both" or sample.get("traffic_class") == traffic:
+            benchmark_observer(sample)
+
+    configure_request_observer(observe_selected_traffic)
     handler = ChapterDownloadHandler(
         session_factory=sessions,
         storage=create_storage(benchmark_settings),
@@ -602,6 +605,7 @@ async def run_worker_benchmark(
         "abandoned_on_rate_limit": rate_limited and concurrency > 1,
         "final_concurrency": 1 if rate_limited and concurrency > 1 else concurrency,
         "benchmark_run_id": run_id,
+        "traffic": traffic,
     }
     policy = telemetry.finish(run_id, rate_limited=rate_limited, report=result)
     result["learned_policy"] = {

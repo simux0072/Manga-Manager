@@ -14,6 +14,8 @@ BASE_URL = os.environ.get("KAVITA_E2E_URL", "http://manga-manager-kavita-e2e:500
 USERNAME = os.environ.get("KAVITA_E2E_USERNAME", "manga-manager-e2e")
 PASSWORD = os.environ.get("KAVITA_E2E_PASSWORD") or secrets.token_urlsafe(18)
 EXISTING_API_KEY = os.environ.get("KAVITA_E2E_API_KEY", "")
+OUTPUT_ENV = os.environ.get("KAVITA_ENV_OUTPUT", "")
+WAIT_SECONDS = int(os.environ.get("KAVITA_WAIT_SECONDS", "300"))
 
 
 def request(path: str, *, method: str = "GET", payload=None, token: str = ""):
@@ -30,7 +32,7 @@ def request(path: str, *, method: str = "GET", payload=None, token: str = ""):
 
 
 def main() -> None:
-    for _ in range(60):
+    for _ in range(max(1, WAIT_SECONDS)):
         try:
             if request("/api/Admin/exists") is False:
                 user = request(
@@ -45,7 +47,14 @@ def main() -> None:
                     payload={"username": USERNAME, "password": PASSWORD, "apiKey": None},
                 )
             break
-        except (OSError, urllib.error.HTTPError):
+        except urllib.error.HTTPError as exc:
+            if exc.code in {401, 403}:
+                raise RuntimeError(
+                    "Kavita already has a different administrator; preserve .local/kavita.env "
+                    "or reset the local Kavita config volume"
+                ) from exc
+            time.sleep(1)
+        except OSError:
             time.sleep(1)
     else:
         raise RuntimeError("Kavita did not become ready")
@@ -62,25 +71,25 @@ def main() -> None:
     libraries = request("/api/Library/libraries", token=token) or []
     library = next((row for row in libraries if row.get("name") == "Manga Manager E2E"), None)
     library_payload = {
-                "id": int(library["id"]) if library else 0,
-                "name": "Manga Manager E2E",
-                "type": 0,
-                "folders": ["/manga"],
-                "folderWatching": False,
-                "includeInDashboard": True,
-                "includeInSearch": True,
-                "manageCollections": True,
-                "manageReadingLists": True,
-                "allowScrobbling": False,
-                "allowMetadataMatching": False,
-                "enableMetadata": True,
-                "removePrefixForSortName": False,
-                "inheritWebLinksFromFirstChapter": False,
-                "defaultLanguage": "en",
-                "metadataProvider": 0,
-                "fileGroupTypes": [1],
-                "excludePatterns": [],
-            }
+        "id": int(library["id"]) if library else 0,
+        "name": "Manga Manager E2E",
+        "type": 0,
+        "folders": ["/manga"],
+        "folderWatching": False,
+        "includeInDashboard": True,
+        "includeInSearch": True,
+        "manageCollections": True,
+        "manageReadingLists": True,
+        "allowScrobbling": False,
+        "allowMetadataMatching": False,
+        "enableMetadata": True,
+        "removePrefixForSortName": False,
+        "inheritWebLinksFromFirstChapter": False,
+        "defaultLanguage": "en",
+        "metadataProvider": 0,
+        "fileGroupTypes": [1],
+        "excludePatterns": [],
+    }
     if library is None:
         library = request(
             "/api/Library/create",
@@ -95,18 +104,22 @@ def main() -> None:
             token=token,
             payload=library_payload,
         )
-    print(
-        json.dumps(
-            {
-                "url": BASE_URL,
-                "username": USERNAME,
-                "password": PASSWORD,
-                "api_key": auth_key_value,
-                "library_id": library["id"],
-            },
-            sort_keys=True,
-        )
-    )
+    result = {
+        "url": BASE_URL,
+        "username": USERNAME,
+        "password": PASSWORD,
+        "api_key": auth_key_value,
+        "library_id": library["id"],
+    }
+    if OUTPUT_ENV:
+        with open(OUTPUT_ENV, "w", encoding="utf-8") as handle:
+            handle.write(f"KAVITA_URL={BASE_URL}\n")
+            handle.write(f"KAVITA_USERNAME={USERNAME}\n")
+            handle.write(f"KAVITA_PASSWORD={PASSWORD}\n")
+            handle.write(f"KAVITA_API_KEY={auth_key_value}\n")
+            handle.write("KAVITA_LIBRARY_ROOT=/manga\n")
+        os.chmod(OUTPUT_ENV, 0o600)
+    print(json.dumps(result, sort_keys=True))
 
 
 if __name__ == "__main__":

@@ -14,19 +14,20 @@ from bs4 import BeautifulSoup
 
 from app.adapters.base import SourceRateLimited
 from app.settings import settings
+from manga_manager.domain.providers import KNOWN_SOURCES, PROVIDER_ORIGINS, source_for_origin
 
-_page_semaphores: dict[str, asyncio.Semaphore] = {}
+_page_limiters: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _request_schedulers: dict[str, tuple[asyncio.Lock, float]] = {}
 _worker_page_semaphores: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 WORKER_INFLIGHT_BYTE_BUDGET = 256 * 1024 * 1024
-_provider_waiter: Callable[[str, float], Awaitable[None]] | None = None
+_provider_waiter: Callable[[str, str, float], Awaitable[None]] | None = None
 _request_observer: Callable[[dict], None] | None = None
 
 
 @dataclass(slots=True)
 class ReservedPage:
     content: bytes
-    semaphore: asyncio.Semaphore
+    semaphore: object
     released: bool = False
 
     def release(self) -> None:
@@ -36,7 +37,7 @@ class ReservedPage:
 
 
 def configure_provider_waiter(
-    waiter: Callable[[str, float], Awaitable[None]] | None,
+    waiter: Callable[[str, str, float], Awaitable[None]] | None,
 ) -> None:
     global _provider_waiter
     _provider_waiter = waiter
@@ -54,11 +55,19 @@ class HttpSourceClient:
         timeout: float | None = None,
         throttle_seconds: float = 0.0,
         transport: httpx.AsyncBaseTransport | None = None,
+        source: str | None = None,
+        provider_origin_url: str | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout or settings.request_timeout_seconds
         self.throttle_seconds = throttle_seconds
         self.transport = transport
+        self.source = source or source_for_origin(base_url) or ""
+        if self.source and self.source not in KNOWN_SOURCES:
+            raise ValueError(f"unknown provider source: {self.source}")
+        self.provider_origin_url = provider_origin_url or PROVIDER_ORIGINS.get(
+            self.source, self.base_url
+        )
         self._client: httpx.AsyncClient | None = None
 
     async def get_soup(self, path_or_url: str) -> BeautifulSoup:
@@ -92,13 +101,13 @@ class HttpSourceClient:
         headers = {}
         if referer:
             headers["Referer"] = referer
-        await self.wait_for_throttle()
+        await self.wait_for_throttle(url)
         started = time.monotonic()
         async with self.client.stream("GET", url, headers=headers) as response:
             try:
                 self.raise_for_status(response)
             except Exception as exc:
-                observe_request(self.base_url, url, response, started, 0, exc)
+                self.observe(url, response, started, 0, exc)
                 raise
             content_type = response.headers.get("content-type", "")
             if content_type and not content_type.startswith("image/"):
@@ -120,7 +129,7 @@ class HttpSourceClient:
                     raise RuntimeError(
                         f"image exceeds max_page_bytes ({settings.max_page_bytes}) for {url}"
                     )
-        observe_request(self.base_url, url, response, started, len(content), None)
+        self.observe(url, response, started, len(content), None)
         return bytes(content)
 
     @property
@@ -140,34 +149,63 @@ class HttpSourceClient:
         url: str,
         headers: dict[str, str] | None = None,
     ) -> httpx.Response:
-        await self.wait_for_throttle()
+        await self.wait_for_throttle(url)
         started = time.monotonic()
         try:
             response = await self.client.request(method, url, headers=headers)
         except Exception as exc:
-            observe_request(self.base_url, url, None, started, 0, exc)
+            self.observe(url, None, started, 0, exc)
             raise
         try:
             self.raise_for_status(response)
         except Exception as exc:
-            observe_request(self.base_url, url, response, started, len(response.content), exc)
+            self.observe(url, response, started, len(response.content), exc)
             raise
-        observe_request(self.base_url, url, response, started, len(response.content), None)
+        self.observe(url, response, started, len(response.content), None)
         return response
+
+    def observe(
+        self,
+        url: str,
+        response: httpx.Response | None,
+        started: float,
+        byte_count: int,
+        error: BaseException | None,
+    ) -> None:
+        if self.source:
+            observe_request(
+                self.source,
+                self.provider_origin_url,
+                url,
+                response,
+                started,
+                byte_count,
+                error,
+            )
 
     def raise_for_status(self, response: httpx.Response) -> None:
         if response.status_code == 429:
+            traffic_class = traffic_class_for_url(
+                self.provider_origin_url, str(response.request.url)
+            )
             raise SourceRateLimited(
                 f"rate limited by {self.base_url}",
                 retry_after=retry_after_from_headers(response.headers),
+                source=self.source,
+                traffic_class=traffic_class,
             )
         response.raise_for_status()
 
-    async def wait_for_throttle(self) -> None:
-        if self.throttle_seconds <= 0:
-            return
+    async def wait_for_throttle(self, url: str = "") -> None:
         if _provider_waiter is not None:
-            await _provider_waiter(source_for_base_url(self.base_url), self.throttle_seconds)
+            if self.source:
+                await _provider_waiter(
+                    self.source,
+                    traffic_class_for_url(self.provider_origin_url, url or self.base_url),
+                    self.throttle_seconds,
+                )
+                return
+        if self.throttle_seconds <= 0:
             return
         lock, last_request_at = _request_schedulers.setdefault(self.base_url, (asyncio.Lock(), 0.0))
         async with lock:
@@ -272,12 +310,35 @@ def worker_page_semaphore() -> asyncio.Semaphore:
     return semaphore
 
 
-def page_semaphore_for_client(client: HttpSourceClient) -> asyncio.Semaphore:
-    semaphore = _page_semaphores.get(client.base_url)
-    if semaphore is None:
-        semaphore = asyncio.Semaphore(page_concurrency_for_base_url(client.base_url))
-        _page_semaphores[client.base_url] = semaphore
-    return semaphore
+class DynamicLimiter:
+    def __init__(self, limit: Callable[[], int]) -> None:
+        self.limit = limit
+        self.active = 0
+        self.condition = asyncio.Condition()
+
+    async def __aenter__(self):
+        async with self.condition:
+            await self.condition.wait_for(lambda: self.active < max(1, self.limit()))
+            self.active += 1
+        return self
+
+    async def __aexit__(self, *_args) -> None:
+        async with self.condition:
+            self.active = max(0, self.active - 1)
+            self.condition.notify_all()
+
+
+def page_semaphore_for_client(client: HttpSourceClient) -> DynamicLimiter:
+    loop = asyncio.get_running_loop()
+    by_source = _page_limiters.get(loop)
+    if by_source is None:
+        by_source = {}
+        _page_limiters[loop] = by_source
+    limiter = by_source.get(client.base_url)
+    if limiter is None:
+        limiter = DynamicLimiter(lambda: page_concurrency_for_base_url(client.base_url))
+        by_source[client.base_url] = limiter
+    return limiter
 
 
 def page_concurrency_for_base_url(base_url: str) -> int:
@@ -291,13 +352,11 @@ def page_concurrency_for_base_url(base_url: str) -> int:
 
 
 def source_for_base_url(base_url: str) -> str:
-    if "asura" in base_url:
-        return "asura"
-    if "mangafire" in base_url:
-        return "mangafire"
-    if "kingofshojo" in base_url:
-        return "kingofshojo"
-    return base_url
+    return source_for_origin(base_url) or ""
+
+
+def traffic_class_for_url(base_url: str, url: str) -> str:
+    return "origin" if urlparse(base_url).hostname == urlparse(url).hostname else "cdn"
 
 
 def is_partial_body_error(exc: BaseException) -> bool:
@@ -327,7 +386,8 @@ def retry_after_from_headers(headers: httpx.Headers) -> datetime | None:
 
 
 def observe_request(
-    base_url: str,
+    source: str,
+    provider_origin_url: str,
     url: str,
     response: httpx.Response | None,
     started: float,
@@ -339,14 +399,13 @@ def observe_request(
     headers = response.headers if response is not None else httpx.Headers()
     retry_at = retry_after_from_headers(headers)
     retry_seconds = (
-        max(0, int((retry_at - datetime.now(timezone.utc)).total_seconds()))
-        if retry_at
-        else None
+        max(0, int((retry_at - datetime.now(timezone.utc)).total_seconds())) if retry_at else None
     )
     _request_observer(
         {
-            "source": source_for_base_url(base_url),
+            "source": source,
             "host": urlparse(url).hostname or "",
+            "traffic_class": traffic_class_for_url(provider_origin_url, url),
             "status_code": response.status_code if response is not None else 0,
             "latency_ms": max(0, int((time.monotonic() - started) * 1000)),
             "byte_count": byte_count,

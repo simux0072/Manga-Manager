@@ -5,7 +5,12 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from manga_manager.infrastructure.db_models import CatalogSourceState, JobBase, WorkJob
+from manga_manager.infrastructure.db_models import (
+    CatalogSourceState,
+    JobBase,
+    ProviderPolicy,
+    WorkJob,
+)
 from manga_manager.settings import V2Settings
 from manga_manager.worker.scheduler import SourcePollScheduler
 
@@ -72,3 +77,33 @@ def test_scheduler_respects_source_circuit_breaker() -> None:
         ),
     )
     assert scheduler.enqueue_due(now=NOW) == 0
+
+
+def test_provider_recovery_probe_uses_its_provider_pull_pool() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    JobBase.metadata.create_all(engine)
+    sessions = sessionmaker(engine, expire_on_commit=False)
+    with Session(engine) as session:
+        session.add(
+            ProviderPolicy(
+                source="asura",
+                metadata_json={"next_recovery_probe": (NOW - timedelta(seconds=1)).isoformat()},
+            )
+        )
+        session.commit()
+    scheduler = SourcePollScheduler(
+        engine=engine,
+        session_factory=sessions,
+        settings=V2Settings(
+            database_url="postgresql+psycopg://unused",
+            enable_asura=False,
+            enable_mangafire=False,
+            enable_kingofshojo=False,
+        ),
+    )
+
+    assert scheduler.enqueue_due(now=NOW) == 1
+    with Session(engine) as session:
+        job = session.scalar(select(WorkJob))
+    assert job is not None
+    assert (job.kind, job.source, job.pool) == ("maintenance", "asura", "pull:asura")

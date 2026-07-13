@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 
 from app.adapters import adapter_for_source
 from app.adapters.base import SourceRateLimited
@@ -10,9 +10,14 @@ from manga_manager.application.job_handlers import (
     DeferredJobError,
     JobContext,
     PermanentJobError,
+    exception_message,
 )
 from manga_manager.domain.jobs import MaintenancePayload
-from manga_manager.infrastructure.db_models import CatalogSourceState, ProviderPolicy
+from manga_manager.infrastructure.db_models import (
+    CatalogSourceState,
+    ProviderEndpointState,
+    ProviderPolicy,
+)
 from manga_manager.worker.runtime import SessionFactory
 
 
@@ -37,14 +42,14 @@ class MaintenanceHandler:
     async def _provider_probe(self, source: str, context: JobContext) -> None:
         adapter = adapter_for_source(source)
         if adapter is None:
-            raise DeferredJobError(
-                "provider_unavailable", source, retry_after=timedelta(minutes=5)
-            )
+            raise DeferredJobError("provider_unavailable", source, retry_after=timedelta(minutes=5))
         try:
             await adapter.list_recent_frontier([])
         except SourceRateLimited as exc:
             delay = timedelta(minutes=self._record_probe_failure(source))
-            raise DeferredJobError("rate_limited", str(exc), retry_after=delay) from exc
+            raise DeferredJobError(
+                "rate_limited", exception_message(exc), retry_after=delay
+            ) from exc
         finally:
             await adapter.aclose()
         context.ensure_lease()
@@ -61,9 +66,7 @@ class MaintenanceHandler:
                 started = metadata.get("recovery_started_at")
                 if started:
                     try:
-                        elapsed = int(
-                            (now - datetime.fromisoformat(str(started))).total_seconds()
-                        )
+                        elapsed = int((now - datetime.fromisoformat(str(started))).total_seconds())
                         policy.cooldown_seconds = max(60, min(21600, int(elapsed * 1.2)))
                     except (TypeError, ValueError):
                         pass
@@ -77,6 +80,11 @@ class MaintenanceHandler:
                 if state is not None:
                     state.cooldown_until = None
                     state.health_status = "healthy"
+                session.execute(
+                    update(ProviderEndpointState)
+                    .where(ProviderEndpointState.source == source)
+                    .values(cooldown_until=None, consecutive_failures=0, last_error="")
+                )
             else:
                 metadata["next_recovery_probe"] = (now + timedelta(seconds=30)).isoformat()
             policy.metadata_json = metadata

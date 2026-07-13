@@ -36,9 +36,11 @@ def test_worker_registry_tracks_live_and_stopped_workers() -> None:
             now=NOW + timedelta(seconds=5),
         )
         session.commit()
-        assert registry.live_workers(
-            session,
-            seen_within=timedelta(minutes=2),
-            now=NOW + timedelta(seconds=5),
-        ) == []
-
+        assert (
+            registry.live_workers(
+                session,
+                seen_within=timedelta(minutes=2),
+                now=NOW + timedelta(seconds=5),
+            )
+            == []
+        )

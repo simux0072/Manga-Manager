@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import select, text
 from sqlalchemy.orm import Session
 
 from app.domain import ChapterItem, SeriesItem
@@ -107,12 +107,14 @@ class CatalogRepository:
         source: str,
         frontier: list[dict[str, str]],
         partial_failures: int = 0,
+        metrics: dict[str, int] | None = None,
     ) -> None:
         state = self._source_state(session, source)
         state.health_status = "degraded" if partial_failures else "healthy"
         state.consecutive_failures = 0
         state.last_error = f"{partial_failures} item failures" if partial_failures else ""
         state.frontier_json = list(frontier)
+        state.cursor_json = {**(state.cursor_json or {}), "last_pull": dict(metrics or {})}
         state.cooldown_until = None
         state.last_poll_at = utcnow()
         state.updated_at = utcnow()
@@ -148,7 +150,11 @@ class CatalogRepository:
                 policy.cooldown_seconds = max(policy.cooldown_seconds, seconds)
                 metadata = dict(policy.metadata_json or {})
                 metadata.update(
-                    {"recovery_probe_step": 0, "next_recovery_probe": (utcnow() + timedelta(minutes=1)).isoformat(), "recovery_probe_successes": 0}
+                    {
+                        "recovery_probe_step": 0,
+                        "next_recovery_probe": (utcnow() + timedelta(minutes=1)).isoformat(),
+                        "recovery_probe_successes": 0,
+                    }
                 )
                 policy.metadata_json = metadata
         session.flush()
@@ -222,10 +228,20 @@ class CatalogRepository:
         source_series_id: int,
         aliases: Iterable[str],
     ) -> None:
+        seen: set[str] = set()
         for display_value in aliases:
             normalized = normalize_title(display_value)
-            if not normalized:
+            if not normalized or normalized in seen:
                 continue
+            seen.add(normalized)
+            # Alias synchronization can race across provider refresh workers for
+            # the same canonical series.  The transaction-scoped advisory lock
+            # makes the read-before-insert safe without weakening the unique key.
+            if session.bind is not None and session.bind.dialect.name == "postgresql":
+                session.execute(
+                    text("SELECT pg_advisory_xact_lock(:namespace, :series_id)"),
+                    {"namespace": 0x4D414C49, "series_id": series_id},
+                )
             existing = session.scalar(
                 select(CatalogSeriesAlias).where(
                     CatalogSeriesAlias.series_id == series_id,

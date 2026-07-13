@@ -28,7 +28,7 @@ def test_asura_requires_two_clean_explorations_before_promoting() -> None:
         policy.next_exploration_at = NOW - timedelta(seconds=1)
     first = service.start_due_exploration("asura", ceiling=2, now=NOW)
     assert first is not None
-    for _ in range(10):
+    for _ in range(100):
         service.observer(first)({"source": "asura", "status_code": 200})
     service.finish(first, rate_limited=False, report={})
     with sessions() as session, session.begin():
@@ -37,7 +37,7 @@ def test_asura_requires_two_clean_explorations_before_promoting() -> None:
         policy.next_exploration_at = NOW - timedelta(seconds=1)
     second = service.start_due_exploration("asura", ceiling=2, now=NOW)
     assert second is not None
-    for _ in range(10):
+    for _ in range(100):
         service.observer(second)({"source": "asura", "status_code": 200})
     service.finish(second, rate_limited=False, report={})
     with sessions() as session:
@@ -65,3 +65,21 @@ def test_rate_limit_abandons_exploration_and_learns_retry_after() -> None:
         assert policy.learned_job_limit == 2
         assert policy.cooldown_seconds == 1200
         assert policy.next_exploration_at is not None
+
+
+def test_existing_zero_interval_policy_receives_conservative_pacing() -> None:
+    service, sessions = telemetry()
+    with sessions() as session, session.begin():
+        session.add(ProviderPolicy(source="asura", request_interval_seconds=0))
+
+    service.ensure_policy(
+        "asura",
+        job_limit=1,
+        page_limit=1,
+        cooldown_seconds=900,
+        request_interval_seconds=2.0,
+    )
+
+    with sessions() as session:
+        policy = session.get(ProviderPolicy, "asura")
+        assert policy is not None and policy.request_interval_seconds == 2.0

@@ -7,6 +7,7 @@ from uuid import uuid4
 
 from sqlalchemy import (
     CheckConstraint,
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
@@ -134,6 +135,32 @@ class JobPermit(JobBase):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
+class StorageState(JobBase):
+    __tablename__ = "storage_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    paused: Mapped[bool] = mapped_column(Boolean, default=False, index=True)
+    free_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    min_free_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    reserved_bytes: Mapped[int] = mapped_column(BigInteger, default=0)
+    reason: Mapped[str] = mapped_column(Text, default="")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class StorageReservation(JobBase):
+    __tablename__ = "storage_reservation"
+    __table_args__ = (Index("ix_storage_reservation_expiry", "lease_expires_at"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    job_id: Mapped[int] = mapped_column(
+        ForeignKey("job.id", ondelete="CASCADE"), unique=True, nullable=False, index=True
+    )
+    owner: Mapped[str] = mapped_column(String(200), nullable=False)
+    reserved_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class JobEvent(JobBase):
     __tablename__ = "job_event"
     __table_args__ = (
@@ -211,6 +238,8 @@ class CatalogSeries(JobBase):
     normalized_title: Mapped[str] = mapped_column(String(500), index=True)
     description: Mapped[str] = mapped_column(Text, default="")
     cover_url: Mapped[str] = mapped_column(Text, default="")
+    cover_checksum: Mapped[str] = mapped_column(String(64), default="")
+    cover_relative_path: Mapped[str] = mapped_column(Text, default="")
     status: Mapped[str] = mapped_column(String(30), default="untracked", index=True)
     integrity_state: Mapped[str] = mapped_column(String(20), default="unknown", index=True)
     latest_release_at: Mapped[datetime | None] = mapped_column(
@@ -226,6 +255,7 @@ class CatalogSeries(JobBase):
     kavita_synced_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    kavita_cover_checksum: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -357,6 +387,7 @@ class CatalogChapter(JobBase):
     kavita_mapped_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    kavita_cover_checksum: Mapped[str] = mapped_column(String(64), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -463,6 +494,38 @@ class CatalogChapterRelease(JobBase):
     )
 
 
+class ChapterReleaseAttempt(JobBase):
+    __tablename__ = "chapter_release_attempt"
+    __table_args__ = (
+        CheckConstraint(
+            "outcome IN ('failed', 'fallback_queued', 'fallback_succeeded', 'succeeded', 'upgraded')",
+            name="ck_chapter_release_attempt_outcome",
+        ),
+        Index("ix_chapter_release_attempt_chapter_created", "chapter_id", "created_at"),
+        Index("ix_chapter_release_attempt_release_outcome", "chapter_release_id", "outcome"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chapter_id: Mapped[int] = mapped_column(
+        ForeignKey("chapter_v2.id", ondelete="CASCADE"), index=True
+    )
+    chapter_release_id: Mapped[int] = mapped_column(
+        ForeignKey("chapter_release_v2.id", ondelete="CASCADE"), index=True
+    )
+    job_id: Mapped[int | None] = mapped_column(
+        ForeignKey("job.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    source: Mapped[str] = mapped_column(String(50), index=True)
+    outcome: Mapped[str] = mapped_column(String(30), index=True)
+    error_code: Mapped[str] = mapped_column(String(100), default="")
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    retry_after: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    details_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON().with_variant(JSONB(none_as_null=True), "postgresql"), default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class CatalogSourceState(JobBase):
     __tablename__ = "source_state_v2"
     __table_args__ = (
@@ -499,12 +562,32 @@ class ProviderPolicy(JobBase):
     cooldown_seconds: Mapped[int] = mapped_column(Integer, default=300)
     clean_since: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_limited_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    next_exploration_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    next_exploration_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     successful_tier_runs: Mapped[int] = mapped_column(Integer, default=0)
     metadata_json: Mapped[dict[str, Any]] = mapped_column(
         JSON().with_variant(JSONB(none_as_null=True), "postgresql"), default=dict
     )
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ProviderEndpointState(JobBase):
+    __tablename__ = "provider_endpoint_state"
+    __table_args__ = (
+        UniqueConstraint("source", "traffic_class", name="uq_provider_endpoint_source_class"),
+        Index("ix_provider_endpoint_cooldown", "cooldown_until"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source: Mapped[str] = mapped_column(String(50), index=True)
+    traffic_class: Mapped[str] = mapped_column(String(20), index=True)
+    request_interval_seconds: Mapped[float] = mapped_column(default=0.0)
+    next_request_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cooldown_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
+    last_error: Mapped[str] = mapped_column(Text, default="")
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -533,8 +616,8 @@ class ProviderRequestSample(JobBase):
     __table_args__ = (Index("ix_provider_sample_run_created", "run_id", "created_at"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    run_id: Mapped[int] = mapped_column(
-        ForeignKey("provider_benchmark_run.id", ondelete="CASCADE"), index=True
+    run_id: Mapped[int | None] = mapped_column(
+        ForeignKey("provider_benchmark_run.id", ondelete="CASCADE"), nullable=True, index=True
     )
     source: Mapped[str] = mapped_column(String(50), index=True)
     host: Mapped[str] = mapped_column(String(255), default="")

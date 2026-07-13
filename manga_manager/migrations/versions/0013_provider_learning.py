@@ -51,7 +51,9 @@ def upgrade() -> None:
     )
     op.create_index("ix_provider_benchmark_run_source", "provider_benchmark_run", ["source"])
     op.create_index("ix_provider_benchmark_run_state", "provider_benchmark_run", ["state"])
-    op.create_index("ix_provider_benchmark_source_started", "provider_benchmark_run", ["source", "started_at"])
+    op.create_index(
+        "ix_provider_benchmark_source_started", "provider_benchmark_run", ["source", "started_at"]
+    )
     op.create_table(
         "provider_request_sample",
         sa.Column("id", sa.Integer(), primary_key=True),
@@ -69,7 +71,9 @@ def upgrade() -> None:
     )
     op.create_index("ix_provider_request_sample_run_id", "provider_request_sample", ["run_id"])
     op.create_index("ix_provider_request_sample_source", "provider_request_sample", ["source"])
-    op.create_index("ix_provider_sample_run_created", "provider_request_sample", ["run_id", "created_at"])
+    op.create_index(
+        "ix_provider_sample_run_created", "provider_request_sample", ["run_id", "created_at"]
+    )
 
 
 def downgrade() -> None:

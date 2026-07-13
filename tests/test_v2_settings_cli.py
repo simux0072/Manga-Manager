@@ -11,9 +11,10 @@ def test_v2_settings_require_postgresql() -> None:
         V2Settings(database_url="").require_database_url()
     with pytest.raises(ValueError, match=r"postgresql\+"):
         V2Settings(database_url="sqlite:///test.db").require_database_url()
-    assert V2Settings(
-        database_url="postgresql+psycopg://localhost/test"
-    ).require_database_url() == "postgresql+psycopg://localhost/test"
+    assert (
+        V2Settings(database_url="postgresql+psycopg://localhost/test").require_database_url()
+        == "postgresql+psycopg://localhost/test"
+    )
 
 
 def test_normal_worker_cannot_enable_asura_concurrency_two() -> None:

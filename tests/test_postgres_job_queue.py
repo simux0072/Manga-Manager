@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import shutil
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from threading import Barrier
 
 import pytest
@@ -17,6 +19,7 @@ from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.infrastructure.scheduler_leadership import (
     try_acquire_scheduler_leadership,
 )
+from manga_manager.infrastructure.storage_capacity import StorageCapacityCoordinator
 
 
 DATABASE_URL = os.environ.get("V2_TEST_DATABASE_URL", "")
@@ -30,7 +33,10 @@ def sessions():
     engine = create_engine(DATABASE_URL, pool_pre_ping=True)
     with engine.begin() as connection:
         connection.execute(
-            text("TRUNCATE job_event, worker_heartbeat, job RESTART IDENTITY CASCADE")
+            text(
+                "TRUNCATE job_event, worker_heartbeat, storage_state, job "
+                "RESTART IDENTITY CASCADE"
+            )
         )
     yield engine, sessionmaker(engine, expire_on_commit=False)
     engine.dispose()
@@ -156,6 +162,41 @@ def test_per_series_cap_is_atomic_across_workers(sessions) -> None:
     assert sum(job_id is not None for job_id in claims) == 1
 
 
+def test_storage_reservation_cap_is_atomic_across_workers(sessions, tmp_path: Path) -> None:
+    _engine, factory = sessions
+    requested = 1024 * 1024 * 1024
+    minimum_free = shutil.disk_usage(tmp_path).free - requested - requested // 2
+    lease_expires_at = datetime.now(timezone.utc) + timedelta(minutes=1)
+    with factory() as session, session.begin():
+        jobs = [
+            JobQueue().enqueue(
+                session,
+                kind=JobKind.MAINTENANCE,
+                dedupe_key=f"storage:{index}",
+                payload=MaintenancePayload(action="stage_probe"),
+                available_at=NOW,
+            )[0].id
+            for index in range(2)
+        ]
+    barrier = Barrier(2)
+
+    def reserve(item: tuple[int, str]) -> bool:
+        job_id, owner = item
+        with factory() as session, session.begin():
+            barrier.wait()
+            return StorageCapacityCoordinator(tmp_path, minimum_free).reserve(
+                session,
+                job_id=job_id,
+                owner=owner,
+                requested_bytes=requested,
+                lease_expires_at=lease_expires_at,
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        reservations = list(executor.map(reserve, zip(jobs, ("worker-a", "worker-b"))))
+    assert sorted(reservations) == [False, True]
+
+
 def test_scheduler_advisory_lock_has_one_leader(sessions) -> None:
     engine, _factory = sessions
     first = try_acquire_scheduler_leadership(engine)
@@ -178,13 +219,11 @@ def test_v2_migrations_round_trip_on_postgresql(sessions) -> None:
     command.upgrade(config, "head")
     with Session(create_engine(DATABASE_URL)) as session:
         assert session.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0014_matching_evidence"
+            "0016_refresh_storage_hardening"
         )
         indexes = set(
             session.scalars(
-                text(
-                    "SELECT indexname FROM pg_indexes WHERE tablename='series_v2'"
-                )
+                text("SELECT indexname FROM pg_indexes WHERE tablename='series_v2'")
             ).all()
         )
         assert {

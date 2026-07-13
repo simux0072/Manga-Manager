@@ -6,14 +6,20 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 
 import pytest
+import httpx
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app.adapters.base import FrontierSentinel, SourceAdapter
 from app.domain import ChapterItem, SeriesItem
-from manga_manager.application.job_handlers import JobContext
-from manga_manager.application.source_pull import SourcePullHandler
+from manga_manager.application.job_handlers import JobContext, RetryableJobError
+from manga_manager.application.source_pull import (
+    SourcePullHandler,
+    SourceRefreshHandler,
+    build_listing_frontier,
+    changed_before_stable_frontier,
+)
 from manga_manager.domain.jobs import JobKind, SourcePullPayload
 from manga_manager.infrastructure.db_models import (
     CatalogChapter,
@@ -23,7 +29,8 @@ from manga_manager.infrastructure.db_models import (
     CatalogSourceSeries,
     CatalogSourceState,
     JobBase,
-    JobEvent,
+    ProviderEndpointState,
+    WorkJob,
 )
 from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.infrastructure.catalog_repository import CatalogRepository
@@ -69,7 +76,7 @@ class FakeAdapter(SourceAdapter):
                 description="A test series",
                 cover_url="https://example.test/cover.jpg",
                 external_ids={"mal": "123"},
-                metadata={"rating": 9.1},
+                metadata={"rating": 9.1, "recent_chapters": [{"number": "10.0"}]},
             )
         ]
 
@@ -98,6 +105,11 @@ class FakeAdapter(SourceAdapter):
 
     async def aclose(self) -> None:
         self.closed = True
+
+
+class DisconnectedAdapter(FakeAdapter):
+    async def list_recent_frontier(self, sentinels: list[FrontierSentinel]) -> list[SeriesItem]:
+        raise httpx.RemoteProtocolError("")
 
 
 @pytest.fixture
@@ -144,6 +156,25 @@ async def test_source_pull_keeps_database_closed_during_http_and_ingests_idempot
     await handler(context)
     await handler(context)
 
+    with sessions() as session, session.begin():
+        assert (
+            session.scalar(
+                select(func.count()).select_from(WorkJob).where(WorkJob.kind == "source_refresh")
+            )
+            == 1
+        )
+        assert JobQueue().succeed(session, job_id=context.lease.id, owner=context.lease.owner)
+        refresh_lease = JobQueue().claim(
+            session,
+            owner="worker-refresh",
+            lease_for=timedelta(minutes=5),
+            kinds={JobKind.SOURCE_REFRESH},
+        )
+        assert refresh_lease is not None
+    await SourceRefreshHandler(session_factory=sessions, adapter_factory=lambda _source: adapter)(
+        JobContext(lease=refresh_lease, lease_lost=asyncio.Event())
+    )
+
     assert adapter.closed is True
     with sessions() as session:
         assert session.scalar(select(func.count()).select_from(CatalogSeries)) == 1
@@ -154,8 +185,12 @@ async def test_source_pull_keeps_database_closed_during_http_and_ingests_idempot
         assert state is not None
         assert state.health_status == "healthy"
         assert state.frontier_json == [{"source_id": "series-1", "latest_chapter": "10.0"}]
-        progress = session.scalars(select(JobEvent).where(JobEvent.event_type == "progress")).all()
-        assert len(progress) == 4
+        assert (
+            session.scalar(
+                select(func.count()).select_from(WorkJob).where(WorkJob.kind == "source_refresh")
+            )
+            == 1
+        )
 
 
 @pytest.mark.asyncio
@@ -174,6 +209,24 @@ async def test_source_pull_reads_persisted_frontier(sessions: TrackingSessionFac
     )
     await handler(claimed_context(sessions))
     assert adapter.frontier == [FrontierSentinel(source_id="known", latest_chapter="9")]
+
+
+@pytest.mark.asyncio
+async def test_source_pull_classifies_empty_protocol_error_as_network_failure(
+    sessions: TrackingSessionFactory,
+) -> None:
+    adapter = DisconnectedAdapter(sessions)
+    handler = SourcePullHandler(
+        session_factory=sessions,
+        adapter_factory=lambda _source: adapter,
+    )
+
+    with pytest.raises(RetryableJobError) as raised:
+        await handler(claimed_context(sessions))
+
+    assert raised.value.code == "source_network_error"
+    assert raised.value.message == "RemoteProtocolError"
+    assert adapter.closed is True
 
 
 def test_exact_title_without_external_id_creates_pending_match(
@@ -228,6 +281,27 @@ def test_shared_external_id_never_adds_second_identity_from_same_provider(
         assert first.series_id != second.series_id
 
 
+def test_duplicate_normalized_aliases_are_inserted_once(
+    sessions: TrackingSessionFactory,
+) -> None:
+    with sessions() as session, session.begin():
+        CatalogRepository().ingest(
+            session,
+            SeriesItem(
+                "asura",
+                "alias-test",
+                "Eden",
+                "https://asura.test/eden",
+                aliases=("Eden", " EDEN ", "Eden!"),
+            ),
+            [],
+        )
+    with sessions() as session:
+        from manga_manager.infrastructure.db_models import CatalogSeriesAlias
+
+        assert session.scalar(select(func.count()).select_from(CatalogSeriesAlias)) == 1
+
+
 def test_source_failure_repairs_null_counter_and_opens_circuit_after_three(
     sessions: TrackingSessionFactory,
 ) -> None:
@@ -247,3 +321,51 @@ def test_source_failure_repairs_null_counter_and_opens_circuit_after_three(
         assert state.consecutive_failures == 3
         assert state.health_status == "cooldown"
         assert state.cooldown_until is not None
+
+
+def test_source_pull_failure_records_endpoint_cooldown(
+    sessions: TrackingSessionFactory,
+) -> None:
+    retry_at = datetime.now(timezone.utc) + timedelta(minutes=5)
+    SourcePullHandler(
+        session_factory=sessions, adapter_factory=lambda _source: None
+    )._record_failure("asura", "limited", retry_at, traffic_class="origin")
+
+    with sessions() as session:
+        endpoint = session.scalar(select(ProviderEndpointState))
+        assert endpoint is not None
+        assert endpoint.source == "asura"
+        assert endpoint.traffic_class == "origin"
+        assert endpoint.cooldown_until is not None
+
+
+def test_frontier_only_enriches_new_or_advanced_rows_before_stable_boundary() -> None:
+    def item(source_id: str, chapter: str) -> SeriesItem:
+        return SeriesItem(
+            "asura",
+            source_id,
+            source_id,
+            f"https://asura.test/{source_id}",
+            metadata={"recent_chapters": [{"number": chapter}]},
+        )
+
+    listed = [
+        item("new", "1"),
+        item("advanced", "11"),
+        item("stable-a", "10"),
+        item("stable-b", "8"),
+        item("stable-c", "5"),
+        item("older", "1"),
+    ]
+    sentinels = [
+        FrontierSentinel("advanced", "10"),
+        FrontierSentinel("stable-a", "10"),
+        FrontierSentinel("stable-b", "8"),
+        FrontierSentinel("stable-c", "5"),
+    ]
+    changed = changed_before_stable_frontier(listed, sentinels, required_hits=3)
+    assert [row.source_id for row in changed] == ["new", "advanced"]
+    assert build_listing_frontier(listed, 5) == [
+        {"source_id": row.source_id, "latest_chapter": row.metadata["recent_chapters"][0]["number"]}
+        for row in listed[:5]
+    ]

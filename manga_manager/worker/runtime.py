@@ -18,7 +18,9 @@ from manga_manager.application.job_handlers import (
     JobHandler,
     LeaseLostError,
     PermanentJobError,
+    ReroutedJobError,
     RetryableJobError,
+    exception_message,
 )
 from manga_manager.domain.jobs import JobKind, JobLease, JobState
 from manga_manager.infrastructure.job_queue import JobQueue
@@ -127,6 +129,8 @@ class JobWorker:
                 message=exc.message,
                 retry_after=exc.retry_after,
             )
+        except ReroutedJobError:
+            return WorkerRunResult.RETRY_SCHEDULED
         except PermanentJobError as exc:
             return self._fail(lease, code=exc.code, message=exc.message)
         except LeaseLostError:
@@ -139,7 +143,7 @@ class JobWorker:
             return self._retry(
                 lease,
                 code="unexpected_error",
-                message=str(exc),
+                message=exception_message(exc),
                 retry_after=None,
             )
         finally:

@@ -6,6 +6,7 @@ import sqlite3
 import zipfile
 from pathlib import Path
 
+import pytest
 from PIL import Image
 from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import sessionmaker
@@ -108,6 +109,14 @@ def test_storage_requires_comic_info(tmp_path: Path) -> None:
         raise AssertionError("archive without ComicInfo.xml was accepted")
 
 
+def test_storage_reports_malformed_zip_as_validation_error(tmp_path: Path) -> None:
+    source = tmp_path / "corrupt.cbz"
+    source.write_bytes(b"not a zip archive")
+
+    with pytest.raises(ValueError, match="invalid ZIP archive"):
+        storage(tmp_path).validate_cbz(source)
+
+
 def test_download_storage_rejects_cover_only_page(tmp_path: Path) -> None:
     store = ContentAddressedStorage(
         tmp_path / "storage-v2",
@@ -160,11 +169,14 @@ def test_cbz_import_dry_run_full_duplicate_and_conflict(tmp_path: Path) -> None:
         assert session.scalar(select(func.count()).select_from(CatalogChapter)) == 1
         assert session.scalar(select(func.count()).select_from(ArtifactBlob)) == 2
         assert session.scalar(select(func.count()).select_from(ChapterArtifact)) == 2
-        assert session.scalar(
-            select(func.count())
-            .select_from(ChapterArtifact)
-            .where(ChapterArtifact.state == "quarantined")
-        ) == 1
+        assert (
+            session.scalar(
+                select(func.count())
+                .select_from(ChapterArtifact)
+                .where(ChapterArtifact.state == "quarantined")
+            )
+            == 1
+        )
         projection = session.scalar(select(LibraryProjection))
         assert projection is not None
         assert (store.library_root / projection.relative_path).is_file()

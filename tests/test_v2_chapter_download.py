@@ -16,15 +16,20 @@ from sqlalchemy.pool import StaticPool
 from app.adapters.base import SourceAdapter, SourceRateLimited
 from app.domain import ChapterItem, SeriesItem
 from manga_manager.application.chapter_download import ChapterDownloadHandler
-from manga_manager.application.job_handlers import JobContext, RetryableJobError
+from manga_manager.application.job_handlers import JobContext, ReroutedJobError, RetryableJobError
 from manga_manager.domain.jobs import ChapterDownloadPayload, JobKind
 from manga_manager.infrastructure.catalog_repository import CatalogRepository
 from manga_manager.infrastructure.db_models import (
     CatalogChapterRelease,
+    CatalogChapter,
+    CatalogSeries,
+    CatalogSourceSeries,
     CatalogSourceState,
     ChapterArtifact,
+    ChapterReleaseAttempt,
     JobBase,
     LibraryProjection,
+    WorkJob,
 )
 from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.infrastructure.storage import ContentAddressedStorage
@@ -208,3 +213,85 @@ async def test_rate_limit_sets_shared_source_cooldown(
         assert state is not None
         assert state.health_status == "cooldown"
         assert state.cooldown_until is not None
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_reroutes_same_chapter_to_next_provider(
+    sessions: TrackingSessions,
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(timezone.utc)
+    with sessions() as session, session.begin():
+        series = CatalogSeries(title="Example", normalized_title="example", status="interested")
+        session.add(series)
+        session.flush()
+        chapter = CatalogChapter(
+            series_id=series.id,
+            canonical_number="1",
+            display_number="1",
+        )
+        session.add(chapter)
+        session.flush()
+        releases = []
+        for source in ("asura", "mangafire"):
+            identity = CatalogSourceSeries(
+                series_id=series.id,
+                source=source,
+                source_id=f"{source}-example",
+                title="Example",
+                normalized_title="example",
+                url=f"https://{source}.test/example",
+            )
+            session.add(identity)
+            session.flush()
+            release = CatalogChapterRelease(
+                chapter_id=chapter.id,
+                source_series_id=identity.id,
+                source=source,
+                source_release_id=f"{source}-1",
+                url=f"https://{source}.test/example/1",
+            )
+            session.add(release)
+            session.flush()
+            releases.append(release)
+        job, _ = JobQueue().enqueue(
+            session,
+            kind=JobKind.CHAPTER_DOWNLOAD,
+            dedupe_key=f"chapter:{chapter.id}",
+            payload=ChapterDownloadPayload(chapter_release_id=releases[0].id),
+            source="asura",
+            series_key=str(series.id),
+            available_at=now,
+        )
+        lease = JobQueue().claim(
+            session,
+            owner="worker-a",
+            lease_for=timedelta(minutes=5),
+            now=now,
+            pool_limits={"download:asura": 1, "chapter_global": 8},
+        )
+        assert lease is not None and lease.id == job.id
+
+    class RateLimitedAdapter(PageAdapter):
+        async def iter_chapter_pages(self, chapter: ChapterItem) -> AsyncIterator[bytes]:
+            raise SourceRateLimited("slow down")
+            yield b""  # pragma: no cover
+
+    handler = ChapterDownloadHandler(
+        session_factory=sessions,
+        storage=storage(tmp_path),
+        adapter_factory=lambda _source: RateLimitedAdapter(sessions, []),
+        cooldowns={"asura": timedelta(minutes=7), "default": timedelta(minutes=7)},
+    )
+    with pytest.raises(ReroutedJobError):
+        await handler(JobContext(lease=lease, lease_lost=asyncio.Event()))
+
+    with sessions() as session:
+        jobs = session.scalars(select(WorkJob).order_by(WorkJob.id)).all()
+        assert [row.status for row in jobs] == ["cancelled", "queued"]
+        assert jobs[1].source == "mangafire"
+        assert jobs[1].payload["chapter_release_id"] == releases[1].id
+        attempts = session.scalars(
+            select(ChapterReleaseAttempt).order_by(ChapterReleaseAttempt.id)
+        ).all()
+        assert [row.outcome for row in attempts] == ["failed", "fallback_queued"]

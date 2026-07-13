@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 
 from manga_manager.infrastructure.db_models import (
     ProviderBenchmarkRun,
@@ -10,6 +10,7 @@ from manga_manager.infrastructure.db_models import (
     ProviderRequestSample,
 )
 from manga_manager.worker.runtime import SessionFactory
+from manga_manager.domain.providers import KNOWN_SOURCES
 
 
 def utcnow() -> datetime:
@@ -38,6 +39,14 @@ class ProviderTelemetry:
             session.flush()
             return run.id
 
+    def cleanup_samples(self, *, days: int = 7, now: datetime | None = None) -> int:
+        cutoff = (now or utcnow()) - timedelta(days=max(1, days))
+        with self.session_factory() as session, session.begin():
+            result = session.execute(
+                delete(ProviderRequestSample).where(ProviderRequestSample.created_at < cutoff)
+            )
+            return int(result.rowcount or 0)
+
     def observer(self, run_id: int):
         def observe(sample: dict) -> None:
             with self.session_factory() as session, session.begin():
@@ -61,7 +70,8 @@ class ProviderTelemetry:
                         byte_count=int(sample.get("byte_count") or 0),
                         error_code=str(sample.get("error_code") or ""),
                         retry_after_seconds=sample.get("retry_after_seconds"),
-                        headers_json=dict(sample.get("headers") or {}),
+                        headers_json=dict(sample.get("headers") or {})
+                        | {"traffic_class": str(sample.get("traffic_class") or "origin")},
                     )
                 )
                 if failed and not run.limiting_signal:
@@ -73,6 +83,8 @@ class ProviderTelemetry:
 
     def active_observer(self, sample: dict) -> None:
         source = str(sample.get("source") or "")
+        if source not in KNOWN_SOURCES:
+            return
         with self.session_factory() as session:
             run_id = session.scalar(
                 select(ProviderBenchmarkRun.id)
@@ -85,9 +97,34 @@ class ProviderTelemetry:
             )
         if run_id is not None:
             self.observer(run_id)(sample)
+            return
+        with self.session_factory() as session, session.begin():
+            failed = bool(
+                sample.get("error_code") or int(sample.get("status_code") or 0) in {403, 429, 503}
+            )
+            session.add(
+                ProviderRequestSample(
+                    run_id=None,
+                    source=source,
+                    host=str(sample.get("host") or ""),
+                    status_code=int(sample.get("status_code") or 0),
+                    latency_ms=int(sample.get("latency_ms") or 0),
+                    byte_count=int(sample.get("byte_count") or 0),
+                    error_code=str(sample.get("error_code") or "") if failed else "",
+                    retry_after_seconds=sample.get("retry_after_seconds"),
+                    headers_json=dict(sample.get("headers") or {})
+                    | {"traffic_class": str(sample.get("traffic_class") or "origin")},
+                )
+            )
 
     def ensure_policy(
-        self, source: str, *, job_limit: int, page_limit: int, cooldown_seconds: int
+        self,
+        source: str,
+        *,
+        job_limit: int,
+        page_limit: int,
+        cooldown_seconds: int,
+        request_interval_seconds: float = 0.0,
     ) -> None:
         now = utcnow()
         with self.session_factory() as session, session.begin():
@@ -99,12 +136,18 @@ class ProviderTelemetry:
                         learned_job_limit=job_limit,
                         learned_page_limit=page_limit,
                         cooldown_seconds=cooldown_seconds,
+                        request_interval_seconds=request_interval_seconds,
                         clean_since=now,
                         next_exploration_at=now + timedelta(days=7),
                         expires_at=now + timedelta(days=30),
                         metadata_json={},
                     )
                 )
+            elif policy.request_interval_seconds <= 0 < request_interval_seconds:
+                # Backfill the conservative pace for policies created before request pacing
+                # became durable. Learned non-zero values are never overwritten here.
+                policy.request_interval_seconds = request_interval_seconds
+                policy.updated_at = now
 
     def start_due_exploration(
         self,
@@ -192,7 +235,7 @@ class ProviderTelemetry:
             if run is None:
                 raise ValueError("benchmark run disappeared")
             limited = rate_limited or bool(run.limiting_signal)
-            useful = run.request_count >= 10 or int(report.get("completed_jobs") or 0) > 0
+            useful = run.request_count >= 100 or int(report.get("completed_jobs") or 0) >= 2
             run.state = "limited" if limited else "succeeded" if useful else "inconclusive"
             run.completed_at = now
             run.report_json = dict(report)
@@ -204,6 +247,19 @@ class ProviderTelemetry:
                 policy.last_limited_at = now
                 policy.successful_tier_runs = 0
                 policy.learned_job_limit = max(1, run.requested_tier - 1)
+                policy.learned_page_limit = max(
+                    1,
+                    min(
+                        policy.learned_page_limit,
+                        1 if run.source == "asura" else max(2, (run.requested_tier - 1) * 2),
+                    ),
+                )
+                policy.request_interval_seconds = max(
+                    0.5,
+                    policy.request_interval_seconds * 2
+                    if policy.request_interval_seconds > 0
+                    else 0.5,
+                )
                 policy.next_exploration_at = now + timedelta(days=30)
                 retry_values = session.scalars(
                     select(ProviderRequestSample.retry_after_seconds).where(
@@ -217,12 +273,16 @@ class ProviderTelemetry:
                 policy.successful_tier_runs += 1
                 required = 2 if run.source == "asura" and run.requested_tier >= 2 else 1
                 if policy.successful_tier_runs >= required:
-                    policy.learned_job_limit = max(
-                        policy.learned_job_limit, run.requested_tier
-                    )
+                    policy.learned_job_limit = max(policy.learned_job_limit, run.requested_tier)
                     policy.learned_page_limit = max(
-                        policy.learned_page_limit, 2 if run.source == "asura" else run.requested_tier * 2
+                        policy.learned_page_limit,
+                        2 if run.source == "asura" else run.requested_tier * 2,
                     )
+                    floor = 0.5 if run.source == "asura" else 0.0
+                    if policy.request_interval_seconds > floor:
+                        policy.request_interval_seconds = max(
+                            floor, round(policy.request_interval_seconds * 0.8, 3)
+                        )
                 policy.clean_since = policy.clean_since or now
                 policy.next_exploration_at = now + timedelta(days=7)
             else:

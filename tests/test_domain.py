@@ -16,5 +16,7 @@ def test_priority_replacement_order():
 
 
 def test_title_similarity_token_overlap():
-    assert title_similarity("Father, I Don't Want This Marriage", "Father I Dont Want to Get Married") > 0.4
-
+    assert (
+        title_similarity("Father, I Don't Want This Marriage", "Father I Dont Want to Get Married")
+        > 0.4
+    )

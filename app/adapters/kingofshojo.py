@@ -6,8 +6,18 @@ from urllib.parse import unquote, urljoin, urlparse
 
 from app.adapters.asura import clean_series_title, dedupe_chapters, dedupe_series
 from app.adapters.base import FrontierSentinel, SourceAdapter
-from app.adapters.http import HttpSourceClient, enumerate_async, iter_ordered_bytes, page_concurrency_for_source
-from app.adapters.parsing import clean_chapter_title, extract_image_urls, nearby_cover_attr, parse_source_date
+from app.adapters.http import (
+    HttpSourceClient,
+    enumerate_async,
+    iter_ordered_bytes,
+    page_concurrency_for_source,
+)
+from app.adapters.parsing import (
+    clean_chapter_title,
+    extract_image_urls,
+    nearby_cover_attr,
+    parse_source_date,
+)
 from app.domain import ChapterItem, SeriesItem, normalize_chapter_number
 from app.settings import settings
 
@@ -21,6 +31,7 @@ class KingOfShojoAdapter(SourceAdapter):
             self.base_url,
             timeout=settings.kingofshojo_timeout_seconds,
             throttle_seconds=settings.kingofshojo_request_interval_seconds,
+            source=self.source,
         )
 
     async def aclose(self) -> None:
@@ -34,9 +45,7 @@ class KingOfShojoAdapter(SourceAdapter):
         sentinel_map = {sentinel.source_id: sentinel.latest_chapter for sentinel in sentinels}
         required_hits = min(settings.source_frontier_required_hits, len(sentinel_map))
         hits = 0
-        max_pages = (
-            settings.kingofshojo_recent_pages if sentinels else min(3, settings.kingofshojo_recent_pages)
-        )
+        max_pages = min(3, settings.kingofshojo_recent_pages)
         for page in range(1, max_pages + 1):
             path = "/" if page == 1 else f"/page/{page}/"
             soup = await self.client.get_soup(path)
@@ -67,7 +76,9 @@ class KingOfShojoAdapter(SourceAdapter):
                     source_id=urlparse(url).path.strip("/"),
                     title=title,
                     url=url,
-                    cover_url=urljoin(self.base_url, cover) if valid_kingofshojo_cover(cover) else "",
+                    cover_url=urljoin(self.base_url, cover)
+                    if valid_kingofshojo_cover(cover)
+                    else "",
                     metadata={
                         "recent_chapters": [
                             {"number": chapter.number, "title": chapter.title, "url": chapter.url}
@@ -99,9 +110,17 @@ class KingOfShojoAdapter(SourceAdapter):
 
     def parse_series_detail(self, soup, source_series: SeriesItem) -> SeriesItem:
         title_tag = soup.select_one("h1, .post-title, .entry-title")
-        title = clean_series_title(title_tag.get_text(" ", strip=True)) if title_tag else source_series.title
+        title = (
+            clean_series_title(title_tag.get_text(" ", strip=True))
+            if title_tag
+            else source_series.title
+        )
         description_tag = soup.select_one(".summary__content, .description, .entry-content")
-        description = description_tag.get_text(" ", strip=True) if description_tag else source_series.description
+        description = (
+            description_tag.get_text(" ", strip=True)
+            if description_tag
+            else source_series.description
+        )
         aliases, description = extract_description_aliases(description, title)
         cover = ""
         from app.adapters.parsing import image_attr
@@ -186,12 +205,14 @@ class KingOfShojoAdapter(SourceAdapter):
         soup = await self.client.get_soup(chapter.url)
         urls = self.parse_chapter_image_urls(soup)
         total_bytes = 0
-        async for index, page in enumerate_async(iter_ordered_bytes(
-            self.client,
-            urls,
-            referer=chapter.url,
-            concurrency=page_concurrency_for_source(self.source),
-        )):
+        async for index, page in enumerate_async(
+            iter_ordered_bytes(
+                self.client,
+                urls,
+                referer=chapter.url,
+                concurrency=page_concurrency_for_source(self.source),
+            )
+        ):
             total_bytes += len(page)
             if progress:
                 progress(index, len(urls), total_bytes)
@@ -233,7 +254,11 @@ def frontier_hits(items: list[SeriesItem], sentinels: dict[str, str]) -> int:
     for item in items:
         known = sentinels.get(item.source_id)
         latest = latest_recent_chapter(item)
-        if known is not None and latest is not None and chapter_number_key(latest) <= chapter_number_key(known):
+        if (
+            known is not None
+            and latest is not None
+            and chapter_number_key(latest) <= chapter_number_key(known)
+        ):
             hits += 1
     return hits
 
@@ -268,7 +293,11 @@ def is_non_series_link(url: str, title: str) -> bool:
 
 def extract_description_aliases(description: str, title: str) -> tuple[tuple[str, ...], str]:
     text = " ".join((description or "").split())
-    match = re.match(r"Read\s+(?:manhwa|manga|manhua)\s+(.{3,260}?)(?:\s+(?:Plot|Summary|Synopsis|Description)\b|$)", text, flags=re.I)
+    match = re.match(
+        r"Read\s+(?:manhwa|manga|manhua)\s+(.{3,260}?)(?:\s+(?:Plot|Summary|Synopsis|Description)\b|$)",
+        text,
+        flags=re.I,
+    )
     if not match:
         return (), description
     prefix = match.group(1).strip()

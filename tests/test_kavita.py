@@ -85,7 +85,9 @@ class FakeFullAsyncClient:
             {"method": "GET", "url": url, "headers": headers, "params": params}
         )
         if url.endswith("/api/Series/series-detail"):
-            return FakeResponse({"chapters": [{"id": 42, "number": "12", "volumeId": 3, "pages": 11}]})
+            return FakeResponse(
+                {"chapters": [{"id": 42, "number": "12", "volumeId": 3, "pages": 11}]}
+            )
         if url.endswith("/api/Reader/get-progress"):
             return FakeResponse({"chapterId": params["chapterId"], "pageNum": 11})
         return FakeResponse(None)
@@ -105,6 +107,8 @@ async def test_kavita_client_folder_scan_series_and_want_to_read(monkeypatch, tm
     progress = await client.chapter_progress(42, pages_total=11)
     wanted = await client.want_to_read()
     await client.add_want_to_read([7])
+    await client.upload_series_cover(7, "data:image/png;base64,Y292ZXI=")
+    await client.upload_chapter_cover(42, "Y292ZXI=")
 
     assert FakeFullAsyncClient.requests[0]["json"] == {
         "apiKey": "secret",
@@ -121,7 +125,14 @@ async def test_kavita_client_folder_scan_series_and_want_to_read(monkeypatch, tm
     assert progress.pages_read == 11
     assert progress.pages_total == 11
     assert wanted[0].name == "Wanted"
-    assert FakeFullAsyncClient.requests[-1]["json"] == {"seriesIds": [7]}
+    assert {
+        "method": "POST",
+        "url": "http://kavita/api/Upload/series",
+        "headers": {"x-api-key": "secret"},
+        "json": {"id": 7, "url": "Y292ZXI="},
+        "params": None,
+    } in FakeFullAsyncClient.requests
+    assert FakeFullAsyncClient.requests[-1]["json"] == {"id": 42, "url": "Y292ZXI="}
     assert {
         "method": "GET",
         "url": "http://kavita/api/Reader/get-progress",
@@ -150,25 +161,20 @@ def test_kavita_client_renders_urls(monkeypatch):
     assert client.chapter_url(2, 7, 42) == "http://kavita/series/7/chapter/42"
 
 
-def test_kavita_path_translation_same_path(monkeypatch, tmp_path):
-    import app.kavita as kavita
-
-    monkeypatch.setattr(kavita.settings, "library_root", tmp_path / "library")
-    monkeypatch.setattr(kavita.settings, "kavita_library_root", None)
-
+def test_kavita_path_translation_same_path(tmp_path):
     local_path = tmp_path / "library" / "Manga" / "Example"
+    client = KavitaClient("http://kavita/", "secret", local_library_root=tmp_path / "library")
 
-    assert kavita.kavita_path_for_local(local_path) == local_path
-    assert kavita.local_path_for_kavita(str(local_path)) == local_path
+    assert client.kavita_path_for_local(local_path) == local_path
 
 
-def test_kavita_path_translation_different_container_path(monkeypatch, tmp_path):
-    import app.kavita as kavita
-
-    monkeypatch.setattr(kavita.settings, "library_root", tmp_path / "library")
-    monkeypatch.setattr(kavita.settings, "kavita_library_root", Path("/kavita-manga"))
-
+def test_kavita_path_translation_different_container_path(tmp_path):
     local_path = tmp_path / "library" / "Manga" / "Example"
+    client = KavitaClient(
+        "http://kavita/",
+        "secret",
+        local_library_root=tmp_path / "library",
+        kavita_library_root=Path("/kavita-manga"),
+    )
 
-    assert kavita.kavita_path_for_local(local_path) == Path("/kavita-manga/Manga/Example")
-    assert kavita.local_path_for_kavita("/kavita-manga/Manga/Example") == local_path
+    assert client.kavita_path_for_local(local_path) == Path("/kavita-manga/Manga/Example")

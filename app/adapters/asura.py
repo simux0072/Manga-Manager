@@ -31,6 +31,7 @@ class AsuraAdapter(SourceAdapter):
         self.client = HttpSourceClient(
             self.base_url,
             throttle_seconds=settings.asura_request_interval_seconds,
+            source=self.source,
         )
 
     async def aclose(self) -> None:
@@ -44,9 +45,7 @@ class AsuraAdapter(SourceAdapter):
         sentinel_map = {sentinel.source_id: sentinel.latest_chapter for sentinel in sentinels}
         required_hits = min(settings.source_frontier_required_hits, len(sentinel_map))
         hits = 0
-        max_pages = (
-            settings.asura_recent_pages if sentinels else min(3, settings.asura_recent_pages)
-        )
+        max_pages = min(3, settings.asura_recent_pages)
         for page in range(1, max_pages + 1):
             path = "/" if page == 1 else f"/page/{page}/"
             try:
@@ -223,12 +222,14 @@ class AsuraAdapter(SourceAdapter):
             )
             raise ChapterTemporarilyUnavailable("Asura chapter is still premium", retry_after)
         total_bytes = 0
-        async for index, page in enumerate_async(iter_ordered_bytes(
-            self.client,
-            urls,
-            referer=chapter.url,
-            concurrency=page_concurrency_for_source(self.source),
-        )):
+        async for index, page in enumerate_async(
+            iter_ordered_bytes(
+                self.client,
+                urls,
+                referer=chapter.url,
+                concurrency=page_concurrency_for_source(self.source),
+            )
+        ):
             total_bytes += len(page)
             if progress:
                 progress(index, len(urls), total_bytes)

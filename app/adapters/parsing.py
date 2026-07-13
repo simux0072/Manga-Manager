@@ -70,7 +70,9 @@ def parse_source_date(value: str) -> datetime | None:
     if "yesterday" in lowered:
         return now - timedelta(days=1)
     for fmt in ("%b %d %Y", "%B %d %Y", "%Y-%m-%d", "%m/%d/%Y"):
-        match = re.search(r"([A-Za-z]{3,9}\s+\d{1,2}\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4})", value)
+        match = re.search(
+            r"([A-Za-z]{3,9}\s+\d{1,2}\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}/\d{4})", value
+        )
         if not match:
             continue
         try:
@@ -88,9 +90,15 @@ def clean_chapter_title(number: str, title: str, published_at: datetime | None =
                 title = title.replace(published_at.strftime(fmt), "")
             except ValueError:
                 continue
-    title = re.sub(r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b", "", title)
+    title = re.sub(
+        r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2},?\s+\d{4}\b",
+        "",
+        title,
+    )
     title = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", "", title)
-    title = re.sub(r"\b(?:just now|today|yesterday|last week|\d+\s+\w+\s+ago)\b", "", title, flags=re.I)
+    title = re.sub(
+        r"\b(?:just now|today|yesterday|last week|\d+\s+\w+\s+ago)\b", "", title, flags=re.I
+    )
     title = " ".join(title.split("·")).strip()
     title = " ".join(title.split())
     return title or f"Chapter {number}"

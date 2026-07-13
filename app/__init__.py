@@ -1,2 +1,1 @@
 """Manga Manager application package."""
-

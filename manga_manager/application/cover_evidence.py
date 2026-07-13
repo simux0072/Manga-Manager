@@ -13,6 +13,7 @@ from manga_manager.infrastructure.db_models import (
     CatalogMatchDecision,
     CatalogSourceSeries,
 )
+from manga_manager.domain.providers import PROVIDER_ORIGINS
 from manga_manager.worker.runtime import SessionFactory
 
 
@@ -61,7 +62,9 @@ class CoverEvidenceService:
             await self._ensure_fingerprint(identity_id)
         with self.session_factory() as session, session.begin():
             for decision in session.scalars(
-                select(CatalogMatchDecision).where(CatalogMatchDecision.id.in_([d.id for d in decisions]))
+                select(CatalogMatchDecision).where(
+                    CatalogMatchDecision.id.in_([d.id for d in decisions])
+                )
             ):
                 left = self._fingerprint(session, decision.left_source_series_id)
                 right = self._fingerprint(session, decision.right_source_series_id)
@@ -83,10 +86,15 @@ class CoverEvidenceService:
                 return
             identity = session.get(CatalogSourceSeries, source_series_id)
             cover_url = identity.cover_url if identity else ""
+            source = identity.source if identity else ""
         if not cover_url:
             return
         parts = urlsplit(cover_url)
-        client = HttpSourceClient(f"{parts.scheme}://{parts.netloc}")
+        client = HttpSourceClient(
+            f"{parts.scheme}://{parts.netloc}",
+            source=source,
+            provider_origin_url=PROVIDER_ORIGINS.get(source),
+        )
         try:
             content = await client.get_bytes(cover_url)
             hash_hex, sha256, width, height = fingerprint_cover(content)

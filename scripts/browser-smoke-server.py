@@ -8,9 +8,7 @@ from sqlalchemy.pool import StaticPool
 from manga_manager.infrastructure.db_models import CatalogSeries, JobBase
 from manga_manager.web.app import create_app
 
-engine = create_engine(
-    "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
-)
+engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
 JobBase.metadata.create_all(engine)
 sessions = sessionmaker(engine, expire_on_commit=False)
 with sessions() as session, session.begin():

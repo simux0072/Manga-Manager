@@ -25,6 +25,8 @@ def test_provider_scheduler_reserves_shared_request_times() -> None:
 
     assert scheduler.reserve("asura", 2.0, now=now) == 0
     assert scheduler.reserve("asura", 2.0, now=now) == 2.0
+    assert scheduler.reserve("asura", 2.0, traffic_class="cdn", now=now) == 0
+    assert scheduler.reserve("asura", 2.0, traffic_class="cdn", now=now) == 2.0
     assert scheduler.reserve("mangafire", 2.0, now=now) == 0
     with sessions() as session:
         assert session.get(CatalogSourceState, "asura").next_request_at is not None
@@ -47,7 +49,5 @@ def test_provider_scheduler_is_atomic_on_postgresql() -> None:
     scheduler = ProviderRequestScheduler(sessions)
     now = datetime(2026, 7, 11, tzinfo=timezone.utc)
     with ThreadPoolExecutor(max_workers=2) as executor:
-        delays = sorted(
-            executor.map(lambda _: scheduler.reserve("scheduler-test", 1.0, now=now), range(2))
-        )
+        delays = sorted(executor.map(lambda _: scheduler.reserve("asura", 1.0, now=now), range(2)))
     assert delays == [0.0, 1.0]

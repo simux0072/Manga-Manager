@@ -1,36 +1,35 @@
 from __future__ import annotations
 
-import logging
 from collections.abc import Callable
-from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 import httpx
+from sqlalchemy import select
 
 from app.adapters import adapter_for_source
 from app.adapters.base import FrontierSentinel, SourceAdapter, SourceRateLimited
-from app.domain import ChapterItem, SeriesItem
-from manga_manager.application.job_handlers import JobContext, PermanentJobError, RetryableJobError
+from app.domain import SeriesItem
+from manga_manager.application.job_handlers import (
+    JobContext,
+    PermanentJobError,
+    RetryableJobError,
+    exception_message,
+)
 from manga_manager.application.cover_evidence import CoverEvidenceService
-from manga_manager.domain.jobs import SourcePullPayload
+from manga_manager.application.download_plans import DownloadPlanCoordinator
+from manga_manager.domain.jobs import JobKind, SourcePullPayload, SourceRefreshPayload
 from manga_manager.infrastructure.catalog_repository import CatalogRepository
 from manga_manager.infrastructure.job_queue import JobQueue
+from manga_manager.infrastructure.db_models import CatalogSourceState, ProviderEndpointState
 from manga_manager.worker.runtime import SessionFactory
 
 
-logger = logging.getLogger(__name__)
 AdapterFactory = Callable[[str], SourceAdapter | None]
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
-
-
-@dataclass(frozen=True, slots=True)
-class FetchedSeries:
-    item: SeriesItem
-    chapters: tuple[ChapterItem, ...]
 
 
 class SourcePullHandler:
@@ -60,64 +59,60 @@ class SourcePullHandler:
             raise RetryableJobError("source_unavailable", f"source {source} is unavailable")
 
         try:
-            fetched, failures = await self._fetch(adapter, frontier, context)
+            listed_items = await adapter.list_recent_frontier(frontier)
+            observed_frontier = build_listing_frontier(listed_items, self.frontier_limit)
+            candidates = changed_before_stable_frontier(listed_items, frontier, required_hits=3)
         except SourceRateLimited as exc:
             retry_at = aware_datetime(exc.retry_after)
-            self._record_failure(source, str(exc), retry_at)
+            self._record_failure(
+                source,
+                exception_message(exc),
+                retry_at,
+                traffic_class=exc.traffic_class or "origin",
+            )
             delay = max(retry_at - utcnow(), timedelta(seconds=1)) if retry_at else None
-            raise RetryableJobError("rate_limited", str(exc), retry_after=delay) from exc
-        except (httpx.TimeoutException, httpx.NetworkError) as exc:
-            self._record_failure(source, str(exc), None)
-            raise RetryableJobError("source_network_error", str(exc)) from exc
+            raise RetryableJobError(
+                "rate_limited", exception_message(exc), retry_after=delay
+            ) from exc
+        except httpx.TransportError as exc:
+            self._record_failure(source, exception_message(exc), None)
+            raise RetryableJobError("source_network_error", exception_message(exc)) from exc
         except httpx.HTTPStatusError as exc:
-            self._record_failure(source, str(exc), None)
+            self._record_failure(source, exception_message(exc), None)
             status = exc.response.status_code
             if 400 <= status < 500 and status not in {408, 429}:
-                raise PermanentJobError("source_http_error", str(exc)) from exc
-            raise RetryableJobError("source_http_error", str(exc)) from exc
+                raise PermanentJobError("source_http_error", exception_message(exc)) from exc
+            raise RetryableJobError("source_http_error", exception_message(exc)) from exc
         except Exception as exc:
-            self._record_failure(source, str(exc), None)
-            raise PermanentJobError("source_processing_error", str(exc)) from exc
+            self._record_failure(source, exception_message(exc), None)
+            raise PermanentJobError("source_processing_error", exception_message(exc)) from exc
         finally:
             await adapter.aclose()
 
-        if failures and not fetched:
-            message = f"all {failures} discovered items failed"
-            self._record_failure(source, message, None)
-            raise PermanentJobError("all_items_failed", message)
-
-        for index, row in enumerate(fetched, start=1):
-            context.ensure_lease()
-            with self.session_factory() as session, session.begin():
-                source_series = self.catalog.ingest(session, row.item, row.chapters)
-                source_series_id = source_series.id
-            await CoverEvidenceService(self.session_factory).refresh_for_source_series(
-                source_series_id
-            )
-            if index == len(fetched) or index % 10 == 0:
-                with self.session_factory() as session, session.begin():
-                    if not self.queue.progress(
-                        session,
-                        job_id=context.lease.id,
-                        owner=context.lease.owner,
-                        message=f"ingested {index}/{len(fetched)} series",
-                        details={
-                            "phase": "ingest",
-                            "processed": len(fetched) + index,
-                            "total": len(fetched) * 2,
-                            "unit": "steps",
-                            "source": source,
-                        },
-                    ):
-                        context.lease_lost.set()
-                        context.ensure_lease()
-
         with self.session_factory() as session, session.begin():
+            created = 0
+            for item in candidates:
+                _job, was_created = self.queue.enqueue(
+                    session,
+                    kind=JobKind.SOURCE_REFRESH,
+                    dedupe_key=f"refresh:{source}:{item.source_id}",
+                    payload=refresh_payload(item),
+                    source=source,
+                    priority=55,
+                    max_attempts=4,
+                )
+                created += int(was_created)
             self.catalog.record_poll_success(
                 session,
                 source=source,
-                frontier=build_frontier(fetched, self.frontier_limit),
-                partial_failures=failures,
+                frontier=observed_frontier,
+                partial_failures=0,
+                metrics={
+                    "listed": len(listed_items),
+                    "candidates": len(candidates),
+                    "refresh_jobs_created": created,
+                    "stable_sentinels_required": min(3, len(frontier)),
+                },
             )
 
     def _load_frontier(self, source: str) -> list[FrontierSentinel]:
@@ -132,71 +127,175 @@ class SourcePullHandler:
             if row.get("source_id")
         ]
 
-    async def _fetch(
-        self,
-        adapter: SourceAdapter,
-        frontier: list[FrontierSentinel],
-        context: JobContext,
-    ) -> tuple[list[FetchedSeries], int]:
-        items = await adapter.list_recent_frontier(frontier)
-        fetched: list[FetchedSeries] = []
-        failures = 0
-        for index, item in enumerate(items, start=1):
-            context.ensure_lease()
-            try:
-                detail = getattr(adapter, "get_series_detail", None)
-                enriched = await detail(item) if detail is not None else item
-                chapters = await adapter.get_chapters(enriched)
-                fetched.append(FetchedSeries(item=enriched, chapters=tuple(chapters)))
-            except SourceRateLimited:
-                raise
-            except Exception as exc:
-                failures += 1
-                logger.warning(
-                    "source item failed source=%s url=%s: %s", item.source, item.url, exc
-                )
-            if index == len(items) or index % 5 == 0:
-                with self.session_factory() as session, session.begin():
-                    if not self.queue.progress(
-                        session,
-                        job_id=context.lease.id,
-                        owner=context.lease.owner,
-                        message=f"fetched {index}/{len(items)} series",
-                        details={
-                            "phase": "enrichment",
-                            "processed": index,
-                            "total": len(items) * 2,
-                            "unit": "steps",
-                            "source": item.source,
-                        },
-                    ):
-                        context.lease_lost.set()
-                        context.ensure_lease()
-        return fetched, failures
-
     def _record_failure(
         self,
         source: str,
         error: str,
         cooldown_until: datetime | None,
+        *,
+        traffic_class: str = "origin",
     ) -> None:
         with self.session_factory() as session, session.begin():
             self.catalog.record_poll_failure(
-                session,
-                source=source,
-                error=error,
-                cooldown_until=cooldown_until,
+                session, source=source, error=error, cooldown_until=cooldown_until
+            )
+            state = session.get(CatalogSourceState, source)
+            effective_cooldown = state.cooldown_until if state is not None else cooldown_until
+            endpoint = session.scalar(
+                select(ProviderEndpointState).where(
+                    ProviderEndpointState.source == source,
+                    ProviderEndpointState.traffic_class == traffic_class,
+                )
+            )
+            if endpoint is None:
+                endpoint = ProviderEndpointState(source=source, traffic_class=traffic_class)
+                session.add(endpoint)
+            endpoint.consecutive_failures = (endpoint.consecutive_failures or 0) + 1
+            endpoint.last_error = error[:4000]
+            endpoint.cooldown_until = effective_cooldown
+            endpoint.updated_at = utcnow()
+            if effective_cooldown is not None:
+                DownloadPlanCoordinator(self.queue).bypass_cooling_source(
+                    session, source=source, retry_after=effective_cooldown
+                )
+
+
+class SourceRefreshHandler:
+    def __init__(
+        self,
+        *,
+        session_factory: SessionFactory,
+        adapter_factory: AdapterFactory = adapter_for_source,
+        catalog: CatalogRepository | None = None,
+    ) -> None:
+        self.session_factory = session_factory
+        self.adapter_factory = adapter_factory
+        self.catalog = catalog or CatalogRepository()
+
+    async def __call__(self, context: JobContext) -> None:
+        payload = context.lease.payload
+        if not isinstance(payload, SourceRefreshPayload):
+            raise RuntimeError("source refresh handler received the wrong payload")
+        adapter = self.adapter_factory(payload.source)
+        if adapter is None:
+            raise RetryableJobError("source_unavailable", f"source {payload.source} unavailable")
+        item = item_from_refresh(payload)
+        try:
+            detail = getattr(adapter, "get_series_detail", None)
+            enriched = await detail(item) if detail is not None else item
+            chapters = await adapter.get_chapters(enriched)
+        except SourceRateLimited as exc:
+            retry_at = aware_datetime(exc.retry_after)
+            delay = max(retry_at - utcnow(), timedelta(seconds=1)) if retry_at else None
+            raise RetryableJobError(
+                "rate_limited", exception_message(exc), retry_after=delay
+            ) from exc
+        except httpx.TransportError as exc:
+            raise RetryableJobError("source_network_error", exception_message(exc)) from exc
+        except httpx.HTTPStatusError as exc:
+            if exc.response.status_code in {408, 429, 500, 502, 503, 504}:
+                raise RetryableJobError("source_http_error", exception_message(exc)) from exc
+            self._quarantine(payload, exception_message(exc))
+            raise PermanentJobError("source_item_invalid", exception_message(exc)) from exc
+        except Exception as exc:
+            self._quarantine(payload, exception_message(exc))
+            raise PermanentJobError("source_item_invalid", exception_message(exc)) from exc
+        finally:
+            await adapter.aclose()
+        context.ensure_lease()
+        with self.session_factory() as session, session.begin():
+            source_series = self.catalog.ingest(session, enriched, chapters)
+            source_series_id = source_series.id
+        await CoverEvidenceService(self.session_factory).refresh_for_source_series(source_series_id)
+
+    def _quarantine(self, payload: SourceRefreshPayload, reason: str) -> None:
+        from manga_manager.infrastructure.db_models import CatalogObservation
+
+        with self.session_factory() as session, session.begin():
+            session.add(
+                CatalogObservation(
+                    source=payload.source,
+                    observation_type="source_refresh_failure",
+                    source_key=payload.source_id,
+                    state="quarantined",
+                    reason=reason[:4000],
+                    payload_json=payload.model_dump(mode="json"),
+                )
             )
 
 
-def build_frontier(rows: list[FetchedSeries], limit: int) -> list[dict[str, str]]:
+def refresh_payload(item: SeriesItem) -> SourceRefreshPayload:
+    return SourceRefreshPayload(
+        source=item.source,
+        source_id=item.source_id,
+        title=item.title,
+        url=item.url,
+        aliases=item.aliases,
+        description=item.description,
+        cover_url=item.cover_url,
+        genres=item.genres,
+        popularity=item.popularity,
+        external_ids=item.external_ids,
+        metadata=item.metadata,
+    )
+
+
+def item_from_refresh(payload: SourceRefreshPayload) -> SeriesItem:
+    return SeriesItem(
+        source=payload.source,
+        source_id=payload.source_id,
+        title=payload.title,
+        url=payload.url,
+        aliases=payload.aliases,
+        description=payload.description,
+        cover_url=payload.cover_url,
+        genres=payload.genres,
+        popularity=payload.popularity,
+        external_ids=payload.external_ids,
+        metadata=payload.metadata,
+    )
+
+
+def build_listing_frontier(rows: list[SeriesItem], limit: int) -> list[dict[str, str]]:
     result: list[dict[str, str]] = []
-    for row in rows:
-        latest = max((chapter.number for chapter in row.chapters), key=chapter_key, default="")
-        result.append({"source_id": row.item.source_id, "latest_chapter": latest})
+    for item in rows:
+        latest = latest_listing_chapter(item)
+        if latest:
+            result.append({"source_id": item.source_id, "latest_chapter": latest})
         if len(result) >= limit:
             break
     return result
+
+
+def changed_before_stable_frontier(
+    rows: list[SeriesItem], sentinels: list[FrontierSentinel], *, required_hits: int
+) -> list[SeriesItem]:
+    if not sentinels:
+        return rows
+    known = {row.source_id: row.latest_chapter for row in sentinels}
+    needed = min(required_hits, len(known))
+    stable = 0
+    changed: list[SeriesItem] = []
+    for item in rows:
+        latest = latest_listing_chapter(item)
+        previous = known.get(item.source_id)
+        if latest and previous and chapter_key(latest) <= chapter_key(previous):
+            stable += 1
+            if stable >= needed:
+                break
+            continue
+        changed.append(item)
+    return changed
+
+
+def latest_listing_chapter(item: SeriesItem) -> str:
+    rows = item.metadata.get("recent_chapters")
+    if not isinstance(rows, list):
+        return ""
+    values = [
+        str(row.get("number") or "") for row in rows if isinstance(row, dict) and row.get("number")
+    ]
+    return max(values, key=chapter_key, default="")
 
 
 def chapter_key(value: str) -> tuple[int, Decimal, str]:

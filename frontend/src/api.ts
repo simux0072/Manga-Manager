@@ -21,5 +21,6 @@ export const api={
   operations:()=>request<Operations>('/api/v2/operations'),
   retryJob:(id:number)=>request(`/api/v2/jobs/${id}/retry`,{method:'POST'}),
   pullSource:(source:string)=>request(`/api/v2/sources/${source}/pull`,{method:'POST'}),
-  probe:()=>request('/api/v2/probe',{method:'POST'})
+  probe:()=>request('/api/v2/probe',{method:'POST'}),
+  syncKavita:()=>request<{pending:number;created:number}>('/api/v2/operations/kavita-sync',{method:'POST'})
 }

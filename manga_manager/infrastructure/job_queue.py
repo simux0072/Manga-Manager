@@ -21,6 +21,8 @@ from manga_manager.infrastructure.db_models import (
     JobEvent,
     JobPermit,
     ProviderPolicy,
+    StorageReservation,
+    StorageState,
     WorkJob,
 )
 
@@ -62,7 +64,7 @@ class JobQueue:
 
         validated_payload = parse_job_payload(kind, payload)
         routed_source = source.strip()
-        if kind is JobKind.SOURCE_PULL:
+        if kind in {JobKind.SOURCE_PULL, JobKind.SOURCE_REFRESH}:
             routed_source = validated_payload.source
         routed_pool = pool.strip() or default_pool(kind, routed_source)
         existing = self.active_job(session, kind=kind, dedupe_key=key)
@@ -141,6 +143,15 @@ class JobQueue:
                             CatalogSourceState.cooldown_until > current,
                         )
                     )
+                    .exists(),
+                )
+            )
+            .where(
+                or_(
+                    WorkJob.kind != JobKind.CHAPTER_DOWNLOAD.value,
+                    ~select(StorageState.id)
+                    .where(StorageState.id == 1)
+                    .where(StorageState.paused.is_(True))
                     .exists(),
                 )
             )
@@ -295,6 +306,12 @@ class JobQueue:
                 update(JobPermit)
                 .where(JobPermit.job_id == job_id)
                 .where(JobPermit.owner == owner)
+                .values(lease_expires_at=current + lease_for)
+            )
+            session.execute(
+                update(StorageReservation)
+                .where(StorageReservation.job_id == job_id)
+                .where(StorageReservation.owner == owner)
                 .values(lease_expires_at=current + lease_for)
             )
         return result.rowcount == 1
@@ -651,6 +668,7 @@ class JobQueue:
 
     def _release_permits(self, session: Session, job_id: int) -> None:
         session.execute(delete(JobPermit).where(JobPermit.job_id == job_id))
+        session.execute(delete(StorageReservation).where(StorageReservation.job_id == job_id))
 
     def _record_event(
         self,
@@ -675,8 +693,8 @@ class JobQueue:
 
 
 def default_pool(kind: JobKind, source: str = "") -> str:
-    if kind is JobKind.SOURCE_PULL:
-        return "source_pull"
+    if kind in {JobKind.SOURCE_PULL, JobKind.SOURCE_REFRESH}:
+        return f"pull:{source}" if source else "pull:unknown"
     if kind is JobKind.CHAPTER_DOWNLOAD:
         return f"download:{source}" if source else "download:unknown"
     if kind is JobKind.KAVITA_SYNC:

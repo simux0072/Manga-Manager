@@ -17,6 +17,7 @@ from manga_manager.infrastructure.db_models import (
     WorkerHeartbeat,
     WorkJob,
 )
+from manga_manager.web.api import operational_error_message
 from manga_manager.web.app import create_app
 
 
@@ -247,9 +248,11 @@ async def test_merge_consolidates_strong_same_provider_duplicate_before_group_me
         )
         session.add(duplicate)
         session.flush()
-        keeper = session.query(CatalogSourceSeries).filter_by(
-            series_id=right.id, source="mangafire"
-        ).one()
+        keeper = (
+            session.query(CatalogSourceSeries)
+            .filter_by(series_id=right.id, source="mangafire")
+            .one()
+        )
         for number in ("2", "3"):
             for series, identity, suffix in (
                 (left, duplicate, "alternate"),
@@ -323,3 +326,9 @@ async def test_operations_hides_stale_worker_processes() -> None:
     ) as client:
         response = await client.get("/api/v2/operations")
     assert [row["id"] for row in response.json()["workers"]] == ["current-worker"]
+
+
+def test_blank_legacy_network_error_has_operational_fallback() -> None:
+    assert operational_error_message("source_network_error", "") == (
+        "Provider network request failed; retry is scheduled."
+    )

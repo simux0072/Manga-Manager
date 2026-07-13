@@ -13,7 +13,9 @@ from manga_manager.application.job_handlers import PermanentJobError, RetryableJ
 from manga_manager.domain.jobs import ChapterDownloadPayload, JobKind, JobState
 from manga_manager.infrastructure.db_models import JobBase, WorkJob
 from manga_manager.infrastructure.job_queue import JobQueue
+from manga_manager.settings import V2Settings
 from manga_manager.worker.runtime import JobWorker, WorkerRunResult, WorkerSettings
+from manga_manager.worker.service import WorkerService
 
 
 NOW = datetime(2026, 7, 10, 12, 0, tzinfo=timezone.utc)
@@ -103,7 +105,9 @@ async def test_retryable_failure_schedules_retry(sessions: TrackingSessionFactor
     job = enqueue(sessions)
 
     async def handler(_lease) -> None:
-        raise RetryableJobError("rate_limited", "source asked us to wait", retry_after=timedelta(minutes=5))
+        raise RetryableJobError(
+            "rate_limited", "source asked us to wait", retry_after=timedelta(minutes=5)
+        )
 
     result = await worker(sessions, handler).run_once()
     stored = load_job(sessions, job.id)
@@ -170,3 +174,18 @@ async def test_idle_worker_returns_without_handler_call(sessions: TrackingSessio
 
     assert await worker(sessions, handler).run_once() is WorkerRunResult.IDLE
     assert called is False
+
+
+def test_source_pull_workers_are_partitioned_by_provider(
+    sessions: TrackingSessionFactory,
+) -> None:
+    async def handler(_context) -> None:
+        return None
+
+    service = WorkerService(
+        session_factory=sessions,
+        handlers={JobKind.SOURCE_PULL: handler},
+        settings=V2Settings(),
+    )
+    pools = [pool for _slot, pool, _kinds in service._pool_specs()]
+    assert pools == ["pull:asura", "pull:mangafire", "pull:kingofshojo"]

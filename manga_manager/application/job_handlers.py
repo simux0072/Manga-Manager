@@ -21,6 +21,12 @@ class JobContext:
 JobHandler = Callable[[JobContext], Awaitable[None]]
 
 
+def exception_message(exc: BaseException) -> str:
+    """Return useful diagnostics even when an exception has no message text."""
+    message = str(exc).strip()
+    return message or type(exc).__name__
+
+
 class JobExecutionError(RuntimeError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
@@ -42,6 +48,13 @@ class DeferredJobError(JobExecutionError):
 
 class PermanentJobError(JobExecutionError):
     pass
+
+
+class ReroutedJobError(JobExecutionError):
+    """The handler atomically superseded this lease with another provider job."""
+
+    def __init__(self, message: str = "job rerouted") -> None:
+        super().__init__("rerouted", message)
 
 
 class LeaseLostError(JobExecutionError):
