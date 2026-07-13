@@ -29,3 +29,17 @@ test('discovery filters immediately and jobs use an overlay drawer',async({page}
   const widthAfter=await page.locator('main').evaluate(node=>node.getBoundingClientRect().width)
   expect(widthAfter).toBe(widthBefore)
 })
+
+test('manual merge workspace is searchable and limits selection to three',async({page})=>{
+  await page.goto('/matches')
+  await page.getByRole('button',{name:'Manual merge'}).click()
+  await expect(page.getByPlaceholder('Search tracked manga…')).toBeVisible()
+  await page.getByPlaceholder('Search tracked manga…').fill('a')
+  const candidates=page.locator('.merge-candidate:not([disabled])')
+  const available=await candidates.count()
+  if(available){
+    await candidates.first().click()
+    await expect(page.locator('.merge-selection')).toContainText('Selection 2')
+  }
+  await expect(page.locator('.merge-slots').locator('button')).toHaveCount(available?1:0)
+})

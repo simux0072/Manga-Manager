@@ -26,6 +26,13 @@ const series = {
   read_count: 0,
   unread_count: 1,
 }
+const matchingSeries = {
+  ...series,
+  id: 9,
+  title: 'Dungeon Painter',
+  status: 'interested',
+  sources: [{name: 'mangafire', title: 'Dungeon Painter', url: 'https://mangafire.test/painter'}],
+}
 
 function response(value:unknown){return Promise.resolve(new Response(JSON.stringify(value),{status:200,headers:{'Content-Type':'application/json'}}))}
 function renderApp(path='/discovery'){
@@ -63,5 +70,26 @@ describe('media library frontend',()=>{
     expect(screen.getByRole('complementary',{name:'Job center'})).toBeInTheDocument()
     expect(screen.getByRole('button',{name:'failed'})).toBeInTheDocument()
     expect(screen.getByRole('button',{name:'running'})).toBeInTheDocument()
+  })
+
+  it('previews and confirms a manual cross-provider merge',async()=>{
+    vi.stubGlobal('fetch',vi.fn((input:string|URL|Request,init?:RequestInit)=>{
+      const url=String(input)
+      if(url.includes('/api/v2/operations'))return response({job_counts:{},health:{series:2,chapters:1,active_artifacts:0,missing_projections:0},sources:[],workers:[],permits:{}})
+      if(url.includes('/api/v2/merge-candidates'))return response({items:[{...matchingSeries,similarity:.93,compatible:true,conflicting_sources:[]}],next_cursor:null})
+      if(url.includes('/api/v2/library'))return response({items:[{...series,status:'interested'}],next_cursor:null})
+      if(url.endsWith('/api/v2/series/merge-preview'))return response({target_id:7,target_title:series.title,items:[series,matchingSeries],conflicting_sources:[],can_merge:true})
+      if(url.endsWith('/api/v2/series/merge')&&init?.method==='POST')return response({target_id:7,merged_ids:[7,9]})
+      if(url.includes('/api/v2/matches'))return response({items:[],next_cursor:null})
+      return response({items:[],next_cursor:null})
+    }))
+    renderApp('/matches')
+    await userEvent.click(await screen.findByRole('button',{name:'Manual merge'}))
+    await userEvent.click(await screen.findByRole('button',{name:new RegExp(series.title)}))
+    await userEvent.click(await screen.findByRole('button',{name:/Dungeon Painter/}))
+    await userEvent.click(screen.getByRole('button',{name:'Review merge'}))
+    expect(await screen.findByText(`Merge into ${series.title}?`)).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button',{name:'Confirm merge'}))
+    expect(await screen.findByText(/Merged into series #7/)).toBeInTheDocument()
   })
 })
