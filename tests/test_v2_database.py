@@ -3,11 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from alembic import command
+from alembic.config import Config
 from sqlalchemy import inspect, text
 
 from manga_manager.infrastructure.database import (
     create_database_engine,
     create_session_factory,
+    DEFAULT_ALEMBIC_CONFIG,
     run_migrations,
 )
 
@@ -54,6 +57,13 @@ def test_v2_migration_builds_job_constraints_and_indexes(tmp_path: Path) -> None
         "provider_endpoint_state",
         "storage_state",
         "storage_reservation",
+        "cover_asset_v2",
+        "cover_signature_v2",
+        "kavita_projection",
+        "artifact_metadata_rewrite",
+            "match_training_label",
+            "workload_cycle",
+            "job_daily_aggregate",
     } == set(inspector.get_table_names())
     indexes = {index["name"] for index in inspector.get_indexes("job")}
     assert {
@@ -77,4 +87,21 @@ def test_v2_migration_builds_job_constraints_and_indexes(tmp_path: Path) -> None
     sessions = create_session_factory(engine)
     with sessions() as session:
         version = session.scalar(text("SELECT version_num FROM alembic_version"))
-    assert version == "0016_refresh_storage_hardening"
+    assert version == "0018_workflow_progress_identity"
+
+
+def test_catalog_recovery_migration_downgrades_and_reapplies_on_sqlite(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'round-trip.db'}"
+    run_migrations(database_url)
+    config = Config(str(DEFAULT_ALEMBIC_CONFIG))
+    config.set_main_option("sqlalchemy.url", database_url)
+
+    command.downgrade(config, "0016_refresh_storage_hardening")
+    engine = create_database_engine(database_url, allow_sqlite_for_tests=True)
+    assert "kavita_projection" not in inspect(engine).get_table_names()
+    command.upgrade(config, "head")
+
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0018_workflow_progress_identity"
+        )

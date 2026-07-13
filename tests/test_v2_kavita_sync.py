@@ -22,9 +22,17 @@ from manga_manager.application.kavita_sync import (
     KavitaSnapshot,
     KavitaSyncHandler,
     KavitaSyncPlanner,
+    match_series,
 )
 from manga_manager.domain.jobs import JobKind, KavitaSyncPayload
-from manga_manager.infrastructure.db_models import CatalogChapter, CatalogSeries, JobBase
+from manga_manager.infrastructure.db_models import (
+    ArtifactBlob,
+    CatalogChapter,
+    CatalogSeries,
+    ChapterArtifact,
+    JobBase,
+    KavitaProjection,
+)
 from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.infrastructure.storage import ContentAddressedStorage
 
@@ -118,6 +126,20 @@ async def test_kavita_sync_maps_series_and_chapters_without_open_database_sessio
         assert series is not None
         series.status = "interested"
         series.cover_url = "https://covers.test/example.png"
+        chapter = session.scalar(select(CatalogChapter))
+        artifact = session.scalar(select(ChapterArtifact))
+        assert chapter is not None and artifact is not None
+        blob = session.get(ArtifactBlob, artifact.blob_checksum)
+        assert blob is not None
+        relative = f"Manga/{series.storage_key}/ch-{chapter.id}.cbz"
+        storage.materialize_kavita(blob.relative_path, relative)
+        session.add(
+            KavitaProjection(
+                chapter_id=chapter.id,
+                artifact_id=artifact.id,
+                relative_path=relative,
+            )
+        )
         job, _ = JobQueue().enqueue(
             session,
             kind=JobKind.KAVITA_SYNC,
@@ -152,7 +174,7 @@ async def test_kavita_sync_maps_series_and_chapters_without_open_database_sessio
 
     await KavitaSyncHandler(
         session_factory=sessions,
-        library_root=storage.library_root,
+        library_root=storage.kavita_root,
         client_factory=lambda: client,
         cover_fetcher=fetch_cover,
     )(JobContext(lease=lease, lease_lost=asyncio.Event()))
@@ -232,3 +254,194 @@ async def test_kavita_cover_write_retries_transient_server_error(monkeypatch) ->
     monkeypatch.setattr("manga_manager.application.kavita_sync.asyncio.sleep", no_sleep)
     await KavitaSyncHandler._retry_cover_write(upload)
     assert attempts == 3
+
+
+@pytest.mark.asyncio
+async def test_kavita_sync_waits_until_asynchronous_scan_exposes_chapters(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class DelayedClient:
+        configured = True
+
+        def __init__(self) -> None:
+            self.detail_calls = 0
+
+        async def list_series(self):
+            return [KavitaSeries(id=2, name="Example", library_id=1)]
+
+        async def series_detail(self, _series_id: int):
+            self.detail_calls += 1
+            if self.detail_calls < 3:
+                return []
+            return [KavitaChapter(id=4, number="1", volume_id=3)]
+
+    class Context:
+        checks = 0
+
+        def ensure_lease(self) -> None:
+            self.checks += 1
+
+    async def no_sleep(_delay: float) -> None:
+        return None
+
+    monkeypatch.setattr("manga_manager.application.kavita_sync.asyncio.sleep", no_sleep)
+    snapshot = KavitaSnapshot(
+        series_id=1,
+        title="Example",
+        existing_kavita_id=None,
+        folder_path=tmp_path,
+        tracked=True,
+        aliases=(),
+        external_ids={},
+        cover_urls=(),
+        cover_checksum="",
+        kavita_cover_checksum="",
+        chapter_cover_checksums={},
+        expected_chapters=("1",),
+    )
+    client = DelayedClient()
+    context = Context()
+    handler = KavitaSyncHandler(
+        session_factory=lambda: None,  # type: ignore[arg-type]
+        library_root=tmp_path,
+    )
+
+    match, chapters = await handler._await_scan(
+        client, snapshot, "", context  # type: ignore[arg-type]
+    )
+
+    assert match is not None and match.id == 2
+    assert [chapter.number for chapter in chapters] == ["1"]
+    assert client.detail_calls == 3
+    assert context.checks == 3
+
+
+def test_kavita_match_ignores_stale_numeric_id_and_uses_current_identity(
+    tmp_path: Path,
+) -> None:
+    expected_folder = tmp_path / "Manga" / "correct-series"
+    snapshot = KavitaSnapshot(
+        series_id=414,
+        title="I'm a Hero, but the Heroines are Trying to Kill Me",
+        existing_kavita_id=1,
+        folder_path=expected_folder,
+        tracked=True,
+        aliases=("I’m a Hero, but the Heroines are Trying to Kill Me",),
+        external_ids={},
+        cover_urls=(),
+        cover_checksum="",
+        kavita_cover_checksum="",
+        chapter_cover_checksums={},
+    )
+    candidates = [
+        KavitaSeries(id=1, name="A Different Series", folder_path="/library/Manga/wrong"),
+        KavitaSeries(
+            id=99,
+            name="I’m a Hero, but the Heroines are Trying to Kill Me",
+            folder_path=str(expected_folder),
+        ),
+    ]
+
+    match = match_series(snapshot, candidates, str(expected_folder))
+
+    assert match is not None and match.id == 99
+
+
+@pytest.mark.asyncio
+async def test_kavita_scan_does_not_poll_chapters_from_stale_series_id(
+    tmp_path: Path,
+) -> None:
+    expected_folder = tmp_path / "Manga" / "correct-series"
+
+    class CorrectingClient:
+        configured = True
+
+        def __init__(self) -> None:
+            self.detail_ids: list[int] = []
+
+        async def list_series(self):
+            return [
+                KavitaSeries(id=1, name="Wrong", folder_path="/library/Manga/wrong"),
+                KavitaSeries(id=99, name="Correct", folder_path=str(expected_folder)),
+            ]
+
+        async def series_detail(self, series_id: int):
+            self.detail_ids.append(series_id)
+            return [KavitaChapter(id=101, number="1")]
+
+    class Context:
+        def ensure_lease(self) -> None:
+            return None
+
+    snapshot = KavitaSnapshot(
+        series_id=414,
+        title="Correct",
+        existing_kavita_id=1,
+        folder_path=expected_folder,
+        tracked=True,
+        aliases=(),
+        external_ids={},
+        cover_urls=(),
+        cover_checksum="",
+        kavita_cover_checksum="",
+        chapter_cover_checksums={},
+        expected_chapters=("1",),
+    )
+    client = CorrectingClient()
+    handler = KavitaSyncHandler(
+        session_factory=lambda: None,  # type: ignore[arg-type]
+        library_root=tmp_path,
+    )
+
+    match, chapters = await handler._await_scan(
+        client, snapshot, str(expected_folder), Context()  # type: ignore[arg-type]
+    )
+
+    assert match is not None and match.id == 99
+    assert [chapter.number for chapter in chapters] == ["1"]
+    assert client.detail_ids == [99]
+
+
+def test_exhausted_kavita_match_clears_remote_mapping_for_rescheduling(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine("sqlite://")
+    JobBase.metadata.create_all(engine)
+    sessions = sessionmaker(engine, expire_on_commit=False)
+    storage = ContentAddressedStorage(
+        tmp_path / "storage-v2",
+        max_page_bytes=1024 * 1024,
+        max_chapter_bytes=10 * 1024 * 1024,
+        max_pages=100,
+        min_free_bytes=0,
+    )
+    archive = tmp_path / "chapter.cbz"
+    make_cbz(archive)
+    LegacyCbzImporter(session_factory=sessions, storage=storage).import_file(archive, dry_run=False)
+    with sessions() as session, session.begin():
+        series = session.scalar(select(CatalogSeries))
+        chapter = session.scalar(select(CatalogChapter))
+        assert series is not None and chapter is not None
+        series.kavita_series_id = 1
+        series.kavita_library_id = 2
+        series.kavita_synced_at = datetime.now(timezone.utc)
+        series.kavita_cover_checksum = "old-cover"
+        chapter.kavita_chapter_id = 3
+        chapter.kavita_volume_id = 4
+        chapter.kavita_mapped_at = datetime.now(timezone.utc)
+        chapter.kavita_cover_checksum = "old-cover"
+        series_id = series.id
+
+    handler = KavitaSyncHandler(session_factory=sessions, library_root=storage.kavita_root)
+    handler._invalidate_kavita_mapping(series_id, expected_kavita_id=1)
+
+    with sessions() as session:
+        series = session.get(CatalogSeries, series_id)
+        chapter = session.scalar(select(CatalogChapter))
+        assert series is not None and chapter is not None
+        assert series.kavita_series_id is None
+        assert series.kavita_synced_at is None
+        assert series.kavita_cover_checksum == ""
+        assert chapter.kavita_chapter_id is None
+        assert chapter.kavita_mapped_at is None
+        assert chapter.kavita_cover_checksum == ""

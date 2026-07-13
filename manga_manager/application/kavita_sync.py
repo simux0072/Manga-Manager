@@ -26,12 +26,12 @@ from manga_manager.domain.jobs import JobKind, KavitaSyncPayload
 from manga_manager.domain.providers import SOURCE_PRIORITY
 from manga_manager.infrastructure.db_models import (
     CatalogChapter,
+    CatalogCoverAsset,
     CatalogExternalIdentifier,
     CatalogSeries,
     CatalogSeriesAlias,
     CatalogSourceSeries,
-    LibraryProjection,
-    ChapterArtifact,
+    KavitaProjection,
 )
 from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.worker.runtime import SessionFactory
@@ -71,10 +71,9 @@ class KavitaSyncPlanner:
             .where(CatalogSeries.status.in_(tracked))
             .where(
                 exists(
-                    select(ChapterArtifact.id)
-                    .join(CatalogChapter, CatalogChapter.id == ChapterArtifact.chapter_id)
+                    select(KavitaProjection.chapter_id)
+                    .join(CatalogChapter, CatalogChapter.id == KavitaProjection.chapter_id)
                     .where(CatalogChapter.series_id == CatalogSeries.id)
-                    .where(ChapterArtifact.state == "active")
                 )
             )
             .where(
@@ -124,6 +123,8 @@ class KavitaSnapshot:
     cover_checksum: str
     kavita_cover_checksum: str
     chapter_cover_checksums: dict[str, str]
+    expected_chapters: tuple[str, ...] = ()
+    cached_cover_paths: tuple[str, ...] = ()
 
 
 class KavitaSyncHandler:
@@ -159,14 +160,20 @@ class KavitaSyncHandler:
             )
 
         try:
+            self._progress(context, 0, "requesting Kavita library scan")
             await client.scan_folder_or_all(snapshot.folder_path)
-            candidates = await client.list_series()
             mapper = getattr(client, "kavita_path_for_local", None)
             kavita_folder = mapper(snapshot.folder_path) if mapper else snapshot.folder_path
-            match = match_series(snapshot, candidates, str(kavita_folder))
+            match, chapters = await self._await_scan(
+                client, snapshot, str(kavita_folder), context
+            )
             if match is None:
+                self._invalidate_kavita_mapping(
+                    snapshot.series_id,
+                    expected_kavita_id=snapshot.existing_kavita_id,
+                )
                 raise RetryableJobError("kavita_match_missing", "Kavita series match not found")
-            chapters = await client.series_detail(match.id)
+            self._progress(context, 2, f"matched Kavita series and {len(chapters)} chapters")
             if snapshot.tracked:
                 await client.add_want_to_read([match.id])
             else:
@@ -196,6 +203,7 @@ class KavitaSyncHandler:
             else:
                 checksum = ""
                 relative_path = ""
+            self._progress(context, 3, "Kavita cover metadata synchronized")
         except RetryableJobError:
             raise
         except Exception as exc:
@@ -228,6 +236,50 @@ class KavitaSyncHandler:
                 chapter.kavita_mapped_at = datetime.now(timezone.utc)
                 if cover is not None:
                     chapter.kavita_cover_checksum = checksum
+        self._progress(context, 4, "Kavita synchronization complete")
+
+    def _progress(self, context: JobContext, current: int, message: str) -> None:
+        context.ensure_lease()
+        with self.session_factory() as session, session.begin():
+            JobQueue().progress(
+                session,
+                job_id=context.lease.id,
+                owner=context.lease.owner,
+                message=message,
+                details={
+                    "phase": "kavita",
+                    "processed": current,
+                    "total": 4,
+                    "unit": "phases",
+                },
+            )
+
+    def _invalidate_kavita_mapping(
+        self,
+        series_id: int,
+        *,
+        expected_kavita_id: int | None,
+    ) -> None:
+        with self.session_factory() as session, session.begin():
+            series = session.get(CatalogSeries, series_id)
+            if series is None:
+                return
+            if expected_kavita_id is not None and series.kavita_series_id not in {
+                None,
+                expected_kavita_id,
+            }:
+                return
+            series.kavita_series_id = None
+            series.kavita_library_id = None
+            series.kavita_synced_at = None
+            series.kavita_cover_checksum = ""
+            for chapter in session.scalars(
+                select(CatalogChapter).where(CatalogChapter.series_id == series_id)
+            ):
+                chapter.kavita_chapter_id = None
+                chapter.kavita_volume_id = None
+                chapter.kavita_mapped_at = None
+                chapter.kavita_cover_checksum = ""
 
     @staticmethod
     async def _retry_cover_write(operation: Callable[[], Awaitable[None]]) -> None:
@@ -246,6 +298,12 @@ class KavitaSyncHandler:
             await asyncio.sleep(0.5 * (2**attempt))
 
     async def _cover(self, snapshot: KavitaSnapshot) -> tuple[str, str, str, bytes] | None:
+        for relative_path in snapshot.cached_cover_paths:
+            path = self.library_root.parent / relative_path
+            try:
+                return self._validated_cover_content(path.read_bytes())
+            except (OSError, ValueError):
+                continue
         if not snapshot.cover_urls:
             return None
         last_error: Exception | None = None
@@ -258,6 +316,9 @@ class KavitaSyncHandler:
 
     async def _validated_cover(self, cover_url: str) -> tuple[str, str, str, bytes]:
         content = await self.cover_fetcher(cover_url)
+        return self._validated_cover_content(content)
+
+    def _validated_cover_content(self, content: bytes) -> tuple[str, str, str, bytes]:
         if not content or len(content) > 5 * 1024 * 1024:
             raise ValueError("series cover is empty or exceeds 5 MiB")
         try:
@@ -305,8 +366,8 @@ class KavitaSyncHandler:
             folder = Path(requested_folder)
         else:
             relative = session.scalar(
-                select(LibraryProjection.relative_path)
-                .join(CatalogChapter, CatalogChapter.id == LibraryProjection.chapter_id)
+                select(KavitaProjection.relative_path)
+                .join(CatalogChapter, CatalogChapter.id == KavitaProjection.chapter_id)
                 .where(CatalogChapter.series_id == series_id)
                 .limit(1)
             )
@@ -343,12 +404,31 @@ class KavitaSyncHandler:
         ]
         if series.cover_url and series.cover_url not in ordered_covers:
             ordered_covers.append(series.cover_url)
+        cached_covers = session.execute(
+            select(
+                CatalogSourceSeries.source,
+                CatalogCoverAsset.relative_path,
+            )
+            .join(
+                CatalogCoverAsset,
+                CatalogCoverAsset.source_series_id == CatalogSourceSeries.id,
+            )
+            .where(CatalogSourceSeries.series_id == series.id)
+        ).all()
+        ordered_cached_covers = tuple(
+            row[1]
+            for row in sorted(
+                cached_covers, key=lambda row: priorities.get(row[0], 0), reverse=True
+            )
+        )
         chapter_cover_checksums = dict(
             session.execute(
                 select(
                     CatalogChapter.canonical_number,
                     CatalogChapter.kavita_cover_checksum,
-                ).where(CatalogChapter.series_id == series.id)
+                )
+                .join(KavitaProjection, KavitaProjection.chapter_id == CatalogChapter.id)
+                .where(CatalogChapter.series_id == series.id)
             ).all()
         )
         return KavitaSnapshot(
@@ -363,7 +443,30 @@ class KavitaSyncHandler:
             series.cover_checksum,
             series.kavita_cover_checksum,
             chapter_cover_checksums,
+            tuple(sorted(chapter_cover_checksums)),
+            ordered_cached_covers,
         )
+
+    async def _await_scan(
+        self,
+        client: KavitaClientProtocol,
+        snapshot: KavitaSnapshot,
+        kavita_folder: str,
+        context: JobContext,
+    ) -> tuple[KavitaSeries | None, list[KavitaChapter]]:
+        delay = 1.0
+        for _ in range(60):
+            context.ensure_lease()
+            candidates = await client.list_series()
+            match = match_series(snapshot, candidates, kavita_folder)
+            if match is not None:
+                chapters = await client.series_detail(match.id)
+                available = {canonical_chapter_number(chapter.number) for chapter in chapters}
+                if not snapshot.tracked or set(snapshot.expected_chapters).issubset(available):
+                    return match, chapters
+            await asyncio.sleep(delay)
+            delay = min(delay * 1.35, 15.0)
+        return None, []
 
 
 def match_series(
@@ -371,33 +474,64 @@ def match_series(
     candidates: list[KavitaSeries],
     kavita_folder: str = "",
 ) -> KavitaSeries | None:
-    if snapshot.existing_kavita_id:
-        for candidate in candidates:
-            if candidate.id == snapshot.existing_kavita_id:
-                return candidate
     anilist = snapshot.external_ids.get("anilist") or snapshot.external_ids.get("aniList")
     mal = snapshot.external_ids.get("mal") or snapshot.external_ids.get("myanimelist")
+    normalized_values = {normalize_title(snapshot.title)} | {
+        normalize_title(alias) for alias in snapshot.aliases
+    }
+
+    def same_folder(candidate: KavitaSeries) -> bool:
+        return bool(
+            kavita_folder
+            and candidate.folder_path
+            and Path(candidate.folder_path) == Path(kavita_folder)
+        )
+
+    def same_external_id(candidate: KavitaSeries) -> bool:
+        return bool(
+            (anilist and candidate.anilist_id == anilist)
+            or (mal and candidate.mal_id == mal)
+        )
+
+    def same_title(candidate: KavitaSeries) -> bool:
+        return normalize_title(candidate.name) in normalized_values
+
+    def conflicts_with_snapshot(candidate: KavitaSeries) -> bool:
+        folder_conflict = bool(
+            kavita_folder
+            and candidate.folder_path
+            and Path(candidate.folder_path) != Path(kavita_folder)
+        )
+        external_id_conflict = bool(
+            (anilist and candidate.anilist_id and candidate.anilist_id != anilist)
+            or (mal and candidate.mal_id and candidate.mal_id != mal)
+        )
+        return folder_conflict or external_id_conflict
+
+    # A persisted Kavita ID is only a hint. IDs can become stale after a Kavita
+    # library is recreated, so never allow the numeric ID alone to override the
+    # current folder, external-ID, or title evidence.
+    if snapshot.existing_kavita_id:
+        for candidate in candidates:
+            if candidate.id == snapshot.existing_kavita_id and (
+                not conflicts_with_snapshot(candidate)
+                and (
+                    same_external_id(candidate)
+                    or same_folder(candidate)
+                    or same_title(candidate)
+                )
+            ):
+                return candidate
     identifier_matches = [
         candidate
         for candidate in candidates
-        if (anilist and candidate.anilist_id == anilist) or (mal and candidate.mal_id == mal)
+        if same_external_id(candidate)
     ]
     if len(identifier_matches) == 1:
         return identifier_matches[0]
     if kavita_folder:
-        folder_matches = [
-            candidate
-            for candidate in candidates
-            if candidate.folder_path and Path(candidate.folder_path) == Path(kavita_folder)
-        ]
+        folder_matches = [candidate for candidate in candidates if same_folder(candidate)]
         if len(folder_matches) == 1:
             return folder_matches[0]
-    normalized_values = {normalize_title(snapshot.title)} | {
-        normalize_title(alias) for alias in snapshot.aliases
-    }
-    matches = [
-        candidate
-        for candidate in candidates
-        if normalize_title(candidate.name) in normalized_values
-    ]
+    matches = [candidate for candidate in candidates if same_title(candidate)]
     return matches[0] if len(matches) == 1 else None

@@ -55,7 +55,8 @@ def test_asura_parses_comics_and_filters_chapter_images():
     adapter = AsuraAdapter()
     recent = adapter.parse_recent_series(soup)
 
-    assert recent[0].source_id == "comics/star-embracing-swordmaster-a80d257e"
+    assert recent[0].source_id == "comics/star-embracing-swordmaster"
+    assert recent[0].metadata["asura_revision"] == "a80d257e"
     assert recent[0].title == "Star-Embracing Swordmaster"
 
     chapters = adapter.parse_chapters(soup, recent[0])

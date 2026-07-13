@@ -5,11 +5,16 @@ from datetime import datetime, timezone
 import os
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, delete
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from manga_manager.infrastructure.db_models import CatalogSourceState, JobBase
+from manga_manager.infrastructure.db_models import (
+    CatalogSourceState,
+    JobBase,
+    ProviderEndpointState,
+    ProviderPolicy,
+)
 from manga_manager.infrastructure.provider_scheduler import ProviderRequestScheduler
 from manga_manager.infrastructure.database import create_database_engine, run_migrations
 
@@ -40,9 +45,13 @@ def test_provider_scheduler_is_atomic_on_postgresql() -> None:
     engine = create_database_engine(database_url)
     sessions = sessionmaker(engine, expire_on_commit=False)
     with sessions() as session, session.begin():
-        state = session.get(CatalogSourceState, "scheduler-test")
+        session.execute(
+            delete(ProviderEndpointState).where(ProviderEndpointState.source == "asura")
+        )
+        session.execute(delete(ProviderPolicy).where(ProviderPolicy.source == "asura"))
+        state = session.get(CatalogSourceState, "asura")
         if state is None:
-            session.add(CatalogSourceState(source="scheduler-test"))
+            session.add(CatalogSourceState(source="asura"))
         else:
             state.next_request_at = None
             state.cooldown_until = None

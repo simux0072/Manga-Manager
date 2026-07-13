@@ -58,6 +58,7 @@ class ContentAddressedStorage:
         self.blob_root = root / "blobs"
         self.staging_root = root / "staging"
         self.library_root = root / "library"
+        self.kavita_root = root / "kavita-library"
         self.max_page_bytes = max_page_bytes
         self.max_chapter_bytes = max_chapter_bytes
         self.max_pages = max_pages
@@ -68,6 +69,7 @@ class ContentAddressedStorage:
         self.blob_root.mkdir(parents=True, exist_ok=True)
         self.staging_root.mkdir(parents=True, exist_ok=True)
         self.library_root.mkdir(parents=True, exist_ok=True)
+        self.kavita_root.mkdir(parents=True, exist_ok=True)
 
     def validate_cbz(self, path: Path) -> ValidatedCbz:
         byte_count = path.stat().st_size
@@ -185,10 +187,20 @@ class ContentAddressedStorage:
         return Path("Manga") / storage_key / filename
 
     def materialize(self, blob_relative_path: str, projection_relative_path: str) -> Path:
+        return self._materialize(self.library_root, blob_relative_path, projection_relative_path)
+
+    def materialize_kavita(
+        self, blob_relative_path: str, projection_relative_path: str
+    ) -> Path:
+        return self._materialize(self.kavita_root, blob_relative_path, projection_relative_path)
+
+    def _materialize(
+        self, root: Path, blob_relative_path: str, projection_relative_path: str
+    ) -> Path:
         source = self.root / blob_relative_path
         if not source.is_file():
             raise FileNotFoundError(source)
-        destination = self.library_root / projection_relative_path
+        destination = root / projection_relative_path
         destination.parent.mkdir(parents=True, exist_ok=True)
         temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
         try:

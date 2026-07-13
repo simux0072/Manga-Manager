@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
 from collections.abc import Collection
 from typing import Any
 
@@ -24,6 +25,7 @@ from manga_manager.infrastructure.db_models import (
     StorageReservation,
     StorageState,
     WorkJob,
+    WorkloadCycle,
 )
 
 
@@ -55,6 +57,10 @@ class JobQueue:
         source: str = "",
         series_key: str = "",
         pool: str = "",
+        workflow_key: str = "",
+        group_key: str = "",
+        logical_units: int = 1,
+        coalesce: bool = False,
     ) -> tuple[WorkJob, bool]:
         key = dedupe_key.strip()
         if not key:
@@ -69,7 +75,29 @@ class JobQueue:
         routed_pool = pool.strip() or default_pool(kind, routed_source)
         existing = self.active_job(session, kind=kind, dedupe_key=key)
         if existing is not None:
+            if coalesce:
+                replacement = validated_payload.model_dump(mode="json")
+                current_payload = (
+                    existing.pending_payload
+                    if existing.status == JobState.LEASED.value and existing.pending_payload
+                    else existing.payload
+                )
+                if not self._should_coalesce(kind, current_payload, replacement):
+                    return existing, False
+                if existing.status == JobState.LEASED.value:
+                    existing.pending_payload = replacement
+                else:
+                    existing.payload = replacement
+                    existing.error_code = ""
+                    existing.error_message = ""
+                    existing.updated_at = utcnow()
             return existing, False
+
+        cycle = self._active_cycle(session)
+        routed_workflow = workflow_key.strip() or getattr(validated_payload, "workflow_key", "")
+        routed_group = group_key.strip() or self._default_group_key(
+            kind, key, routed_source, series_key.strip(), routed_workflow, cycle.id
+        )
 
         job = WorkJob(
             kind=kind.value,
@@ -81,6 +109,10 @@ class JobQueue:
             source=routed_source,
             series_key=series_key.strip(),
             pool=routed_pool,
+            cycle_id=cycle.id,
+            workflow_key=routed_workflow,
+            group_key=routed_group,
+            logical_units=max(logical_units, 1),
         )
         try:
             with session.begin_nested():
@@ -92,7 +124,84 @@ class JobQueue:
                 raise
             return existing, False
         self._record_event(session, job, "enqueued")
+        cycle.total_units += job.logical_units
+        cycle.added_units += job.logical_units
+        cycle.updated_at = utcnow()
         return job, True
+
+    def reroute(
+        self,
+        session: Session,
+        *,
+        job_id: int,
+        owner: str,
+        payload: JobPayload | dict[str, Any],
+        source: str,
+        available_at: datetime,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> bool:
+        """Return a leased logical job to the queue with a different provider in place."""
+        current = utcnow()
+        job = session.scalar(
+            select(WorkJob)
+            .where(WorkJob.id == job_id)
+            .where(WorkJob.status == JobState.LEASED.value)
+            .where(WorkJob.lease_owner == owner)
+            .with_for_update()
+        )
+        if job is None:
+            return False
+        validated = parse_job_payload(JobKind(job.kind), payload)
+        job.payload = validated.model_dump(mode="json")
+        job.source = source.strip()
+        job.pool = default_pool(JobKind(job.kind), job.source)
+        job.status = JobState.RETRY_WAIT.value
+        job.available_at = available_at
+        job.lease_owner = ""
+        job.lease_expires_at = None
+        job.heartbeat_at = None
+        job.error_code = "rerouted"
+        job.error_message = message[:4000]
+        job.updated_at = current
+        self._release_permits(session, job.id)
+        self._record_event(
+            session, job, "rerouted", owner=owner, message=message, details=details
+        )
+        session.flush()
+        return True
+
+    def reroute_waiting(
+        self,
+        session: Session,
+        *,
+        job_id: int,
+        payload: JobPayload | dict[str, Any],
+        source: str,
+        available_at: datetime,
+        message: str,
+        details: dict[str, Any] | None = None,
+    ) -> bool:
+        job = session.scalar(
+            select(WorkJob)
+            .where(WorkJob.id == job_id)
+            .where(WorkJob.status.in_((JobState.QUEUED.value, JobState.RETRY_WAIT.value)))
+            .with_for_update()
+        )
+        if job is None:
+            return False
+        validated = parse_job_payload(JobKind(job.kind), payload)
+        job.payload = validated.model_dump(mode="json")
+        job.source = source.strip()
+        job.pool = default_pool(JobKind(job.kind), job.source)
+        job.status = JobState.RETRY_WAIT.value
+        job.available_at = available_at
+        job.error_code = "rerouted"
+        job.error_message = message[:4000]
+        job.updated_at = utcnow()
+        self._record_event(session, job, "rerouted", message=message, details=details)
+        session.flush()
+        return True
 
     def active_job(
         self,
@@ -274,6 +383,7 @@ class JobQueue:
                 message=job.error_message,
             )
             self._release_permits(session, job.id)
+            self._record_terminal_units(session, job, JobState.FAILED, current)
         session.flush()
         return len(jobs)
 
@@ -396,6 +506,8 @@ class JobQueue:
             message=error_message,
             details={"error_code": error_code, "available_at": available_at.isoformat()},
         )
+        if terminal:
+            self._record_terminal_units(session, job, JobState.FAILED, current)
         session.flush()
         return state
 
@@ -427,6 +539,7 @@ class JobQueue:
         job.completed_at = current
         self._release_permits(session, job.id)
         self._record_event(session, job, "cancelled", owner=owner, message=reason)
+        self._record_terminal_units(session, job, JobState.CANCELLED, current)
         session.flush()
         return True
 
@@ -568,6 +681,28 @@ class JobQueue:
         )
         if job is None:
             return False
+        if state is JobState.SUCCEEDED and job.pending_payload:
+            job.payload = dict(job.pending_payload)
+            job.pending_payload = {}
+            job.status = JobState.QUEUED.value
+            job.available_at = current
+            job.lease_owner = ""
+            job.lease_expires_at = None
+            job.heartbeat_at = None
+            job.error_code = "coalesced_observation"
+            job.error_message = "a newer provider observation was coalesced while leased"
+            job.updated_at = current
+            self._release_permits(session, job.id)
+            self._record_event(
+                session,
+                job,
+                "released",
+                owner=owner,
+                message=job.error_message,
+                details={"coalesced": True},
+            )
+            session.flush()
+            return True
         job.status = state.value
         job.lease_owner = ""
         job.lease_expires_at = None
@@ -585,8 +720,84 @@ class JobQueue:
             message=error_message,
             details={"error_code": error_code} if error_code else None,
         )
+        self._record_terminal_units(session, job, state, current)
         session.flush()
         return True
+
+    def _active_cycle(self, session: Session) -> WorkloadCycle:
+        if session.bind is not None and session.bind.dialect.name == "postgresql":
+            session.execute(text("SELECT pg_advisory_xact_lock(:lock_id)"), {"lock_id": 0x4D4D4359})
+        cycle = session.scalar(
+            select(WorkloadCycle)
+            .where(WorkloadCycle.status == "active")
+            .order_by(WorkloadCycle.id.desc())
+            .with_for_update()
+            .limit(1)
+        )
+        if cycle is None:
+            cycle = WorkloadCycle()
+            session.add(cycle)
+            session.flush()
+        return cycle
+
+    def _record_terminal_units(
+        self, session: Session, job: WorkJob, state: JobState, now: datetime
+    ) -> None:
+        if job.cycle_id is None:
+            return
+        cycle = session.get(WorkloadCycle, job.cycle_id)
+        if cycle is None:
+            return
+        units = max(job.logical_units, 1)
+        if state is JobState.SUCCEEDED:
+            cycle.successful_units += units
+        elif state is JobState.FAILED:
+            cycle.failed_units += units
+        elif state is JobState.CANCELLED:
+            cycle.cancelled_units += units
+        cycle.updated_at = now
+        remaining = session.scalar(
+            select(func.count())
+            .select_from(WorkJob)
+            .where(WorkJob.cycle_id == cycle.id)
+            .where(WorkJob.status.in_(_state_values(ACTIVE_JOB_STATES)))
+        )
+        if not remaining:
+            cycle.status = "settled"
+            cycle.settled_at = now
+
+    @staticmethod
+    def _default_group_key(
+        kind: JobKind,
+        dedupe_key: str,
+        source: str,
+        series_key: str,
+        workflow_key: str,
+        cycle_id: int,
+    ) -> str:
+        if kind is JobKind.CHAPTER_DOWNLOAD and series_key:
+            return f"cycle:{cycle_id}:download:{series_key}"
+        if kind in {JobKind.SOURCE_PULL, JobKind.SOURCE_REFRESH}:
+            return workflow_key or f"pull:{source}"
+        if kind is JobKind.LIBRARY_REPAIR and series_key:
+            return f"repair:{series_key}"
+        return f"{kind.value}:{dedupe_key}"
+
+    @staticmethod
+    def _should_coalesce(
+        kind: JobKind, current: dict[str, Any], replacement: dict[str, Any]
+    ) -> bool:
+        if kind is not JobKind.SOURCE_REFRESH:
+            return current != replacement
+        old = str(current.get("observation_version") or "").strip()
+        new = str(replacement.get("observation_version") or "").strip()
+        if old and new:
+            try:
+                return Decimal(new) > Decimal(old)
+            except InvalidOperation:
+                if new == old:
+                    return False
+        return current != replacement
 
     def _expire_permits(self, session: Session, now: datetime) -> None:
         session.execute(delete(JobPermit).where(JobPermit.lease_expires_at <= now))
@@ -601,8 +812,12 @@ class JobQueue:
         now: datetime,
         limits: dict[str, int],
     ) -> bool:
-        if job.kind == JobKind.CHAPTER_DOWNLOAD.value and job.series_key:
-            series_lock = f"chapter-series:{job.series_key}"
+        mutating_kinds = {
+            JobKind.CHAPTER_DOWNLOAD.value,
+            JobKind.LIBRARY_REPAIR.value,
+        }
+        if job.kind in mutating_kinds and job.series_key:
+            series_lock = f"library-series:{job.series_key}"
             if session.bind is not None and session.bind.dialect.name == "postgresql":
                 session.execute(
                     text("SELECT pg_advisory_xact_lock(hashtext(:series_lock))"),
@@ -610,7 +825,7 @@ class JobQueue:
                 )
             leased_for_series = session.scalar(
                 select(WorkJob.id)
-                .where(WorkJob.kind == JobKind.CHAPTER_DOWNLOAD.value)
+                .where(WorkJob.kind.in_(mutating_kinds))
                 .where(WorkJob.status == JobState.LEASED.value)
                 .where(WorkJob.series_key == job.series_key)
                 .where(WorkJob.lease_expires_at > now)
@@ -699,6 +914,8 @@ def default_pool(kind: JobKind, source: str = "") -> str:
         return f"download:{source}" if source else "download:unknown"
     if kind is JobKind.KAVITA_SYNC:
         return "kavita"
+    if kind is JobKind.COVER_BACKFILL:
+        return "cover_backfill"
     if kind is JobKind.NOTIFICATION:
         return "notification"
     return "maintenance"

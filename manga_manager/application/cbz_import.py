@@ -65,9 +65,14 @@ class LegacyCbzImporter:
         connection = sqlite3.connect(database)
         connection.row_factory = sqlite3.Row
         try:
+            series_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(series)").fetchall()
+            }
+            status_expression = "s.status" if "status" in series_columns else "'interested'"
             rows = connection.execute(
-                """
+                f"""
                 SELECT df.path, df.source, ss.source_id, s.title AS series_title,
+                       {status_expression} AS series_status,
                        c.number AS chapter_number
                 FROM downloaded_file df
                 JOIN chapter c ON c.id=df.chapter_id
@@ -125,6 +130,9 @@ class LegacyCbzImporter:
                     session.get(CatalogSeries, source_series.series_id)
                     if source_series is not None
                     else self._series(session, str(row["series_title"]))
+                )
+                series.status = (
+                    "reading" if str(row["series_status"]) == "reading" else "interested"
                 )
                 chapter = self._chapter(session, series.id, str(row["chapter_number"]))
                 release = None

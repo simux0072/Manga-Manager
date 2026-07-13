@@ -2,6 +2,7 @@
 
 from manga_manager.domain.jobs import (
     ChapterDownloadPayload,
+    CoverBackfillPayload,
     JobKind,
     JobLease,
     JobPayload,
@@ -14,6 +15,7 @@ from manga_manager.domain.jobs import (
 
 __all__ = [
     "ChapterDownloadPayload",
+    "CoverBackfillPayload",
     "JobKind",
     "JobLease",
     "JobPayload",

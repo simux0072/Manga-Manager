@@ -14,6 +14,7 @@ from manga_manager.infrastructure.db_models import (
     CatalogSourceSeries,
     JobBase,
     JobEvent,
+    MatchTrainingLabel,
     WorkerHeartbeat,
     WorkJob,
 )
@@ -150,6 +151,42 @@ async def test_tracking_moves_series_between_discovery_and_library() -> None:
     assert series_id in {item["id"] for item in library.json()["items"]}
 
 
+async def test_manual_merge_candidates_are_ranked_and_merge_uses_best_provider() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        asura = session.query(CatalogSeries).filter_by(status="untracked").one()
+        tracked = session.query(CatalogSeries).filter_by(status="reading").one()
+        asura.status = "interested"
+        asura.title = "Tracked"
+        asura.normalized_title = "tracked"
+        asura_id, tracked_id = asura.id, tracked.id
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        candidates = await client.get(
+            "/api/v2/merge-candidates", params={"anchor_id": tracked_id}
+        )
+        preview = await client.post(
+            "/api/v2/series/merge-preview", json={"series_ids": [tracked_id, asura_id]}
+        )
+        merged = await client.post(
+            "/api/v2/series/merge",
+            json={"series_ids": [tracked_id, asura_id], "confirmation": "MERGE"},
+        )
+    assert candidates.status_code == 200
+    assert candidates.json()["items"][0]["id"] == asura_id
+    assert 0.35 <= candidates.json()["items"][0]["similarity"] < 1
+    assert candidates.json()["items"][0]["score_breakdown"]["title"] == 1
+    assert preview.json()["target_id"] == asura_id
+    assert preview.json()["can_merge"] is True
+    assert merged.status_code == 200, merged.text
+    assert merged.json()["target_id"] == asura_id
+    with sessions() as session:
+        assert session.query(CatalogSeries).count() == 1
+        assert session.get(CatalogSeries, asura_id).status == "reading"
+        assert session.query(MatchTrainingLabel).filter_by(origin="manual_merge").count() == 1
+
+
 async def test_updates_group_unread_tracked_chapters_by_series() -> None:
     app, sessions = app_with_catalog()
     with sessions() as session, session.begin():
@@ -214,6 +251,148 @@ async def test_matches_return_human_evidence_and_require_confirmation() -> None:
     assert "Cover mismatch" not in labels
     assert rejected.status_code == 422
     assert "evidence_json" not in matches.text
+
+
+async def test_matches_close_decisions_already_in_the_same_canonical_series() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        identities = session.query(CatalogSourceSeries).order_by(CatalogSourceSeries.id).all()
+        identities[1].series_id = identities[0].series_id
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/api/v2/matches")
+    assert response.status_code == 200 and response.json()["total"] == 0
+    with sessions() as session:
+        decision = session.query(CatalogMatchDecision).one()
+        assert decision.decision == "accepted"
+        assert decision.decided_by == "canonicalized"
+
+
+async def test_matches_collapse_multiple_identity_decisions_per_canonical_pair() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        left, right = session.query(CatalogSeries).order_by(CatalogSeries.id).all()
+        left_extra = CatalogSourceSeries(
+            series_id=left.id, source="kingofshojo", source_id="left-extra",
+            title=left.title, normalized_title=left.normalized_title,
+            url="https://example.test/left-extra",
+        )
+        session.add(left_extra)
+        session.flush()
+        right_identity = session.query(CatalogSourceSeries).filter_by(series_id=right.id).one()
+        session.add(CatalogMatchDecision(
+            left_source_series_id=min(left_extra.id, right_identity.id),
+            right_source_series_id=max(left_extra.id, right_identity.id),
+            confidence=0.81,
+        ))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/api/v2/matches")
+    assert response.json()["total"] == 1
+    assert len(response.json()["items"][0]["decision_ids"]) == 2
+
+
+async def test_entire_match_queue_preview_keeps_active_job_blockers_visible() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        blocked_series = session.query(CatalogSeries).order_by(CatalogSeries.id).first()
+        session.add(WorkJob(
+            kind="library_repair", dedupe_key="blocked-match", payload={
+                "version": 1, "series_id": blocked_series.id, "reason": "merge",
+                "obsolete_storage_keys": [],
+            },
+            series_key=str(blocked_series.id), status="queued",
+        ))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        preview = await client.post(
+            "/api/v2/match-batch/preview",
+            json={"ids": [], "entire_queue": True, "decision": "accepted"},
+        )
+        result = await client.post(
+            "/api/v2/match-batch",
+            json={
+                "ids": [], "entire_queue": True, "decision": "accepted",
+                "confirmation": "MERGE",
+            },
+        )
+    assert preview.json()["selected"] == 1
+    assert preview.json()["blocked"] == 1
+    assert "active jobs" in preview.json()["items"][0]["blocked_reasons"]
+    assert result.json()["ids"] == [] and result.json()["blocked"]
+
+
+async def test_connected_batch_matches_merge_once() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        second = session.query(CatalogSeries).filter_by(title="Tracked").one()
+        third = CatalogSeries(
+            title="Third", normalized_title="third", status="interested",
+        )
+        session.add(third)
+        session.flush()
+        third_identity = CatalogSourceSeries(
+            series_id=third.id, source="kingofshojo", source_id="third",
+            title="Third", normalized_title="third", url="https://example.test/third",
+        )
+        session.add(third_identity)
+        session.flush()
+        second_identity = session.query(CatalogSourceSeries).filter_by(series_id=second.id).one()
+        session.add(CatalogMatchDecision(
+            left_source_series_id=min(second_identity.id, third_identity.id),
+            right_source_series_id=max(second_identity.id, third_identity.id),
+            confidence=0.8,
+        ))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post(
+            "/api/v2/match-batch",
+            json={
+                "ids": [], "entire_queue": True, "decision": "accepted",
+                "confirmation": "MERGE",
+            },
+        )
+    assert response.status_code == 200, response.text
+    assert len(response.json()["ids"]) == 2
+    with sessions() as session:
+        assert session.query(CatalogSeries).count() == 1
+        assert session.query(WorkJob).filter_by(kind="library_repair").count() == 1
+
+
+async def test_provider_registry_expands_manual_merge_limit_dynamically(monkeypatch) -> None:
+    from manga_manager.domain import providers
+
+    monkeypatch.setitem(providers.PROVIDER_ORIGINS, "fourth", "https://fourth.example")
+    app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        existing = session.query(CatalogSeries).all()
+        existing[0].status = "interested"
+        ids = [row.id for row in existing]
+        for source in ("kingofshojo", "fourth"):
+            series = CatalogSeries(
+                title=f"Series {source}", normalized_title=f"series {source}",
+                status="interested",
+            )
+            session.add(series)
+            session.flush()
+            ids.append(series.id)
+            session.add(CatalogSourceSeries(
+                series_id=series.id, source=source, source_id=source, title=series.title,
+                normalized_title=series.normalized_title, url=f"https://{source}.example/title",
+            ))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        registry = await client.get("/api/v2/providers")
+        preview = await client.post(
+            "/api/v2/series/merge-preview", json={"series_ids": ids}
+        )
+    assert registry.json()["items"][-1] == "fourth"
+    assert preview.status_code == 200 and preview.json()["can_merge"] is True
 
 
 async def test_confirmed_match_merges_complete_groups() -> None:
@@ -286,6 +465,10 @@ async def test_merge_consolidates_strong_same_provider_duplicate_before_group_me
         assert session.query(CatalogSourceSeries).filter_by(source="mangafire").count() == 1
         alternate = session.query(CatalogAlternateSourceListing).one()
         assert alternate.source_id == "alternate-slug"
+        label = session.query(MatchTrainingLabel).one()
+        assert label.label == 1
+        assert label.origin == "suggested_review"
+        assert label.left_identity_json["title"]
 
 
 async def test_jobs_activity_and_operations_have_human_context() -> None:
@@ -302,6 +485,44 @@ async def test_jobs_activity_and_operations_have_human_context() -> None:
     assert activity.json()["items"][0]["job"]["description"] == description
     assert operations.json()["health"]["series"] == 2
     assert probe.status_code == 200
+
+
+async def test_job_group_and_child_keyset_cursors_do_not_repeat_rows() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        for group in range(3):
+            for child in range(2):
+                session.add(WorkJob(
+                    kind="maintenance",
+                    dedupe_key=f"cursor:{group}:{child}",
+                    payload={"version": 1, "action": "stage_probe"},
+                    group_key=f"health:{group}",
+                    priority=group + 1,
+                    status="queued",
+                ))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first = await client.get("/api/v2/job-groups", params={"state": "queued", "limit": 2})
+        second = await client.get(
+            "/api/v2/job-groups",
+            params={"state": "queued", "limit": 2, "cursor": first.json()["next_cursor"]},
+        )
+        child_first = await client.get(
+            "/api/v2/job-groups/health:0/children", params={"state": "queued", "limit": 1}
+        )
+        child_second = await client.get(
+            "/api/v2/job-groups/health:0/children",
+            params={
+                "state": "queued", "limit": 1,
+                "cursor": child_first.json()["next_cursor"],
+            },
+        )
+    first_keys = {row["key"] for row in first.json()["items"]}
+    second_keys = {row["key"] for row in second.json()["items"]}
+    assert first.status_code == second.status_code == 200
+    assert first_keys.isdisjoint(second_keys)
+    assert child_first.json()["items"][0]["id"] != child_second.json()["items"][0]["id"]
 
 
 async def test_operations_hides_stale_worker_processes() -> None:

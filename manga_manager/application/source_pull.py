@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
@@ -8,6 +9,7 @@ import httpx
 from sqlalchemy import select
 
 from app.adapters import adapter_for_source
+from app.adapters.asura import asura_series_url, split_asura_source_id
 from app.adapters.base import FrontierSentinel, SourceAdapter, SourceRateLimited
 from app.domain import SeriesItem
 from manga_manager.application.job_handlers import (
@@ -21,7 +23,7 @@ from manga_manager.application.download_plans import DownloadPlanCoordinator
 from manga_manager.domain.jobs import JobKind, SourcePullPayload, SourceRefreshPayload
 from manga_manager.infrastructure.catalog_repository import CatalogRepository
 from manga_manager.infrastructure.job_queue import JobQueue
-from manga_manager.infrastructure.db_models import CatalogSourceState, ProviderEndpointState
+from manga_manager.infrastructure.db_models import CatalogSourceState, ProviderEndpointState, WorkJob
 from manga_manager.worker.runtime import SessionFactory
 
 
@@ -57,6 +59,14 @@ class SourcePullHandler:
         adapter = self.adapter_factory(source)
         if adapter is None:
             raise RetryableJobError("source_unavailable", f"source {source} is unavailable")
+        with self.session_factory() as progress_session, progress_session.begin():
+            self.queue.progress(
+                progress_session,
+                job_id=context.lease.id,
+                owner=context.lease.owner,
+                message=f"reading the latest {source} listing",
+                details={"phase": "listing", "processed": 0, "total": 2, "unit": "phases"},
+            )
 
         try:
             listed_items = await adapter.list_recent_frontier(frontier)
@@ -89,17 +99,38 @@ class SourcePullHandler:
         finally:
             await adapter.aclose()
 
+        with self.session_factory() as progress_session, progress_session.begin():
+            self.queue.progress(
+                progress_session,
+                job_id=context.lease.id,
+                owner=context.lease.owner,
+                message=f"discovered {len(candidates)} changed series",
+                details={"phase": "discovery", "processed": 1, "total": 2, "unit": "phases"},
+            )
+
         with self.session_factory() as session, session.begin():
+            workflow_key = payload.workflow_key or f"pull:{source}:{context.lease.id}"
+            root_job = session.get(WorkJob, context.lease.id)
+            if root_job is not None:
+                root_job.workflow_key = workflow_key
+                root_job.group_key = workflow_key
+            if source == "asura":
+                listed_items = self._apply_asura_revision_consensus(session, listed_items)
+                candidate_ids = {item.source_id for item in candidates}
+                candidates = [item for item in listed_items if item.source_id in candidate_ids]
             created = 0
             for item in candidates:
                 _job, was_created = self.queue.enqueue(
                     session,
                     kind=JobKind.SOURCE_REFRESH,
                     dedupe_key=f"refresh:{source}:{item.source_id}",
-                    payload=refresh_payload(item),
+                    payload=refresh_payload(item, workflow_key=workflow_key),
                     source=source,
                     priority=55,
                     max_attempts=4,
+                    workflow_key=workflow_key,
+                    group_key=workflow_key,
+                    coalesce=True,
                 )
                 created += int(was_created)
             self.catalog.record_poll_success(
@@ -114,6 +145,51 @@ class SourcePullHandler:
                     "stable_sentinels_required": min(3, len(frontier)),
                 },
             )
+            self.queue.progress(
+                session,
+                job_id=context.lease.id,
+                owner=context.lease.owner,
+                message=f"queued {created} refresh jobs",
+                details={"phase": "enqueue", "processed": 2, "total": 2, "unit": "phases"},
+            )
+
+    @staticmethod
+    def _apply_asura_revision_consensus(session, items: list[SeriesItem]) -> list[SeriesItem]:
+        counts: dict[str, set[str]] = {}
+        for item in items:
+            revision = str(item.metadata.get("asura_revision") or "")
+            if revision:
+                counts.setdefault(revision, set()).add(item.source_id)
+        consensus = max(counts, key=lambda value: len(counts[value]), default="")
+        state = session.get(CatalogSourceState, "asura")
+        if state is None:
+            state = CatalogSourceState(source="asura")
+            session.add(state)
+        cursor = dict(state.cursor_json or {})
+        if consensus and len(counts[consensus]) >= 3:
+            cursor["global_revision"] = consensus
+            cursor["revision_consensus_count"] = len(counts[consensus])
+            state.cursor_json = cursor
+        selected = str(cursor.get("global_revision") or "")
+        normalized: list[SeriesItem] = []
+        for item in items:
+            stable, embedded = split_asura_source_id(item.source_id)
+            observed = embedded or str(item.metadata.get("asura_revision") or "")
+            revision = selected or observed
+            metadata = dict(item.metadata)
+            metadata["asura_revision"] = observed
+            if selected and observed and observed != selected:
+                metadata["asura_revision_override"] = observed
+                revision = observed
+            normalized.append(
+                replace(
+                    item,
+                    source_id=stable,
+                    url=asura_series_url(stable, revision),
+                    metadata=metadata,
+                )
+            )
+        return normalized
 
     def _load_frontier(self, source: str) -> list[FrontierSentinel]:
         with self.session_factory() as session:
@@ -179,7 +255,15 @@ class SourceRefreshHandler:
         adapter = self.adapter_factory(payload.source)
         if adapter is None:
             raise RetryableJobError("source_unavailable", f"source {payload.source} unavailable")
-        item = item_from_refresh(payload)
+        item = self._resolve_item(item_from_refresh(payload))
+        with self.session_factory() as progress_session, progress_session.begin():
+            JobQueue().progress(
+                progress_session,
+                job_id=context.lease.id,
+                owner=context.lease.owner,
+                message=f"fetching {payload.title} from {payload.source}",
+                details={"phase": "detail", "processed": 0, "total": 3, "unit": "phases"},
+            )
         try:
             detail = getattr(adapter, "get_series_detail", None)
             enriched = await detail(item) if detail is not None else item
@@ -203,10 +287,35 @@ class SourceRefreshHandler:
         finally:
             await adapter.aclose()
         context.ensure_lease()
+        with self.session_factory() as progress_session, progress_session.begin():
+            JobQueue().progress(
+                progress_session,
+                job_id=context.lease.id,
+                owner=context.lease.owner,
+                message=f"parsed {len(chapters)} chapters",
+                details={"phase": "catalog", "processed": 2, "total": 3, "unit": "phases"},
+            )
         with self.session_factory() as session, session.begin():
             source_series = self.catalog.ingest(session, enriched, chapters)
             source_series_id = source_series.id
         await CoverEvidenceService(self.session_factory).refresh_for_source_series(source_series_id)
+        with self.session_factory() as progress_session, progress_session.begin():
+            JobQueue().progress(
+                progress_session,
+                job_id=context.lease.id,
+                owner=context.lease.owner,
+                message="catalog and cover evidence refreshed",
+                details={"phase": "cover", "processed": 3, "total": 3, "unit": "phases"},
+            )
+
+    def _resolve_item(self, item: SeriesItem) -> SeriesItem:
+        if item.source != "asura":
+            return item
+        with self.session_factory() as session:
+            state = session.get(CatalogSourceState, "asura")
+            revision = str((state.cursor_json if state else {}).get("global_revision") or "")
+        override = str(item.metadata.get("asura_revision_override") or "")
+        return replace(item, url=asura_series_url(item.source_id, override or revision))
 
     def _quarantine(self, payload: SourceRefreshPayload, reason: str) -> None:
         from manga_manager.infrastructure.db_models import CatalogObservation
@@ -224,7 +333,7 @@ class SourceRefreshHandler:
             )
 
 
-def refresh_payload(item: SeriesItem) -> SourceRefreshPayload:
+def refresh_payload(item: SeriesItem, *, workflow_key: str = "") -> SourceRefreshPayload:
     return SourceRefreshPayload(
         source=item.source,
         source_id=item.source_id,
@@ -237,6 +346,8 @@ def refresh_payload(item: SeriesItem) -> SourceRefreshPayload:
         popularity=item.popularity,
         external_ids=item.external_ids,
         metadata=item.metadata,
+        workflow_key=workflow_key,
+        observation_version=str(item.metadata.get("latest_chapter") or latest_listing_chapter(item)),
     )
 
 

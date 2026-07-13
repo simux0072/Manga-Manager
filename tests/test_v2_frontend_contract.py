@@ -30,6 +30,9 @@ def test_typeahead_multi_source_optimistic_tracking_and_sse_contract() -> None:
 
 def test_every_manga_workspace_uses_cover_component() -> None:
     application = Path("frontend/src/App.tsx").read_text()
-    for component in ("DiscoveryCard", "LibraryCard", "UpdateCard", "MatchSideCard"):
+    for component in ("DiscoveryCard", "LibraryCard", "UpdateCard"):
         section = application.split(f"function {component}", 1)[1].split("function ", 1)[0]
         assert "<Cover" in section
+    matches = Path("frontend/src/MatchesWorkspace.tsx").read_text()
+    side = matches.split("function Side", 1)[1].split("function ", 1)[0]
+    assert "<Cover" in side

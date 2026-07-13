@@ -177,6 +177,7 @@ def test_cooling_provider_reroutes_all_waiting_chapters_to_alternates() -> None:
         DownloadPlanCoordinator().track(session, series_id)
 
     assert {job.source for job in session.scalars(select(WorkJob)).all()} == {"asura"}
+    original_ids = {job.id for job in session.scalars(select(WorkJob)).all()}
     session.commit()
     retry_after = datetime.now(timezone.utc) + timedelta(minutes=15)
     with session.begin():
@@ -189,6 +190,7 @@ def test_cooling_provider_reroutes_all_waiting_chapters_to_alternates() -> None:
         select(WorkJob).where(WorkJob.status.in_(["queued", "retry_wait"]))
     ).all()
     assert len(active) == 2 and {job.source for job in active} == {"mangafire"}
+    assert {job.id for job in active} == original_ids
     attempts = session.scalars(select(ChapterReleaseAttempt)).all()
     assert len(attempts) == 2
     assert all(row.outcome == "fallback_queued" for row in attempts)

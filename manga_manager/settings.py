@@ -85,6 +85,8 @@ class V2Settings(BaseSettings):
             "chapter_global": self.global_chapter_concurrency,
             "kavita": 1,
             "maintenance": 1,
+            "health": 1,
+            "cover_backfill": 1,
             "notification": 1,
         }
 

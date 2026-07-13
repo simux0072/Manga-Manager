@@ -9,19 +9,21 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import String, and_, case, func, or_, select
 from sqlalchemy.orm import Session, aliased, sessionmaker
 
 from app.kavita import configured_kavita_client
 
 from manga_manager.domain.jobs import (
     JobKind,
-    KavitaSyncPayload,
+    LibraryRepairPayload,
     MaintenancePayload,
     SourcePullPayload,
 )
 from manga_manager.application.download_plans import DownloadPlanCoordinator
 from manga_manager.application.kavita_sync import KavitaSyncPlanner
+from manga_manager.application.match_training import record_training_label
+from manga_manager.application.matching_score import strongest_candidate_score
 
 from manga_manager.infrastructure.db_models import (
     CatalogChapter,
@@ -39,12 +41,16 @@ from manga_manager.infrastructure.db_models import (
     ProviderBenchmarkRun,
     ProviderEndpointState,
     ProviderPolicy,
+    SeriesDownloadPlan,
     StorageState,
     WorkerHeartbeat,
     WorkJob,
+    WorkloadCycle,
 )
 from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.settings import V2Settings
+from manga_manager.domain.providers import SOURCE_PRIORITY, provider_names
+from manga_manager.domain.matching import provider_identities_equivalent
 
 
 TRACKED_STATES = ("interested", "reading", "caught_up", "paused")
@@ -65,11 +71,57 @@ class MatchChange(BaseModel):
 
 
 class BatchMatchChange(MatchChange):
-    ids: list[int]
+    ids: list[int] = []
+    entire_queue: bool = False
+
+
+class MergeSeriesChange(BaseModel):
+    series_ids: list[int]
+    confirmation: str = ""
 
 
 def utcnow() -> datetime:
     return datetime.now(timezone.utc)
+
+
+def provider_merge_conflicts(session: Session, series_ids: list[int]) -> list[str]:
+    identities = session.scalars(
+        select(CatalogSourceSeries)
+        .where(CatalogSourceSeries.series_id.in_(series_ids))
+    ).all()
+    grouped: dict[str, list[CatalogSourceSeries]] = defaultdict(list)
+    for identity in identities:
+        grouped[identity.source].append(identity)
+    conflicts: list[str] = []
+    for source, source_identities in grouped.items():
+        if len(source_identities) < 2:
+            continue
+        resolvable = True
+        for index, left_identity in enumerate(source_identities):
+            left_numbers = set(
+                session.scalars(
+                    select(CatalogChapter.canonical_number)
+                    .join(CatalogChapterRelease)
+                    .where(CatalogChapterRelease.source_series_id == left_identity.id)
+                ).all()
+            )
+            for right_identity in source_identities[index + 1 :]:
+                if provider_identities_equivalent(left_identity, right_identity):
+                    continue
+                right_numbers = set(
+                    session.scalars(
+                        select(CatalogChapter.canonical_number)
+                        .join(CatalogChapterRelease)
+                        .where(CatalogChapterRelease.source_series_id == right_identity.id)
+                    ).all()
+                )
+                overlap = len(left_numbers & right_numbers)
+                minimum = min(len(left_numbers), len(right_numbers))
+                if overlap < 2 or (minimum and overlap / minimum < 0.5):
+                    resolvable = False
+        if not resolvable:
+            conflicts.append(source)
+    return sorted(conflicts)
 
 
 def storage_health(session: Session) -> dict[str, int]:
@@ -87,6 +139,91 @@ def storage_health(session: Session) -> dict[str, int]:
     }
 
 
+def pending_match_proposals(session: Session) -> list[dict[str, Any]]:
+    left_alias = aliased(CatalogSourceSeries)
+    right_alias = aliased(CatalogSourceSeries)
+    rows = session.execute(
+        select(CatalogMatchDecision, left_alias, right_alias)
+        .join(left_alias, left_alias.id == CatalogMatchDecision.left_source_series_id)
+        .join(right_alias, right_alias.id == CatalogMatchDecision.right_source_series_id)
+        .where(CatalogMatchDecision.decision == "pending")
+    ).all()
+    grouped: dict[tuple[int, int], dict[str, Any]] = {}
+    for decision, left, right in rows:
+        if left.series_id == right.series_id:
+            decision.decision = "accepted"
+            decision.decided_by = "canonicalized"
+            decision.decided_at = utcnow()
+            continue
+        key = tuple(sorted((left.series_id, right.series_id)))
+        proposal = grouped.get(key)
+        if proposal is None:
+            grouped[key] = {
+                "id": decision.id,
+                "decision": decision,
+                "left": left,
+                "right": right,
+                "decision_ids": [decision.id],
+                "series_ids": list(key),
+            }
+        else:
+            proposal["decision_ids"].append(decision.id)
+            if decision.confidence > proposal["decision"].confidence:
+                proposal.update(id=decision.id, decision=decision, left=left, right=right)
+    return sorted(
+        grouped.values(), key=lambda row: (-row["decision"].confidence, row["id"])
+    )
+
+
+def proposal_blockers(session: Session, series_ids: list[int]) -> list[str]:
+    blockers = [f"provider conflict: {value}" for value in provider_merge_conflicts(session, series_ids)]
+    active = session.scalar(
+        select(WorkJob.id)
+        .where(
+            WorkJob.series_key.in_([str(value) for value in series_ids]),
+            WorkJob.status.in_(ACTIVE_JOB_STATES),
+        )
+        .limit(1)
+    )
+    if active is not None:
+        blockers.append("active jobs")
+    return blockers
+
+
+def provider_latest_chapter(session: Session, source_series_id: int) -> str:
+    row = session.execute(
+        select(CatalogChapter.display_number)
+        .join(CatalogChapterRelease)
+        .where(CatalogChapterRelease.source_series_id == source_series_id)
+        .order_by(
+            CatalogChapter.sort_number.desc().nullslast(),
+            CatalogChapterRelease.published_at.desc().nullslast(),
+            CatalogChapterRelease.id.desc(),
+        )
+        .limit(1)
+    ).first()
+    return str(row[0]) if row else ""
+
+
+def connected_proposal_components(proposals: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    remaining = list(proposals)
+    result = []
+    while remaining:
+        component = [remaining.pop(0)]
+        series_ids = set(component[0]["series_ids"])
+        changed = True
+        while changed:
+            changed = False
+            for proposal in list(remaining):
+                if series_ids.intersection(proposal["series_ids"]):
+                    remaining.remove(proposal)
+                    component.append(proposal)
+                    series_ids.update(proposal["series_ids"])
+                    changed = True
+        result.append({"proposals": component, "series_ids": sorted(series_ids)})
+    return result
+
+
 def create_api_router(
     factory_provider: Callable[[], sessionmaker[Session]],
 ) -> APIRouter:
@@ -97,6 +234,10 @@ def create_api_router(
             yield session
 
     SessionDep = Annotated[Session, Depends(sessions)]
+
+    @router.get("/providers")
+    async def providers():
+        return {"items": list(provider_names())}
 
     @router.get("/discovery")
     async def discovery(
@@ -121,7 +262,7 @@ def create_api_router(
                     alias_match.exists(),
                 )
             )
-        valid_sources = sorted(set(source).intersection({"asura", "mangafire", "kingofshojo"}))
+        valid_sources = sorted(set(source).intersection(provider_names()))
         if valid_sources:
             query = query.where(
                 select(CatalogSourceSeries.id)
@@ -176,9 +317,18 @@ def create_api_router(
         if q.strip():
             term = f"%{q.strip()}%"
             query = query.where(
-                or_(CatalogSeries.title.ilike(term), CatalogSeries.description.ilike(term))
+                or_(
+                    CatalogSeries.title.ilike(term),
+                    CatalogSeries.description.ilike(term),
+                    select(CatalogSeriesAlias.id)
+                    .where(
+                        CatalogSeriesAlias.series_id == CatalogSeries.id,
+                        CatalogSeriesAlias.display_value.ilike(term),
+                    )
+                    .exists(),
+                )
             )
-        valid_sources = sorted(set(source).intersection({"asura", "mangafire", "kingofshojo"}))
+        valid_sources = sorted(set(source).intersection(provider_names()))
         if valid_sources:
             query = query.where(
                 select(CatalogSourceSeries.id)
@@ -225,15 +375,14 @@ def create_api_router(
                 coordinator.track(session, row.id)
             else:
                 coordinator.untrack(session, row.id)
-            if row.kavita_series_id is not None:
-                JobQueue().enqueue(
-                    session,
-                    kind=JobKind.KAVITA_SYNC,
-                    dedupe_key=f"series:{row.id}",
-                    payload=KavitaSyncPayload(series_id=row.id),
-                    priority=10,
-                    series_key=str(row.id),
-                )
+            JobQueue().enqueue(
+                session,
+                kind=JobKind.LIBRARY_REPAIR,
+                dedupe_key=f"series:{row.id}:tracking",
+                payload=LibraryRepairPayload(series_id=row.id, reason="tracking"),
+                priority=75,
+                series_key=str(row.id),
+            )
         return {
             "item": serialize_series(session, [row], include_progress=True)[0],
             "previous": previous,
@@ -371,19 +520,18 @@ def create_api_router(
         cursor: int = Query(default=0, ge=0),
         limit: int = Query(default=24, ge=1, le=100),
     ):
-        left = aliased(CatalogSourceSeries)
-        right = aliased(CatalogSourceSeries)
-        query = (
-            select(CatalogMatchDecision, left, right)
-            .join(left, left.id == CatalogMatchDecision.left_source_series_id)
-            .join(right, right.id == CatalogMatchDecision.right_source_series_id)
-            .where(CatalogMatchDecision.decision == "pending")
-        )
+        with session.begin():
+            proposals = pending_match_proposals(session)
         if cursor:
-            query = query.where(CatalogMatchDecision.id > cursor)
-        rows = session.execute(query.order_by(CatalogMatchDecision.id).limit(limit)).all()
+            start = next(
+                (index + 1 for index, value in enumerate(proposals) if value["id"] == cursor),
+                len(proposals),
+            )
+        else:
+            start = 0
+        rows = proposals[start : start + limit]
         canonical_ids = {
-            source.series_id for _, left_row, right_row in rows for source in (left_row, right_row)
+            source.series_id for row in rows for source in (row["left"], row["right"])
         }
         canonical = {
             item["id"]: item
@@ -397,26 +545,240 @@ def create_api_router(
         return {
             "items": [
                 {
-                    "id": decision.id,
-                    "confidence": decision.confidence,
-                    "evidence": human_evidence(decision.evidence_json),
+                    "id": row["id"],
+                    "decision_ids": row["decision_ids"],
+                    "confidence": row["decision"].confidence,
+                    "evidence": human_evidence(row["decision"].evidence_json),
+                    "blocked_reasons": proposal_blockers(session, row["series_ids"]),
                     "left": {
-                        **canonical[left_row.series_id],
-                        "source_title": left_row.title,
-                        "source": left_row.source,
-                        "url": left_row.url,
+                        **canonical[row["left"].series_id],
+                        "source_title": row["left"].title,
+                        "source": row["left"].source,
+                        "url": row["left"].url,
+                        "latest_chapter": provider_latest_chapter(session, row["left"].id),
                     },
                     "right": {
-                        **canonical[right_row.series_id],
-                        "source_title": right_row.title,
-                        "source": right_row.source,
-                        "url": right_row.url,
+                        **canonical[row["right"].series_id],
+                        "source_title": row["right"].title,
+                        "source": row["right"].source,
+                        "url": row["right"].url,
+                        "latest_chapter": provider_latest_chapter(session, row["right"].id),
                     },
                 }
-                for decision, left_row, right_row in rows
+                for row in rows
             ],
-            "next_cursor": rows[-1][0].id if len(rows) == limit else None,
+            "next_cursor": rows[-1]["id"] if len(rows) == limit else None,
+            "total": len(proposals),
         }
+
+    @router.get("/merge-candidates")
+    async def merge_candidates(
+        session: SessionDep,
+        selected_id: list[int] = Query(default=[]),
+        anchor_id: int | None = Query(default=None, gt=0),
+        q: str = Query(default="", max_length=200),
+        source: list[str] = Query(default=[]),
+        cursor: int = Query(default=0, ge=0),
+        limit: int = Query(default=24, ge=1, le=100),
+    ):
+        selected_ids = sorted(set(selected_id or ([anchor_id] if anchor_id else [])))
+        if not selected_ids:
+            raise HTTPException(422, "select at least one manga")
+        if len(selected_ids) > len(provider_names()):
+            raise HTTPException(422, f"select at most {len(provider_names())} manga")
+        selected_rows = session.scalars(
+            select(CatalogSeries).where(CatalogSeries.id.in_(selected_ids))
+        ).all()
+        if len(selected_rows) != len(selected_ids) or any(
+            row.status not in TRACKED_STATES for row in selected_rows
+        ):
+            raise HTTPException(404, "selected manga is not in the library")
+        query = select(CatalogSeries).where(
+            CatalogSeries.id.not_in(selected_ids), CatalogSeries.status.in_(TRACKED_STATES)
+        )
+        if q.strip():
+            term = f"%{q.strip()}%"
+            query = query.where(
+                or_(
+                    CatalogSeries.title.ilike(term),
+                    CatalogSeries.description.ilike(term),
+                    select(CatalogSeriesAlias.id)
+                    .where(
+                        CatalogSeriesAlias.series_id == CatalogSeries.id,
+                        CatalogSeriesAlias.display_value.ilike(term),
+                    )
+                    .exists(),
+                )
+            )
+        wanted_sources = set(source).intersection(provider_names())
+        if wanted_sources:
+            query = query.where(
+                select(CatalogSourceSeries.id)
+                .where(
+                    CatalogSourceSeries.series_id == CatalogSeries.id,
+                    CatalogSourceSeries.source.in_(wanted_sources),
+                )
+                .exists()
+            )
+        rows = session.scalars(query).all()
+
+        identity_rows = session.scalars(
+            select(CatalogSourceSeries).where(
+                CatalogSourceSeries.series_id.in_([*selected_ids, *[row.id for row in rows]])
+            )
+        ).all()
+        identity_to_series = {identity.id: identity.series_id for identity in identity_rows}
+        identities_by_series: dict[int, list[CatalogSourceSeries]] = defaultdict(list)
+        for identity in identity_rows:
+            identities_by_series[identity.series_id].append(identity)
+        identity_ids = set(identity_to_series)
+        chapter_numbers: dict[int, set[str]] = defaultdict(set)
+        if identity_ids:
+            for identity_id, number in session.execute(
+                select(
+                    CatalogChapterRelease.source_series_id,
+                    CatalogChapter.canonical_number,
+                )
+                .join(CatalogChapter, CatalogChapter.id == CatalogChapterRelease.chapter_id)
+                .where(CatalogChapterRelease.source_series_id.in_(identity_ids))
+            ):
+                chapter_numbers[identity_id].add(number)
+
+        occupied = {
+            identity.source
+            for selected in selected_ids
+            for identity in identities_by_series[selected]
+        }
+        configured_providers = set(provider_names())
+
+        def candidate_conflicts(candidate_id: int) -> list[str]:
+            candidate_sources = {row.source for row in identities_by_series[candidate_id]}
+            conflicts = occupied & candidate_sources
+            if configured_providers and configured_providers.issubset(candidate_sources):
+                conflicts.add("all configured providers already present")
+            return sorted(conflicts)
+
+        scores: dict[int, float] = {}
+        if identity_ids:
+            for decision in session.scalars(
+                select(CatalogMatchDecision).where(
+                    CatalogMatchDecision.left_source_series_id.in_(identity_ids),
+                    CatalogMatchDecision.right_source_series_id.in_(identity_ids),
+                    CatalogMatchDecision.decision != "rejected",
+                )
+            ):
+                left_series = identity_to_series.get(decision.left_source_series_id)
+                right_series = identity_to_series.get(decision.right_source_series_id)
+                if not set(selected_ids).intersection({left_series, right_series}):
+                    continue
+                candidate_id = right_series if left_series in selected_ids else left_series
+                if candidate_id:
+                    scores[candidate_id] = max(scores.get(candidate_id, 0), decision.confidence)
+        evidence = {
+            row.id: strongest_candidate_score(session, selected_ids, row.id) for row in rows
+        }
+        eligible = [row for row in rows if not candidate_conflicts(row.id)]
+        ranked = sorted(
+            eligible,
+            key=lambda row: (
+                -max(scores.get(row.id, 0), float(evidence[row.id]["score"])),
+                row.normalized_title,
+                row.id,
+            ),
+        )
+        page = ranked[cursor : cursor + limit]
+        summaries = serialize_series(session, page, include_progress=True)
+        by_id = {item["id"]: item for item in summaries}
+        items = []
+        for row in page:
+            score = max(scores.get(row.id, 0), float(evidence[row.id]["score"]))
+            conflicts = candidate_conflicts(row.id)
+            items.append(
+                {
+                    **by_id[row.id],
+                    "similarity": score,
+                    "compatible": not conflicts,
+                    "conflicting_sources": conflicts,
+                    "score_breakdown": evidence[row.id],
+                }
+            )
+        next_cursor = cursor + len(page) if cursor + len(page) < len(ranked) else None
+        return {"items": items, "next_cursor": next_cursor}
+
+    @router.post("/series/merge-preview")
+    async def preview_series_merge(change: MergeSeriesChange, session: SessionDep):
+        ids = sorted(set(change.series_ids))
+        provider_count = len(provider_names())
+        if not 2 <= len(ids) <= provider_count:
+            raise HTTPException(422, f"select two to {provider_count} manga")
+        rows = session.scalars(select(CatalogSeries).where(CatalogSeries.id.in_(ids))).all()
+        if len(rows) != len(ids):
+            raise HTTPException(404, "one or more manga no longer exist")
+        if any(row.status not in TRACKED_STATES for row in rows):
+            raise HTTPException(422, "manual merges are limited to manga in the library")
+        source_rows = session.execute(
+            select(CatalogSourceSeries.series_id, CatalogSourceSeries.source).where(
+                CatalogSourceSeries.series_id.in_(ids)
+            )
+        ).all()
+        providers: dict[int, set[str]] = defaultdict(set)
+        for series_id, provider in source_rows:
+            providers[series_id].add(provider)
+        conflicts = provider_merge_conflicts(session, ids)
+        priority = {name: len(SOURCE_PRIORITY) - index for index, name in enumerate(SOURCE_PRIORITY)}
+        target = max(
+            rows,
+            key=lambda row: (
+                max((priority.get(value, 0) for value in providers[row.id]), default=0),
+                int(bool(row.cover_url)) + int(bool(row.description)),
+                session.scalar(
+                    select(func.count())
+                    .select_from(CatalogChapter)
+                    .where(CatalogChapter.series_id == row.id)
+                )
+                or 0,
+                row.id * -1,
+            ),
+        )
+        return {
+            "target_id": target.id,
+            "target_title": target.title,
+            "items": serialize_series(session, rows, include_progress=True),
+            "conflicting_sources": conflicts,
+            "can_merge": not conflicts,
+        }
+
+    @router.post("/series/merge")
+    async def merge_series(change: MergeSeriesChange, session: SessionDep):
+        if change.confirmation != "MERGE":
+            raise HTTPException(422, "MERGE confirmation required")
+        from manga_manager.web.app import merge_canonical_series
+
+        with session.begin():
+            ids = sorted(set(change.series_ids))
+            rows = session.scalars(select(CatalogSeries).where(CatalogSeries.id.in_(ids))).all()
+            if len(rows) != len(ids):
+                raise HTTPException(404, "one or more manga no longer exist")
+            if any(row.status not in TRACKED_STATES for row in rows):
+                raise HTTPException(422, "manual merges are limited to manga in the library")
+            identities = session.scalars(
+                select(CatalogSourceSeries).where(
+                    CatalogSourceSeries.series_id.in_(set(change.series_ids))
+                )
+            ).all()
+            for index, left in enumerate(identities):
+                for right in identities[index + 1 :]:
+                    if left.series_id == right.series_id or left.source == right.source:
+                        continue
+                    record_training_label(
+                        session,
+                        left_source_series_id=left.id,
+                        right_source_series_id=right.id,
+                        label=1,
+                        origin="manual_merge",
+                    )
+            target_id = merge_canonical_series(session, change.series_ids)
+        return {"target_id": target_id, "merged_ids": sorted(set(change.series_ids))}
 
     @router.post("/matches/{decision_id}")
     async def decide_match(decision_id: int, change: MatchChange, session: SessionDep):
@@ -424,46 +786,111 @@ def create_api_router(
             raise HTTPException(422, "invalid match decision")
         if change.decision == "accepted" and change.confirmation != "MERGE":
             raise HTTPException(422, "MERGE confirmation required")
-        from manga_manager.web.app import merge_match_groups
+        from manga_manager.web.app import merge_canonical_series
 
         with session.begin():
-            decision = session.get(CatalogMatchDecision, decision_id)
-            if decision is None:
+            proposal = next(
+                (row for row in pending_match_proposals(session) if row["id"] == decision_id),
+                None,
+            )
+            if proposal is None:
                 raise HTTPException(404, "match not found")
+            blockers = proposal_blockers(session, proposal["series_ids"])
+            if change.decision == "accepted" and blockers:
+                raise HTTPException(409, "; ".join(blockers))
+            decisions = session.scalars(
+                select(CatalogMatchDecision).where(
+                    CatalogMatchDecision.id.in_(proposal["decision_ids"])
+                )
+            ).all()
+            for decision in decisions:
+                record_training_label(
+                    session,
+                    left_source_series_id=decision.left_source_series_id,
+                    right_source_series_id=decision.right_source_series_id,
+                    label=int(change.decision == "accepted"),
+                    origin="suggested_review",
+                    decision=decision,
+                )
+                decision.decision = change.decision
+                decision.decided_by = "operator"
+                decision.decided_at = utcnow()
             if change.decision == "accepted":
-                merge_match_groups(session, decision)
-            decision.decision = change.decision
-            decision.decided_by = "operator"
-            decision.decided_at = utcnow()
+                merge_canonical_series(session, proposal["series_ids"])
         return {"id": decision_id, "decision": change.decision}
+
+    @router.post("/match-batch/preview")
+    async def preview_match_batch(change: BatchMatchChange, session: SessionDep):
+        with session.begin():
+            proposals = pending_match_proposals(session)
+        selected = proposals if change.entire_queue else [
+            row for row in proposals if row["id"] in set(change.ids)
+        ]
+        items = [
+            {
+                "id": row["id"],
+                "blocked_reasons": proposal_blockers(session, row["series_ids"]),
+            }
+            for row in selected
+        ]
+        return {
+            "selected": len(items),
+            "eligible": sum(not row["blocked_reasons"] for row in items),
+            "blocked": sum(bool(row["blocked_reasons"]) for row in items),
+            "items": items,
+        }
 
     @router.post("/match-batch")
     async def decide_match_batch(change: BatchMatchChange, session: SessionDep):
-        if not change.ids or change.decision not in {"accepted", "rejected"}:
+        if (not change.ids and not change.entire_queue) or change.decision not in {"accepted", "rejected"}:
             raise HTTPException(422, "select matches and a valid decision")
         if change.decision == "accepted" and change.confirmation != "MERGE":
             raise HTTPException(422, "MERGE confirmation required")
-        from manga_manager.web.app import merge_match_groups
+        from manga_manager.web.app import merge_canonical_series
 
         with session.begin():
-            rows = session.scalars(
-                select(CatalogMatchDecision)
-                .where(
-                    CatalogMatchDecision.id.in_(set(change.ids)),
-                    CatalogMatchDecision.decision == "pending",
+            proposals = pending_match_proposals(session)
+            selected = proposals if change.entire_queue else [
+                row for row in proposals if row["id"] in set(change.ids)
+            ]
+            applied: list[int] = []
+            blocked: list[dict[str, Any]] = []
+            components = connected_proposal_components(selected)
+            for component in components:
+                reasons = (
+                    proposal_blockers(session, component["series_ids"])
+                    if change.decision == "accepted" else []
                 )
-                .order_by(CatalogMatchDecision.id)
-            ).all()
-            if len(rows) != len(set(change.ids)):
-                raise HTTPException(409, "one or more matches are no longer pending")
-            if change.decision == "accepted":
+                if reasons:
+                    blocked.extend(
+                        {"id": proposal["id"], "reasons": reasons}
+                        for proposal in component["proposals"]
+                    )
+                    continue
+                decision_ids = {
+                    decision_id
+                    for proposal in component["proposals"]
+                    for decision_id in proposal["decision_ids"]
+                }
+                rows = session.scalars(
+                    select(CatalogMatchDecision).where(CatalogMatchDecision.id.in_(decision_ids))
+                ).all()
                 for row in rows:
-                    merge_match_groups(session, row)
-            for row in rows:
-                row.decision = change.decision
-                row.decided_by = "operator"
-                row.decided_at = utcnow()
-        return {"ids": change.ids, "decision": change.decision}
+                    record_training_label(
+                        session,
+                        left_source_series_id=row.left_source_series_id,
+                        right_source_series_id=row.right_source_series_id,
+                        label=int(change.decision == "accepted"),
+                        origin="batch_review",
+                        decision=row,
+                    )
+                    row.decision = change.decision
+                    row.decided_by = "operator"
+                    row.decided_at = utcnow()
+                if change.decision == "accepted":
+                    merge_canonical_series(session, component["series_ids"])
+                applied.extend(proposal["id"] for proposal in component["proposals"])
+        return {"ids": applied, "blocked": blocked, "decision": change.decision}
 
     @router.get("/jobs")
     async def jobs(
@@ -482,6 +909,202 @@ def create_api_router(
             "items": serialize_jobs(session, rows),
             "next_cursor": rows[-1].id if len(rows) == limit else None,
         }
+
+    @router.get("/workload-cycle")
+    async def workload_cycle(session: SessionDep):
+        cycle = session.scalar(
+            select(WorkloadCycle).order_by(
+                (WorkloadCycle.status == "active").desc(), WorkloadCycle.id.desc()
+            ).limit(1)
+        )
+        if cycle is None:
+            return {"id": None, "status": "settled", "total": 0, "successful": 0,
+                    "failed": 0, "cancelled": 0, "remaining": 0, "added": 0}
+        settled = cycle.successful_units + cycle.failed_units + cycle.cancelled_units
+        return {
+            "id": cycle.id,
+            "status": cycle.status,
+            "total": cycle.total_units,
+            "successful": cycle.successful_units,
+            "failed": cycle.failed_units,
+            "cancelled": cycle.cancelled_units,
+            "remaining": max(cycle.total_units - settled, 0),
+            "added": cycle.added_units,
+            "started_at": cycle.started_at.isoformat(),
+            "updated_at": cycle.updated_at.isoformat(),
+        }
+
+    @router.get("/job-groups")
+    async def job_groups(
+        session: SessionDep,
+        state: list[str] = Query(default=[]),
+        cursor: str = Query(default="", max_length=200),
+        limit: int = Query(default=20, ge=1, le=50),
+    ):
+        key = func.coalesce(
+            func.nullif(WorkJob.group_key, ""),
+            WorkJob.kind + ":" + func.cast(WorkJob.id, String),
+        ).label("group_key")
+        running = func.sum(case((WorkJob.status == "leased", 1), else_=0)).label("running")
+        succeeded = func.sum(case((WorkJob.status == "succeeded", 1), else_=0)).label(
+            "succeeded"
+        )
+        failed = func.sum(case((WorkJob.status == "failed", 1), else_=0)).label("failed")
+        cancelled = func.sum(case((WorkJob.status == "cancelled", 1), else_=0)).label(
+            "cancelled"
+        )
+        queued = func.sum(case((WorkJob.status == "queued", 1), else_=0)).label("queued")
+        retrying = func.sum(case((WorkJob.status == "retry_wait", 1), else_=0)).label(
+            "retry_wait"
+        )
+        priority = func.min(WorkJob.priority)
+        available_at = func.min(WorkJob.available_at)
+        last_id = func.max(WorkJob.id)
+        query = select(
+            key,
+            last_id.label("last_id"),
+            func.count().label("task_count"),
+            running,
+            succeeded,
+            failed,
+            cancelled,
+            queued,
+            retrying,
+            priority.label("priority"),
+            available_at.label("available_at"),
+        )
+        if state:
+            query = query.where(WorkJob.status.in_(state))
+        query = query.group_by(key)
+        if cursor:
+            cursor_running, cursor_priority, cursor_available, cursor_id = decode_job_cursor(cursor)
+            query = query.having(or_(
+                running < cursor_running,
+                and_(running == cursor_running, priority > cursor_priority),
+                and_(running == cursor_running, priority == cursor_priority,
+                     available_at > cursor_available),
+                and_(running == cursor_running, priority == cursor_priority,
+                     available_at == cursor_available, last_id < cursor_id),
+            ))
+        rows = session.execute(
+            query.order_by(running.desc(), priority, available_at, last_id.desc()).limit(limit)
+        ).all()
+        items = []
+        for row in rows:
+            child_query = select(WorkJob).where(
+                func.coalesce(
+                    func.nullif(WorkJob.group_key, ""),
+                    WorkJob.kind + ":" + func.cast(WorkJob.id, String),
+                ) == row.group_key
+            )
+            if state:
+                child_query = child_query.where(WorkJob.status.in_(state))
+            representative = session.scalar(
+                child_query.order_by(
+                    (WorkJob.status == "leased").desc(),
+                    WorkJob.priority, WorkJob.available_at, WorkJob.id,
+                ).limit(1)
+            )
+            if representative is None:
+                continue
+            status_counts = {
+                key: int(value or 0)
+                for key, value in {
+                    "leased": row.running,
+                    "succeeded": row.succeeded,
+                    "failed": row.failed,
+                    "cancelled": row.cancelled,
+                    "queued": row.queued,
+                    "retry_wait": row.retry_wait,
+                }.items()
+                if value
+            }
+            serialized = serialize_jobs(session, [representative])[0]
+            is_pull_group = representative.kind in {"source_pull", "source_refresh"}
+            total = int(row.task_count)
+            done = sum(status_counts.get(value, 0) for value in ("succeeded", "failed", "cancelled"))
+            successful = status_counts.get("succeeded", 0)
+            failed_count = status_counts.get("failed", 0)
+            cancelled_count = status_counts.get("cancelled", 0)
+            active_view = not state or bool(set(state).intersection(ACTIVE_JOB_STATES))
+            if active_view and (
+                ":download:" in row.group_key or row.group_key.startswith("download:")
+            ):
+                try:
+                    plan = session.get(SeriesDownloadPlan, int(row.group_key.rsplit(":", 1)[1]))
+                except ValueError:
+                    plan = None
+                if plan is not None:
+                    total = plan.total_chapters
+                    done = plan.satisfied_chapters + plan.attention_chapters
+                    successful = plan.satisfied_chapters
+                    failed_count = plan.attention_chapters
+                    cancelled_count = 0
+            items.append({
+                "key": row.group_key,
+                "kind": "source_pull" if is_pull_group else representative.kind,
+                "source": representative.source,
+                "title": (
+                    f"{representative.source.replace('_', ' ').title()} catalog pull"
+                    if is_pull_group
+                    else serialized["context"].get("title") or serialized["description"]
+                ),
+                "cover_url": serialized["context"].get("cover_url", ""),
+                "task_count": row.task_count,
+                "status_counts": status_counts,
+                "progress": {"current": done, "total": total,
+                             "percent": round(done * 100 / total) if total else None,
+                             "successful": successful,
+                             "failed": failed_count,
+                             "cancelled": cancelled_count},
+                "representative": serialized,
+                "single": row.task_count == 1,
+            })
+        next_cursor = (
+            encode_job_cursor(
+                int(rows[-1].running or 0), rows[-1].priority,
+                rows[-1].available_at, rows[-1].last_id,
+            )
+            if len(rows) == limit else None
+        )
+        return {"items": items, "next_cursor": next_cursor}
+
+    @router.get("/job-groups/{group_key:path}/children")
+    async def job_group_children(
+        group_key: str,
+        session: SessionDep,
+        state: list[str] = Query(default=[]),
+        cursor: str = Query(default="", max_length=200),
+        limit: int = Query(default=30, ge=1, le=100),
+    ):
+        query = select(WorkJob).where(WorkJob.group_key == group_key)
+        if state:
+            query = query.where(WorkJob.status.in_(state))
+        if cursor:
+            running, priority, available, job_id = decode_job_cursor(cursor)
+            is_running = case((WorkJob.status == "leased", 1), else_=0)
+            query = query.where(or_(
+                is_running < running,
+                and_(is_running == running, WorkJob.priority > priority),
+                and_(is_running == running, WorkJob.priority == priority,
+                     WorkJob.available_at > available),
+                and_(is_running == running, WorkJob.priority == priority,
+                     WorkJob.available_at == available, WorkJob.id > job_id),
+            ))
+        rows = session.scalars(
+            query.order_by(
+                (WorkJob.status == "leased").desc(), WorkJob.priority,
+                WorkJob.available_at, WorkJob.id,
+            ).limit(limit)
+        ).all()
+        next_cursor = (
+            encode_job_cursor(
+                int(rows[-1].status == "leased"), rows[-1].priority,
+                rows[-1].available_at, rows[-1].id,
+            )
+            if len(rows) == limit else None
+        )
+        return {"items": serialize_jobs(session, rows), "next_cursor": next_cursor}
 
     @router.get("/activity")
     async def activity(
@@ -523,6 +1146,18 @@ def create_api_router(
         counts = dict(
             session.execute(select(WorkJob.status, func.count()).group_by(WorkJob.status)).all()
         )
+        active_group_key = func.coalesce(
+            func.nullif(WorkJob.group_key, ""),
+            WorkJob.kind + ":" + func.cast(WorkJob.id, String),
+        )
+        active_groups = int(
+            session.scalar(
+                select(func.count(func.distinct(active_group_key))).where(
+                    WorkJob.status.in_(ACTIVE_JOB_STATES)
+                )
+            )
+            or 0
+        )
         sources = session.scalars(
             select(CatalogSourceState).order_by(CatalogSourceState.source)
         ).all()
@@ -553,9 +1188,12 @@ def create_api_router(
                 ProviderEndpointState.source, ProviderEndpointState.traffic_class
             )
         ).all()
-        kavita = configured_kavita_client(local_library_root=settings.storage_root / "library")
+        kavita = configured_kavita_client(
+            local_library_root=settings.storage_root / "kavita-library"
+        )
         return {
             "job_counts": counts,
+            "active_groups": active_groups,
             "health": {
                 "series": session.scalar(select(func.count()).select_from(CatalogSeries)) or 0,
                 "chapters": session.scalar(select(func.count()).select_from(CatalogChapter)) or 0,
@@ -656,7 +1294,7 @@ def create_api_router(
 
     @router.post("/sources/{source}/pull")
     async def pull_source(source: str, session: SessionDep):
-        if source not in {"asura", "mangafire", "kingofshojo"}:
+        if source not in provider_names():
             raise HTTPException(422, "invalid source")
         with session.begin():
             job, _created = JobQueue().enqueue(
@@ -677,6 +1315,7 @@ def create_api_router(
                 dedupe_key="operations-probe",
                 payload=MaintenancePayload(action="stage_probe"),
                 priority=1,
+                pool="health",
             )
         return {"job": serialize_jobs(session, [job])[0]}
 
@@ -692,15 +1331,19 @@ def create_api_router(
             job = session.get(WorkJob, job_id)
             if job is None or job.status not in {"failed", "cancelled"}:
                 raise HTTPException(409, "job cannot be retried")
-            job.status = "queued"
-            job.max_attempts = max(job.max_attempts, job.attempts + 3)
-            job.available_at = utcnow()
-            job.lease_owner = ""
-            job.lease_expires_at = None
-            job.error_code = ""
-            job.error_message = ""
-            job.completed_at = None
-            job.updated_at = utcnow()
+            job, _created = JobQueue().enqueue(
+                session,
+                kind=JobKind(job.kind),
+                dedupe_key=job.dedupe_key,
+                payload=job.payload,
+                priority=job.priority,
+                max_attempts=max(job.max_attempts, 3),
+                source=job.source,
+                series_key=job.series_key,
+                pool=job.pool,
+                workflow_key=job.workflow_key,
+                group_key=job.group_key,
+            )
         return {"job": serialize_jobs(session, [job])[0]}
 
     @router.get("/events")
@@ -833,6 +1476,29 @@ def serialize_jobs(session: Session, rows: list[WorkJob]) -> list[dict[str, Any]
     result = []
     for row in rows:
         context: dict[str, Any] = {}
+        queue_position = None
+        if row.status in {"queued", "retry_wait"}:
+            queue_position = 1 + int(
+                session.scalar(
+                    select(func.count()).select_from(WorkJob).where(
+                        WorkJob.pool == row.pool,
+                        WorkJob.status.in_(("queued", "retry_wait")),
+                        or_(
+                            WorkJob.priority < row.priority,
+                            and_(
+                                WorkJob.priority == row.priority,
+                                WorkJob.available_at < row.available_at,
+                            ),
+                            and_(
+                                WorkJob.priority == row.priority,
+                                WorkJob.available_at == row.available_at,
+                                WorkJob.id < row.id,
+                            ),
+                        ),
+                    )
+                )
+                or 0
+            )
         if row.kind == "chapter_download":
             context = chapter_context.get(int(row.payload.get("chapter_release_id", 0)), {})
             description = f"Download {context.get('title', 'chapter')} · Chapter {context.get('chapter', '?')}"
@@ -844,6 +1510,10 @@ def serialize_jobs(session: Session, rows: list[WorkJob]) -> list[dict[str, Any]
             description = f"Refresh {row.payload.get('title', 'source series')}"
         elif row.kind == "kavita_sync":
             description = "Synchronize downloaded manga with Kavita"
+        elif row.kind == "library_repair":
+            description = f"Normalize library metadata · series #{row.payload.get('series_id', '?')}"
+        elif row.kind == "cover_backfill":
+            description = f"Build cover evidence · source series #{row.payload.get('source_series_id', '?')}"
         elif row.kind == "maintenance":
             description = "Run storage and database health probe"
         else:
@@ -855,7 +1525,11 @@ def serialize_jobs(session: Session, rows: list[WorkJob]) -> list[dict[str, Any]
                 "description": description,
                 "source": row.source,
                 "pool": row.pool,
+                "cycle_id": row.cycle_id,
+                "workflow_key": row.workflow_key,
+                "group_key": row.group_key,
                 "status": row.status,
+                "queue_position": queue_position,
                 "attempt": row.attempts,
                 "max_attempts": row.max_attempts,
                 "error_code": row.error_code,
@@ -901,9 +1575,14 @@ def human_evidence(raw: dict[str, Any] | None) -> list[dict[str, str]]:
     if data.get("shared_external_id") or data.get("external_id"):
         labels.append({"tone": "positive", "label": "Shared external ID"})
     if data.get("cover_match") is True:
-        labels.append({"tone": "positive", "label": "Cover match"})
+        raw_inliers = data.get("cover_inliers")
+        inliers = int(raw_inliers) if isinstance(raw_inliers, (int, float)) else 0
+        label = f"Visual cover match · {inliers} aligned features" if inliers else "Cover match"
+        labels.append({"tone": "positive", "label": label})
     elif data.get("cover_compared") and data.get("cover_match") is False:
-        labels.append({"tone": "warning", "label": "Cover mismatch"})
+        labels.append({"tone": "warning", "label": "Cover evidence inconclusive"})
+    elif data.get("cover_signature_invalid"):
+        labels.append({"tone": "warning", "label": "Cover signature needs refresh"})
     if data.get("title_or_alias") or data.get("title_match"):
         labels.append({"tone": "positive", "label": "Strong title or alias match"})
     if data.get("chapter_fingerprint"):
@@ -915,6 +1594,18 @@ def human_evidence(raw: dict[str, Any] | None) -> list[dict[str, str]]:
 
 def encode_cursor(timestamp: datetime | None, row_id: int) -> str:
     return f"{timestamp.isoformat() if timestamp else 'none'}|{row_id}"
+
+
+def encode_job_cursor(running: int, priority: int, available_at: datetime, row_id: int) -> str:
+    return f"{running}|{priority}|{available_at.isoformat()}|{row_id}"
+
+
+def decode_job_cursor(value: str) -> tuple[int, int, datetime, int]:
+    try:
+        running, priority, available_at, row_id = value.split("|", 3)
+        return int(running), int(priority), datetime.fromisoformat(available_at), int(row_id)
+    except (ValueError, TypeError) as exc:
+        raise HTTPException(422, "invalid job cursor") from exc
 
 
 def decode_cursor(value: str) -> tuple[datetime | None, int]:

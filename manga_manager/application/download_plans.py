@@ -83,13 +83,19 @@ class DownloadPlanCoordinator:
         return len(series_ids)
 
     def fallback_release(
-        self, session: Session, chapter_id: int, failed_release_id: int
+        self,
+        session: Session,
+        chapter_id: int,
+        failed_release_id: int,
+        *,
+        excluded_sources: set[str] | None = None,
     ) -> CatalogChapterRelease | None:
         now = utcnow()
         rows = session.scalars(
             select(CatalogChapterRelease).where(
                 CatalogChapterRelease.chapter_id == chapter_id,
                 CatalogChapterRelease.id != failed_release_id,
+                CatalogChapterRelease.source.not_in(excluded_sources or set()),
                 (CatalogChapterRelease.downloadable_after.is_(None))
                 | (CatalogChapterRelease.downloadable_after <= now),
             )
@@ -125,37 +131,39 @@ class DownloadPlanCoordinator:
                 details_json={"fallback_release_id": alternative.id},
             )
         )
-        priority = job.priority
-        series_key = job.series_key
-        self.queue.cancel(
+        current_payload = ChapterDownloadPayload.model_validate(job.payload)
+        attempted = tuple(dict.fromkeys((*current_payload.attempted_sources, failed_release.source)))
+        replacement = ChapterDownloadPayload(
+            chapter_release_id=alternative.id,
+            attempted_sources=attempted,
+            preferred_only=current_payload.preferred_only,
+        )
+        moved = self.queue.reroute(
             session,
             job_id=job.id,
-            reason=f"rerouted to {alternative.source}: {error_code}",
-        )
-        fallback_job, _ = self.queue.enqueue(
-            session,
-            kind=JobKind.CHAPTER_DOWNLOAD,
-            dedupe_key=f"chapter:{failed_release.chapter_id}",
-            payload=ChapterDownloadPayload(chapter_release_id=alternative.id),
-            priority=priority,
+            owner=job.lease_owner,
+            payload=replacement,
             source=alternative.source,
-            series_key=series_key,
-            max_attempts=3,
+            available_at=utcnow(),
+            message=f"rerouted to {alternative.source}: {error_code}",
+            details={"failed_source": failed_release.source, "attempted_sources": attempted},
         )
+        if not moved:
+            raise RuntimeError("chapter lease was lost while rerouting")
         intent = session.scalar(
             select(ChapterDownloadIntent).where(
                 ChapterDownloadIntent.chapter_id == failed_release.chapter_id
             )
         )
         if intent is not None:
-            intent.job_id = fallback_job.id
+            intent.job_id = job.id
             intent.state = "queued"
             intent.updated_at = utcnow()
         session.add(
             ChapterReleaseAttempt(
                 chapter_id=alternative.chapter_id,
                 chapter_release_id=alternative.id,
-                job_id=fallback_job.id,
+                job_id=job.id,
                 source=alternative.source,
                 outcome="fallback_queued",
                 details_json={
@@ -164,7 +172,7 @@ class DownloadPlanCoordinator:
                 },
             )
         )
-        return fallback_job
+        return job
 
     def bypass_cooling_source(self, session: Session, *, source: str, retry_after: datetime) -> int:
         """Move waiting chapters to another provider while one provider is cooling down."""
@@ -183,28 +191,36 @@ class DownloadPlanCoordinator:
             failed_release = session.get(CatalogChapterRelease, release_id)
             if failed_release is None:
                 continue
+            payload = ChapterDownloadPayload.model_validate(job.payload)
+            if payload.preferred_only:
+                job.status = "retry_wait"
+                job.available_at = retry_after
+                failed_release.downloadable_after = retry_after
+                continue
+            attempted = set(payload.attempted_sources) | {source}
             alternative = self.fallback_release(
-                session, failed_release.chapter_id, failed_release.id
+                session,
+                failed_release.chapter_id,
+                failed_release.id,
+                excluded_sources=attempted,
             )
             if alternative is None:
                 failed_release.downloadable_after = retry_after
+                job.status = "retry_wait"
+                job.available_at = retry_after
                 continue
-            priority = job.priority
-            series_key = job.series_key
-            self.queue.cancel(
+            replacement = ChapterDownloadPayload(
+                chapter_release_id=alternative.id,
+                attempted_sources=tuple(sorted(attempted)),
+            )
+            self.queue.reroute_waiting(
                 session,
                 job_id=job.id,
-                reason=f"bypassed while {source} is cooling down",
-            )
-            fallback_job, _ = self.queue.enqueue(
-                session,
-                kind=JobKind.CHAPTER_DOWNLOAD,
-                dedupe_key=f"chapter:{failed_release.chapter_id}",
-                payload=ChapterDownloadPayload(chapter_release_id=alternative.id),
-                priority=priority,
+                payload=replacement,
                 source=alternative.source,
-                series_key=series_key,
-                max_attempts=3,
+                available_at=utcnow(),
+                message=f"bypassed while {source} is cooling down",
+                details={"attempted_sources": sorted(attempted)},
             )
             intent = session.scalar(
                 select(ChapterDownloadIntent).where(
@@ -212,14 +228,14 @@ class DownloadPlanCoordinator:
                 )
             )
             if intent is not None:
-                intent.job_id = fallback_job.id
+                intent.job_id = job.id
                 intent.state = "queued"
                 intent.updated_at = utcnow()
             session.add(
                 ChapterReleaseAttempt(
                     chapter_id=alternative.chapter_id,
                     chapter_release_id=alternative.id,
-                    job_id=fallback_job.id,
+                    job_id=job.id,
                     source=alternative.source,
                     outcome="fallback_queued",
                     retry_after=retry_after,
@@ -260,7 +276,10 @@ class DownloadPlanCoordinator:
                 session,
                 kind=JobKind.CHAPTER_DOWNLOAD,
                 dedupe_key=f"upgrade:{artifact.chapter_id}:{release.id}",
-                payload=ChapterDownloadPayload(chapter_release_id=release.id),
+                payload=ChapterDownloadPayload(
+                    chapter_release_id=release.id,
+                    preferred_only=True,
+                ),
                 priority=250,
                 source=release.source,
                 series_key=str(chapter.series_id),

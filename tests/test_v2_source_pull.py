@@ -281,6 +281,101 @@ def test_shared_external_id_never_adds_second_identity_from_same_provider(
         assert first.series_id != second.series_id
 
 
+def test_asura_ingest_uses_global_revision_without_persisting_an_override(
+    sessions: TrackingSessionFactory,
+) -> None:
+    repository = CatalogRepository()
+    with sessions() as session, session.begin():
+        row = repository.ingest(
+            session,
+            SeriesItem(
+                "asura", "comics/painter", "Painter",
+                "https://asurascans.com/comics/painter-1d35e5bd",
+                metadata={"asura_revision": "1d35e5bd"},
+            ),
+            [],
+        )
+        assert row.source_id == "comics/painter"
+        assert row.normalized_source_id == "comics/painter"
+        assert row.revision_override == ""
+
+
+def test_asura_ingest_retains_only_explicit_per_series_revision_override(
+    sessions: TrackingSessionFactory,
+) -> None:
+    with sessions() as session, session.begin():
+        row = CatalogRepository().ingest(
+            session,
+            SeriesItem(
+                "asura", "comics/exception", "Exception",
+                "https://asurascans.com/comics/exception-deadbeef",
+                metadata={
+                    "asura_revision": "deadbeef",
+                    "asura_revision_override": "deadbeef",
+                },
+            ),
+            [],
+        )
+        assert row.revision_override == "deadbeef"
+
+
+def test_asura_revision_requires_three_distinct_series_for_global_consensus(
+    sessions: TrackingSessionFactory,
+) -> None:
+    items = [
+        SeriesItem(
+            "asura", f"comics/title-{index}", f"Title {index}",
+            f"https://asurascans.com/comics/title-{index}-1d35e5bd",
+            metadata={"asura_revision": "1d35e5bd"},
+        )
+        for index in range(3)
+    ]
+    with sessions() as session, session.begin():
+        normalized = SourcePullHandler._apply_asura_revision_consensus(session, items)
+        state = session.get(CatalogSourceState, "asura")
+        assert state is not None
+        assert state.cursor_json["global_revision"] == "1d35e5bd"
+        assert all("-1d35e5bd" in row.url for row in normalized)
+        assert all("asura_revision_override" not in row.metadata for row in normalized)
+
+
+def test_asura_mixed_revision_without_consensus_uses_observed_per_series_urls(
+    sessions: TrackingSessionFactory,
+) -> None:
+    items = [
+        SeriesItem(
+            "asura", f"comics/title-{index}", f"Title {index}", "https://example/old",
+            metadata={"asura_revision": revision},
+        )
+        for index, revision in enumerate(("1d35e5bd", "1d35e5bd", "deadbeef"))
+    ]
+    with sessions() as session, session.begin():
+        normalized = SourcePullHandler._apply_asura_revision_consensus(session, items)
+        state = session.get(CatalogSourceState, "asura")
+        assert state is not None and "global_revision" not in state.cursor_json
+        assert normalized[0].url.endswith("-1d35e5bd")
+        assert normalized[2].url.endswith("-deadbeef")
+
+
+def test_undated_descending_chapters_recompute_numeric_latest(
+    sessions: TrackingSessionFactory,
+) -> None:
+    with sessions() as session, session.begin():
+        identity = CatalogRepository().ingest(
+            session,
+            SeriesItem("mangafire", "numeric", "Numeric", "https://example/numeric"),
+            [
+                ChapterItem(
+                    "mangafire", "numeric", str(number), f"Chapter {number}",
+                    f"https://example/numeric/{number}",
+                )
+                for number in range(75, 0, -1)
+            ],
+        )
+        series = session.get(CatalogSeries, identity.series_id)
+        assert series is not None and series.latest_release_number == "75"
+
+
 def test_duplicate_normalized_aliases_are_inserted_once(
     sessions: TrackingSessionFactory,
 ) -> None:

@@ -8,7 +8,12 @@ PROVIDER_ORIGINS = {
     "kingofshojo": "https://kingofshojo.com",
     "mangafire": "https://mangafire.to",
 }
-KNOWN_SOURCES = frozenset(PROVIDER_ORIGINS)
+def provider_names() -> tuple[str, ...]:
+    """Return the ordered backend provider registry used by dynamic UI slots."""
+    return tuple(PROVIDER_ORIGINS)
+
+
+KNOWN_SOURCES = provider_names()
 SOURCE_PRIORITY = ("asura", "mangafire", "kingofshojo")
 
 

@@ -12,6 +12,8 @@ class JobKind(StrEnum):
     SOURCE_REFRESH = "source_refresh"
     CHAPTER_DOWNLOAD = "chapter_download"
     KAVITA_SYNC = "kavita_sync"
+    LIBRARY_REPAIR = "library_repair"
+    COVER_BACKFILL = "cover_backfill"
     MAINTENANCE = "maintenance"
     NOTIFICATION = "notification"
 
@@ -33,9 +35,11 @@ class JobPayload(BaseModel):
 
 class SourcePullPayload(JobPayload):
     source: str = Field(min_length=1, max_length=50, pattern=r"^[a-z0-9_-]+$")
+    workflow_key: str = Field(default="", max_length=100)
 
 
 class SourceRefreshPayload(JobPayload):
+    version: int = Field(default=2, ge=1)
     source: str = Field(min_length=1, max_length=50, pattern=r"^[a-z0-9_-]+$")
     source_id: str = Field(min_length=1, max_length=500)
     title: str = Field(min_length=1, max_length=500)
@@ -47,15 +51,29 @@ class SourceRefreshPayload(JobPayload):
     popularity: float = 0
     external_ids: dict[str, str] = Field(default_factory=dict)
     metadata: dict = Field(default_factory=dict)
+    workflow_key: str = Field(default="", max_length=100)
+    observation_version: str = Field(default="", max_length=100)
 
 
 class ChapterDownloadPayload(JobPayload):
     chapter_release_id: int = Field(gt=0)
+    attempted_sources: tuple[str, ...] = ()
+    preferred_only: bool = False
+
+
+class CoverBackfillPayload(JobPayload):
+    source_series_id: int = Field(gt=0)
 
 
 class KavitaSyncPayload(JobPayload):
     series_id: int = Field(gt=0)
     folder_path: str = Field(default="", max_length=4096)
+
+
+class LibraryRepairPayload(JobPayload):
+    series_id: int = Field(gt=0)
+    reason: str = Field(default="metadata", min_length=1, max_length=100)
+    obsolete_storage_keys: tuple[str, ...] = ()
 
 
 class MaintenancePayload(JobPayload):
@@ -71,6 +89,8 @@ JOB_PAYLOAD_TYPES: dict[JobKind, type[JobPayload]] = {
     JobKind.SOURCE_REFRESH: SourceRefreshPayload,
     JobKind.CHAPTER_DOWNLOAD: ChapterDownloadPayload,
     JobKind.KAVITA_SYNC: KavitaSyncPayload,
+    JobKind.LIBRARY_REPAIR: LibraryRepairPayload,
+    JobKind.COVER_BACKFILL: CoverBackfillPayload,
     JobKind.MAINTENANCE: MaintenancePayload,
     JobKind.NOTIFICATION: NotificationPayload,
 }

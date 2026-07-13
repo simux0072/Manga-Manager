@@ -12,6 +12,7 @@ from manga_manager.domain.jobs import (
     JobKind,
     JobState,
     KavitaSyncPayload,
+    LibraryRepairPayload,
     MaintenancePayload,
     NotificationPayload,
     SourcePullPayload,
@@ -22,6 +23,7 @@ from manga_manager.infrastructure.db_models import (
     JobEvent,
     JobPermit,
     WorkJob,
+    WorkloadCycle,
 )
 from manga_manager.infrastructure.job_queue import JobQueue
 
@@ -252,6 +254,8 @@ def test_final_expired_lease_is_failed_instead_of_reclaimed(session: Session) ->
         )
         is None
     )
+    cycle = session.get(WorkloadCycle, job.cycle_id)
+    assert cycle is not None and cycle.failed_units == 1 and cycle.status == "settled"
     session.refresh(job)
     assert job.status == JobState.FAILED.value
     assert job.error_code == "lease_expired"
@@ -430,6 +434,44 @@ def test_per_series_exclusion_skips_to_other_series(session: Session) -> None:
     assert second is not None and second.series_key == "other"
 
 
+def test_library_repair_and_download_are_exclusive_for_one_series(session: Session) -> None:
+    queue = JobQueue()
+    queue.enqueue(
+        session,
+        kind=JobKind.CHAPTER_DOWNLOAD,
+        dedupe_key="release:repair-race",
+        payload=ChapterDownloadPayload(chapter_release_id=9),
+        source="mangafire",
+        series_key="same-series",
+        available_at=NOW,
+    )
+    queue.enqueue(
+        session,
+        kind=JobKind.LIBRARY_REPAIR,
+        dedupe_key="artifact:9",
+        payload=LibraryRepairPayload(series_id=9, reason="download"),
+        series_key="same-series",
+        available_at=NOW,
+    )
+    download = queue.claim(
+        session,
+        owner="download",
+        lease_for=timedelta(minutes=1),
+        now=NOW,
+        pools={"download:mangafire"},
+        pool_limits={"download:mangafire": 1, "chapter_global": 4},
+    )
+    repair = queue.claim(
+        session,
+        owner="repair",
+        lease_for=timedelta(minutes=1),
+        now=NOW,
+        pools={"maintenance"},
+    )
+    assert download is not None
+    assert repair is None
+
+
 def test_expired_permits_are_recovered_with_job_lease(session: Session) -> None:
     queue = JobQueue()
     queue.enqueue(
@@ -579,3 +621,102 @@ def test_capped_pool_does_not_block_other_pool_fairness(session: Session) -> Non
     )
     assert first is not None and first.source == "asura"
     assert second is not None and second.source == "mangafire"
+
+
+def test_workload_cycle_counts_terminal_units_and_settles(session: Session) -> None:
+    queue = JobQueue()
+    job, _ = queue.enqueue(
+        session,
+        kind=JobKind.MAINTENANCE,
+        dedupe_key="cycle:test",
+        payload=MaintenancePayload(action="stage_probe"),
+        available_at=NOW,
+    )
+    lease = queue.claim(session, owner="worker", lease_for=timedelta(minutes=1), now=NOW)
+    assert lease is not None
+    assert queue.succeed(session, job_id=job.id, owner="worker", now=NOW)
+    cycle = session.get(WorkloadCycle, job.cycle_id)
+    assert cycle is not None
+    assert (cycle.total_units, cycle.successful_units, cycle.status) == (1, 1, "settled")
+
+
+def test_refresh_enqueue_coalesces_without_growing_queue(session: Session) -> None:
+    from manga_manager.domain.jobs import SourceRefreshPayload
+
+    queue = JobQueue()
+    first, created = queue.enqueue(
+        session,
+        kind=JobKind.SOURCE_REFRESH,
+        dedupe_key="refresh:asura:stable",
+        payload=SourceRefreshPayload(
+            source="asura", source_id="stable", title="Title", url="https://example/old"
+        ),
+        coalesce=True,
+    )
+    second, created_again = queue.enqueue(
+        session,
+        kind=JobKind.SOURCE_REFRESH,
+        dedupe_key="refresh:asura:stable",
+        payload=SourceRefreshPayload(
+            source="asura", source_id="stable", title="Title", url="https://example/new"
+        ),
+        coalesce=True,
+    )
+    assert created and not created_again and first.id == second.id
+    assert second.payload["url"] == "https://example/new"
+
+
+def test_refresh_coalescing_keeps_newest_observation_while_leased(session: Session) -> None:
+    from manga_manager.domain.jobs import SourceRefreshPayload
+
+    queue = JobQueue()
+    job, _ = queue.enqueue(
+        session,
+        kind=JobKind.SOURCE_REFRESH,
+        dedupe_key="refresh:asura:stable-newest",
+        payload=SourceRefreshPayload(
+            source="asura", source_id="stable-newest", title="Title",
+            url="https://example/10", observation_version="10",
+        ),
+        coalesce=True,
+        available_at=NOW,
+    )
+    lease = queue.claim(session, owner="worker", lease_for=timedelta(minutes=1), now=NOW)
+    assert lease is not None
+    queue.enqueue(
+        session,
+        kind=JobKind.SOURCE_REFRESH,
+        dedupe_key=job.dedupe_key,
+        payload=SourceRefreshPayload(
+            source="asura", source_id="stable-newest", title="Title",
+            url="https://example/12", observation_version="12",
+        ),
+        coalesce=True,
+    )
+    queue.enqueue(
+        session,
+        kind=JobKind.SOURCE_REFRESH,
+        dedupe_key=job.dedupe_key,
+        payload=SourceRefreshPayload(
+            source="asura", source_id="stable-newest", title="Title",
+            url="https://example/11", observation_version="11",
+        ),
+        coalesce=True,
+    )
+    assert job.pending_payload["observation_version"] == "12"
+    assert queue.succeed(session, job_id=job.id, owner="worker", now=NOW)
+    assert job.status == JobState.QUEUED.value
+    assert job.payload["observation_version"] == "12"
+
+
+def test_download_group_is_scoped_to_workload_cycle(session: Session) -> None:
+    queue = JobQueue()
+    job, _ = queue.enqueue(
+        session,
+        kind=JobKind.CHAPTER_DOWNLOAD,
+        dedupe_key="release:cycle-group",
+        payload=ChapterDownloadPayload(chapter_release_id=99),
+        source="asura",
+        series_key="42",
+    )
+    assert job.group_key == f"cycle:{job.cycle_id}:download:42"

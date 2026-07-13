@@ -77,7 +77,8 @@ class AsuraAdapter(SourceAdapter):
             if not title or not href:
                 continue
             url = urljoin(self.base_url, href)
-            source_id = urlparse(url).path.strip("/")
+            observed_id = urlparse(url).path.strip("/")
+            source_id, revision = split_asura_source_id(observed_id)
             cover = nearby_cover_attr(link)
             recent_chapters = self.parse_card_chapters(link, source_id, url)
             items.append(
@@ -88,13 +89,14 @@ class AsuraAdapter(SourceAdapter):
                     url=url,
                     cover_url=urljoin(self.base_url, cover) if cover else "",
                     metadata={
+                        "asura_revision": revision,
                         "recent_chapters": [
                             {"number": chapter.number, "title": chapter.title, "url": chapter.url}
                             for chapter in recent_chapters
                         ]
                     }
                     if recent_chapters
-                    else {},
+                    else {"asura_revision": revision},
                 )
             )
         return dedupe_series(items)
@@ -253,6 +255,25 @@ def dedupe_series(items: list[SeriesItem]) -> list[SeriesItem]:
             seen.add(item.source_id)
             result.append(item)
     return result
+
+
+ASURA_REVISION_RE = re.compile(r"^(?P<stable>comics/.+)-(?P<revision>[0-9a-fA-F]{8})$")
+
+
+def split_asura_source_id(value: str) -> tuple[str, str]:
+    """Return revision-independent identity and the observed rotating suffix."""
+    normalized = urlparse(value).path.strip("/") if "://" in value else value.strip("/")
+    match = ASURA_REVISION_RE.fullmatch(normalized)
+    if not match:
+        return normalized, ""
+    return match.group("stable"), match.group("revision").lower()
+
+
+def asura_series_url(source_id: str, revision: str = "") -> str:
+    stable, embedded = split_asura_source_id(source_id)
+    selected = revision or embedded
+    path = f"{stable}-{selected}" if selected else stable
+    return urljoin(AsuraAdapter.base_url, f"/{path}")
 
 
 def dedupe_chapters(items: list[ChapterItem]) -> list[ChapterItem]:

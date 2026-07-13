@@ -14,6 +14,7 @@ from sqlalchemy import (
     Index,
     Integer,
     JSON,
+    LargeBinary,
     Numeric,
     String,
     Text,
@@ -69,15 +70,19 @@ class WorkJob(JobBase):
         Index("ix_job_lease_expiry", "status", "lease_expires_at"),
         Index("ix_job_pool_claim", "pool", "status", "available_at", "priority"),
         Index("ix_job_source_status", "source", "status"),
+        Index("ix_job_cycle_group_status", "cycle_id", "group_key", "status"),
+        Index("ix_job_workflow_status", "workflow_key", "status"),
         Index(
             "uq_job_leased_chapter_series",
             "series_key",
             unique=True,
             sqlite_where=text(
-                "kind = 'chapter_download' AND status = 'leased' AND series_key <> ''"
+                "kind IN ('chapter_download', 'library_repair') "
+                "AND status = 'leased' AND series_key <> ''"
             ),
             postgresql_where=text(
-                "kind = 'chapter_download' AND status = 'leased' AND series_key <> ''"
+                "kind IN ('chapter_download', 'library_repair') "
+                "AND status = 'leased' AND series_key <> ''"
             ),
         ),
     )
@@ -92,6 +97,15 @@ class WorkJob(JobBase):
     source: Mapped[str] = mapped_column(String(50), default="", index=True)
     series_key: Mapped[str] = mapped_column(String(100), default="", index=True)
     pool: Mapped[str] = mapped_column(String(50), default="maintenance", index=True)
+    cycle_id: Mapped[int | None] = mapped_column(
+        ForeignKey("workload_cycle.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    workflow_key: Mapped[str] = mapped_column(String(100), default="", index=True)
+    group_key: Mapped[str] = mapped_column(String(500), default="", index=True)
+    logical_units: Mapped[int] = mapped_column(Integer, default=1)
+    pending_payload: Mapped[dict[str, Any]] = mapped_column(
+        JSON().with_variant(JSONB(none_as_null=True), "postgresql"), default=dict
+    )
     status: Mapped[str] = mapped_column(String(20), default=JobState.QUEUED.value, index=True)
     priority: Mapped[int] = mapped_column(Integer, default=100)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
@@ -116,6 +130,53 @@ class WorkJob(JobBase):
     progress_updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+
+class WorkloadCycle(JobBase):
+    __tablename__ = "workload_cycle"
+    __table_args__ = (
+        CheckConstraint("status IN ('active', 'settled')", name="ck_workload_cycle_status"),
+        Index(
+            "uq_workload_cycle_active",
+            "status",
+            unique=True,
+            sqlite_where=text("status = 'active'"),
+            postgresql_where=text("status = 'active'"),
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    status: Mapped[str] = mapped_column(String(20), default="active", index=True)
+    total_units: Mapped[int] = mapped_column(Integer, default=0)
+    successful_units: Mapped[int] = mapped_column(Integer, default=0)
+    failed_units: Mapped[int] = mapped_column(Integer, default=0)
+    cancelled_units: Mapped[int] = mapped_column(Integer, default=0)
+    added_units: Mapped[int] = mapped_column(Integer, default=0)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    settled_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class JobDailyAggregate(JobBase):
+    __tablename__ = "job_daily_aggregate"
+    __table_args__ = (
+        UniqueConstraint(
+            "day", "kind", "source", "status", "error_code",
+            name="uq_job_daily_aggregate_bucket",
+        ),
+        Index("ix_job_daily_aggregate_day", "day"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    day: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    kind: Mapped[str] = mapped_column(String(30))
+    source: Mapped[str] = mapped_column(String(50), default="")
+    status: Mapped[str] = mapped_column(String(20))
+    error_code: Mapped[str] = mapped_column(String(100), default="")
+    job_count: Mapped[int] = mapped_column(Integer, default=0)
+    attempt_count: Mapped[int] = mapped_column(Integer, default=0)
+    duration_seconds: Mapped[int] = mapped_column(BigInteger, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class JobPermit(JobBase):
@@ -166,7 +227,7 @@ class JobEvent(JobBase):
     __table_args__ = (
         CheckConstraint(
             "event_type IN ('enqueued', 'leased', 'progress', 'retry_scheduled', 'succeeded', "
-            "'failed', 'cancelled', 'released', 'lease_expired')",
+            "'failed', 'cancelled', 'released', 'lease_expired', 'rerouted')",
             name="ck_job_event_type",
         ),
         Index("ix_job_event_job_created", "job_id", "created_at"),
@@ -266,6 +327,7 @@ class CatalogSourceSeries(JobBase):
         UniqueConstraint("source", "source_id", name="uq_source_series_v2_identity"),
         UniqueConstraint("series_id", "source", name="uq_source_series_v2_series_source"),
         Index("ix_source_series_v2_source_checked", "source", "last_checked_at"),
+        Index("ix_source_series_v2_normalized_identity", "source", "normalized_source_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
@@ -274,6 +336,8 @@ class CatalogSourceSeries(JobBase):
     )
     source: Mapped[str] = mapped_column(String(50), index=True)
     source_id: Mapped[str] = mapped_column(String(500))
+    normalized_source_id: Mapped[str] = mapped_column(String(500), default="")
+    revision_override: Mapped[str] = mapped_column(String(20), default="")
     title: Mapped[str] = mapped_column(String(500))
     normalized_title: Mapped[str] = mapped_column(String(500), index=True)
     url: Mapped[str] = mapped_column(Text)
@@ -328,6 +392,39 @@ class CatalogCoverFingerprint(JobBase):
     width: Mapped[int] = mapped_column(Integer, default=0)
     height: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class CatalogCoverAsset(JobBase):
+    __tablename__ = "cover_asset_v2"
+
+    source_series_id: Mapped[int] = mapped_column(
+        ForeignKey("source_series_v2.id", ondelete="CASCADE"), primary_key=True
+    )
+    content_checksum: Mapped[str] = mapped_column(String(64), index=True)
+    relative_path: Mapped[str] = mapped_column(Text)
+    content_type: Mapped[str] = mapped_column(String(100), default="")
+    source_url: Mapped[str] = mapped_column(Text, default="")
+    width: Mapped[int] = mapped_column(Integer, default=0)
+    height: Mapped[int] = mapped_column(Integer, default=0)
+    fetched_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class CatalogCoverSignature(JobBase):
+    __tablename__ = "cover_signature_v2"
+    __table_args__ = (
+        Index("ix_cover_signature_algorithm", "algorithm_version"),
+    )
+
+    source_series_id: Mapped[int] = mapped_column(
+        ForeignKey("source_series_v2.id", ondelete="CASCADE"), primary_key=True
+    )
+    algorithm_version: Mapped[str] = mapped_column(String(50))
+    feature_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON().with_variant(JSONB(none_as_null=True), "postgresql"), default=dict
+    )
+    keypoints_blob: Mapped[bytes] = mapped_column(LargeBinary, default=b"")
+    descriptors_blob: Mapped[bytes] = mapped_column(LargeBinary, default=b"")
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class CatalogSeriesAlias(JobBase):
@@ -657,9 +754,40 @@ class CatalogMatchDecision(JobBase):
     evidence_json: Mapped[dict[str, Any]] = mapped_column(
         JSON().with_variant(JSONB(none_as_null=True), "postgresql"), default=dict
     )
+    scorer_version: Mapped[str] = mapped_column(String(50), default="legacy")
+    feature_vector_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON().with_variant(JSONB(none_as_null=True), "postgresql"), default=dict
+    )
     decided_by: Mapped[str] = mapped_column(String(100), default="")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class MatchTrainingLabel(JobBase):
+    __tablename__ = "match_training_label"
+    __table_args__ = (
+        CheckConstraint("label IN (0, 1)", name="ck_match_training_label_value"),
+        Index("ix_match_training_label_created", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    original_decision_id: Mapped[int | None] = mapped_column(Integer, nullable=True, index=True)
+    label: Mapped[int] = mapped_column(Integer)
+    origin: Mapped[str] = mapped_column(String(50), default="review")
+    scorer_version: Mapped[str] = mapped_column(String(50), default="legacy")
+    feature_vector_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON().with_variant(JSONB(none_as_null=True), "postgresql"), default=dict
+    )
+    evidence_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON().with_variant(JSONB(none_as_null=True), "postgresql"), default=dict
+    )
+    left_identity_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON().with_variant(JSONB(none_as_null=True), "postgresql"), default=dict
+    )
+    right_identity_json: Mapped[dict[str, Any]] = mapped_column(
+        JSON().with_variant(JSONB(none_as_null=True), "postgresql"), default=dict
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class CatalogObservation(JobBase):
@@ -744,3 +872,36 @@ class LibraryProjection(JobBase):
     )
     relative_path: Mapped[str] = mapped_column(Text)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class KavitaProjection(JobBase):
+    __tablename__ = "kavita_projection"
+    __table_args__ = (UniqueConstraint("relative_path", name="uq_kavita_projection_path"),)
+
+    chapter_id: Mapped[int] = mapped_column(
+        ForeignKey("chapter_v2.id", ondelete="CASCADE"), primary_key=True
+    )
+    artifact_id: Mapped[int] = mapped_column(
+        ForeignKey("chapter_artifact.id", ondelete="CASCADE"), index=True
+    )
+    relative_path: Mapped[str] = mapped_column(Text)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ArtifactMetadataRewrite(JobBase):
+    __tablename__ = "artifact_metadata_rewrite"
+    __table_args__ = (
+        UniqueConstraint("new_blob_checksum", name="uq_metadata_rewrite_new_blob"),
+        Index("ix_metadata_rewrite_chapter_created", "chapter_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    chapter_id: Mapped[int] = mapped_column(
+        ForeignKey("chapter_v2.id", ondelete="CASCADE"), index=True
+    )
+    old_blob_checksum: Mapped[str] = mapped_column(String(64), index=True)
+    new_blob_checksum: Mapped[str] = mapped_column(String(64), index=True)
+    old_comic_info: Mapped[bytes] = mapped_column(LargeBinary)
+    new_comic_info: Mapped[bytes] = mapped_column(LargeBinary)
+    reason: Mapped[str] = mapped_column(String(100), default="metadata")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)

@@ -1,0 +1,176 @@
+from __future__ import annotations
+
+import asyncio
+import io
+import zipfile
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from xml.etree import ElementTree
+
+import pytest
+from PIL import Image
+from sqlalchemy import create_engine, func, select
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from manga_manager.application.cbz_import import LegacyCbzImporter
+from manga_manager.application.job_handlers import JobContext
+from manga_manager.application.library_repair import LibraryRepairHandler, LibraryRepairPlanner
+from manga_manager.domain.jobs import JobKind, LibraryRepairPayload
+from manga_manager.infrastructure.db_models import (
+    ArtifactBlob,
+    ArtifactMetadataRewrite,
+    CatalogChapter,
+    CatalogSeries,
+    ChapterArtifact,
+    JobBase,
+    KavitaProjection,
+    LibraryProjection,
+    WorkJob,
+)
+from manga_manager.infrastructure.job_queue import JobQueue
+from manga_manager.infrastructure.storage import ContentAddressedStorage
+
+
+def make_storage(tmp_path: Path) -> ContentAddressedStorage:
+    return ContentAddressedStorage(
+        tmp_path / "storage",
+        max_page_bytes=1024 * 1024,
+        max_chapter_bytes=10 * 1024 * 1024,
+        max_pages=100,
+        min_free_bytes=0,
+    )
+
+
+def make_archive(path: Path, *, include_metadata: bool = True) -> None:
+    image = io.BytesIO()
+    Image.new("RGB", (16, 24), "navy").save(image, format="PNG")
+    with zipfile.ZipFile(path, "w") as archive:
+        if include_metadata:
+            archive.writestr(
+                "ComicInfo.xml",
+                "<ComicInfo><Series>9.5 Wrong title</Series><Number>1</Number>"
+                "<Writer>Original Author</Writer></ComicInfo>",
+            )
+        archive.writestr("0001.png", image.getvalue())
+
+
+@pytest.mark.asyncio
+async def test_repair_rewrites_canonical_metadata_and_builds_tracked_kavita_projection(
+    tmp_path: Path,
+) -> None:
+    engine = create_engine(
+        "sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool
+    )
+    JobBase.metadata.create_all(engine)
+    sessions = sessionmaker(engine, expire_on_commit=False)
+    storage = make_storage(tmp_path)
+    source = tmp_path / "chapter.cbz"
+    make_archive(source)
+    LegacyCbzImporter(session_factory=sessions, storage=storage).import_file(
+        source, dry_run=False
+    )
+
+    with sessions() as session, session.begin():
+        series = session.scalar(select(CatalogSeries))
+        assert series is not None
+        series.title = "Canonical Series"
+        series.description = "Canonical summary"
+        series.status = "interested"
+        missing_projection = session.scalar(select(LibraryProjection))
+        assert missing_projection is not None
+        (storage.library_root / missing_projection.relative_path).unlink()
+        session.delete(missing_projection)
+        job, _ = JobQueue().enqueue(
+            session,
+            kind=JobKind.LIBRARY_REPAIR,
+            dedupe_key=f"series:{series.id}:test",
+            payload=LibraryRepairPayload(series_id=series.id, reason="test"),
+            series_key=str(series.id),
+        )
+        lease = JobQueue().claim(
+            session,
+            owner="repair-test",
+            lease_for=timedelta(minutes=5),
+            now=datetime.now(timezone.utc),
+            kinds={JobKind.LIBRARY_REPAIR},
+        )
+        assert lease is not None and lease.id == job.id
+        series_id = series.id
+
+    handler = LibraryRepairHandler(session_factory=sessions, storage=storage)
+    await handler(JobContext(lease=lease, lease_lost=asyncio.Event()))
+
+    with sessions() as session:
+        chapter = session.scalar(select(CatalogChapter))
+        artifact = session.scalar(
+            select(ChapterArtifact).where(ChapterArtifact.state == "active")
+        )
+        assert chapter is not None and artifact is not None
+        blob = session.get(ArtifactBlob, artifact.blob_checksum)
+        projection = session.get(KavitaProjection, chapter.id)
+        library_projection = session.get(LibraryProjection, chapter.id)
+        assert blob is not None and projection is not None and library_projection is not None
+        assert projection.artifact_id == artifact.id
+        assert (storage.library_root / library_projection.relative_path).is_file()
+        assert session.scalar(select(func.count()).select_from(ArtifactMetadataRewrite)) == 1
+        with zipfile.ZipFile(storage.root / blob.relative_path) as archive:
+            metadata = ElementTree.fromstring(archive.read("ComicInfo.xml"))
+        assert metadata.findtext("Series") == "Canonical Series"
+        assert metadata.findtext("SeriesSort") == "Canonical Series"
+        assert metadata.findtext("Number") == "1"
+        assert metadata.findtext("Summary") == "Canonical summary"
+        assert metadata.findtext("Writer") == "Original Author"
+        assert (storage.kavita_root / projection.relative_path).is_file()
+
+    # A second pass is idempotent and does not rewrite another  archive.
+    handler._reconcile_kavita(series_id)
+    with sessions() as session:
+        assert session.scalar(select(func.count()).select_from(ArtifactMetadataRewrite)) == 1
+
+
+def test_untracked_series_is_removed_from_kavita_projection(tmp_path: Path) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    JobBase.metadata.create_all(engine)
+    sessions = sessionmaker(engine, expire_on_commit=False)
+    storage = make_storage(tmp_path)
+    source = tmp_path / "chapter.cbz"
+    make_archive(source)
+    LegacyCbzImporter(session_factory=sessions, storage=storage).import_file(
+        source, dry_run=False
+    )
+    with sessions() as session, session.begin():
+        series = session.scalar(select(CatalogSeries))
+        assert series is not None
+        series.status = "interested"
+        series_id = series.id
+    handler = LibraryRepairHandler(session_factory=sessions, storage=storage)
+    handler._reconcile_kavita(series_id)
+    with sessions() as session, session.begin():
+        series = session.get(CatalogSeries, series_id)
+        assert series is not None
+        series.status = "untracked"
+    handler._reconcile_kavita(series_id)
+    with sessions() as session:
+        assert session.scalar(select(func.count()).select_from(KavitaProjection)) == 0
+    assert not any(storage.kavita_root.rglob("*.cbz"))
+
+
+def test_planner_queues_missing_tracked_projection_once(tmp_path: Path) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    JobBase.metadata.create_all(engine)
+    sessions = sessionmaker(engine, expire_on_commit=False)
+    storage = make_storage(tmp_path)
+    source = tmp_path / "chapter.cbz"
+    make_archive(source)
+    LegacyCbzImporter(session_factory=sessions, storage=storage).import_file(
+        source, dry_run=False
+    )
+    with sessions() as session, session.begin():
+        series = session.scalar(select(CatalogSeries))
+        assert series is not None
+        series.status = "interested"
+        assert LibraryRepairPlanner().enqueue_pending(session) == (1, 1)
+    with sessions() as session, session.begin():
+        assert LibraryRepairPlanner().enqueue_pending(session) == (1, 0)
+        assert session.scalar(select(func.count()).select_from(WorkJob)) == 1

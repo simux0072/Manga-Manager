@@ -5,11 +5,16 @@ import asyncio
 import json
 import logging
 import signal
+import sys
 import time
+import zipfile
+from dataclasses import asdict
+from xml.etree import ElementTree
 from collections.abc import Sequence
 from pathlib import Path
 
-from sqlalchemy import text
+from sqlalchemy import exists, select, text
+from sqlalchemy.engine import Connection
 
 from manga_manager.application.source_pull import SourcePullHandler, SourceRefreshHandler
 from manga_manager.application.storage_reconcile import StorageReconciler
@@ -20,11 +25,17 @@ from manga_manager.application.legacy_repair import (
 from manga_manager.application.cbz_import import LegacyCbzImporter, write_report
 from manga_manager.application.chapter_download import ChapterDownloadHandler
 from manga_manager.application.kavita_sync import KavitaSyncHandler, KavitaSyncPlanner
+from manga_manager.application.library_repair import LibraryRepairHandler
+from manga_manager.application.catalog_recovery import CatalogRecovery, write_recovery_report
+from manga_manager.application.match_training import export_training_data
 from manga_manager.application.maintenance import MaintenanceHandler
+from manga_manager.application.provider_identity_repair import ProviderIdentityRepair
+from manga_manager.application.refresh_queue_reconcile import RefreshQueueReconciler
 from manga_manager.domain.jobs import (
     ChapterDownloadPayload,
     JobKind,
     KavitaSyncPayload,
+    LibraryRepairPayload,
     MaintenancePayload,
     SourcePullPayload,
 )
@@ -37,11 +48,43 @@ from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.infrastructure.db_models import (
     CatalogChapter,
     CatalogChapterRelease,
+    CatalogSeries,
+    ChapterArtifact,
 )
 from manga_manager.infrastructure.storage import ContentAddressedStorage
 from manga_manager.settings import V2Settings
 from manga_manager.worker.service import WorkerService
 from manga_manager.worker.scheduler import SourcePollScheduler
+
+
+STAGE_MUTATING_JOB_KINDS = ("chapter_download", "library_repair", "kavita_sync")
+STAGE_ACTIVE_JOB_STATES = ("queued", "leased", "retry_wait")
+
+
+def stage_active_mutations(connection: Connection) -> list[dict[str, object]]:
+    rows = connection.execute(
+        text(
+            "SELECT kind,status,count(*) AS job_count FROM job "
+            "WHERE kind IN ('chapter_download','library_repair','kavita_sync') "
+            "AND status IN ('queued','leased','retry_wait') "
+            "GROUP BY kind,status ORDER BY kind,status"
+        )
+    ).all()
+    return [
+        {"kind": str(kind), "status": str(status), "count": int(count)}
+        for kind, status, count in rows
+    ]
+
+
+def stage_check_details(values: list[str], *, limit: int, full: bool) -> list[str]:
+    return values if full else values[:limit]
+
+
+def print_stage_check(payload: dict[str, object], *, json_output: bool) -> None:
+    if json_output:
+        print(json.dumps(payload, sort_keys=True))
+    else:
+        print(" ".join(f"{key}={value}" for key, value in payload.items()))
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -52,6 +95,17 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands.add_parser("doctor", help="check v2 database connectivity and migration state")
     stage = subcommands.add_parser("stage-check", help="verify staged database and storage health")
     stage.add_argument("--json", action="store_true", dest="json_output")
+    stage.add_argument(
+        "--detail-limit",
+        type=int,
+        default=25,
+        help="maximum archive paths included per failure category",
+    )
+    stage.add_argument(
+        "--full-details",
+        action="store_true",
+        help="include every failing archive path (potentially very large)",
+    )
     benchmark = subcommands.add_parser(
         "benchmark-workers", help="run a bounded worker-pool benchmark"
     )
@@ -122,6 +176,32 @@ def build_parser() -> argparse.ArgumentParser:
     )
     kavita_check.add_argument("--scan-test", action="store_true")
     subcommands.add_parser("enqueue-probe", help="enqueue a deterministic staging probe")
+    for name in ("audit-catalog-recovery", "repair-catalog-recovery"):
+        recovery = subcommands.add_parser(name, help="reconcile downloaded legacy tracking state")
+        recovery.add_argument("legacy_database", type=Path)
+        recovery.add_argument("--report", type=Path, required=True)
+        if name == "repair-catalog-recovery":
+            recovery.add_argument("--apply", action="store_true")
+    training = subcommands.add_parser(
+        "export-match-training", help="export reviewed match labels and cached covers"
+    )
+    training.add_argument("output", type=Path)
+    library_repair = subcommands.add_parser(
+        "enqueue-library-repair", help="queue canonical CBZ/Kavita repair"
+    )
+    library_repair.add_argument("series_id", type=int, nargs="?")
+    library_repair.add_argument("--all-tracked", action="store_true")
+    provider_repair = subcommands.add_parser(
+        "repair-provider-identities", help="audit or repair normalized provider identities"
+    )
+    provider_repair.add_argument("--report", type=Path, required=True)
+    provider_repair.add_argument("--apply", action="store_true")
+    refresh_repair = subcommands.add_parser(
+        "reconcile-refresh-queue",
+        help="audit or repair queued provider refresh payload compatibility",
+    )
+    refresh_repair.add_argument("--report", type=Path, required=True)
+    refresh_repair.add_argument("--apply", action="store_true")
     return parser
 
 
@@ -189,6 +269,36 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     engine = create_database_engine(database_url)
+    if args.command == "repair-provider-identities":
+        sessions = create_session_factory(engine)
+        service = ProviderIdentityRepair()
+        if args.apply:
+            with sessions() as session, session.begin():
+                records = service.audit(session, lock=True)
+                service.apply(session, records)
+        else:
+            with sessions() as session:
+                records = service.audit(session)
+        payload = {"applied": bool(args.apply), "records": [asdict(record) for record in records]}
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        print(f"observations={len(records)} applied={str(bool(args.apply)).lower()}")
+        return 0
+    if args.command == "reconcile-refresh-queue":
+        sessions = create_session_factory(engine)
+        service = RefreshQueueReconciler()
+        if args.apply:
+            with sessions() as session, session.begin():
+                records = service.audit(session, lock=True)
+                service.apply(session, records)
+        else:
+            with sessions() as session:
+                records = service.audit(session)
+        payload = {"applied": bool(args.apply), "records": [asdict(row) for row in records]}
+        args.report.parent.mkdir(parents=True, exist_ok=True)
+        args.report.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        print(f"observations={len(records)} applied={str(bool(args.apply)).lower()}")
+        return 0
     if args.command == "doctor":
         with engine.connect() as connection:
             connection.execute(text("SELECT 1"))
@@ -196,6 +306,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"database=ok migration={version}")
         return 0
     if args.command == "stage-check":
+        if args.detail_limit < 0:
+            parser.error("--detail-limit must not be negative")
         storage = create_storage(settings)
         storage.ensure_directories()
         with engine.connect() as connection:
@@ -206,6 +318,23 @@ def main(argv: Sequence[str] | None = None) -> int:
                     text("SELECT status, count(*) FROM job GROUP BY status ORDER BY status")
                 ).all()
             )
+            active_mutations = stage_active_mutations(connection)
+            if active_mutations:
+                payload = {
+                    "ok": False,
+                    "busy": True,
+                    "database": "ok",
+                    "migration": version,
+                    "jobs": counts,
+                    "active_storage_jobs": active_mutations,
+                    "message": (
+                        "storage validation deferred while chapter downloads, library repairs, "
+                        "or Kavita synchronization jobs can change the validation result"
+                    ),
+                    "storage_root": str(storage.root.resolve()),
+                }
+                print_stage_check(payload, json_output=args.json_output)
+                return 1
             invalid = connection.scalar(
                 text(
                     "SELECT count(*) FROM chapter_artifact a "
@@ -222,11 +351,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
             blobs = connection.execute(
                 text(
-                    "SELECT b.relative_path FROM chapter_artifact a "
+                    "SELECT b.relative_path,s.title,c.display_number FROM chapter_artifact a "
                     "JOIN artifact_blob b ON b.checksum=a.blob_checksum "
+                    "JOIN chapter_v2 c ON c.id=a.chapter_id "
+                    "JOIN series_v2 s ON s.id=c.series_id "
                     "WHERE a.state='active'"
                 )
             ).all()
+            duplicate_providers = connection.scalar(
+                text(
+                    "SELECT count(*) FROM (SELECT series_id,source FROM source_series_v2 "
+                    "GROUP BY series_id,source HAVING count(*)>1) duplicates"
+                )
+            )
+            missing_kavita = connection.scalar(
+                text(
+                    "SELECT count(*) FROM chapter_artifact a JOIN chapter_v2 c ON c.id=a.chapter_id "
+                    "JOIN series_v2 s ON s.id=c.series_id LEFT JOIN kavita_projection k "
+                    "ON k.artifact_id=a.id WHERE a.state='active' AND "
+                    "s.status IN ('interested','reading','caught_up','paused') "
+                    "AND k.artifact_id IS NULL"
+                )
+            )
             started = time.perf_counter()
             connection.execute(
                 text(
@@ -236,17 +382,44 @@ def main(argv: Sequence[str] | None = None) -> int:
             ).all()
             first_page_ms = round((time.perf_counter() - started) * 1000, 2)
         invalid_archives: list[str] = []
-        for (relative_path,) in blobs:
+        metadata_mismatches: list[str] = []
+        archive_total = len(blobs)
+        report_every = max(25, archive_total // 100)
+        print(
+            f"stage-check: validating {archive_total} active archives; "
+            "the final result is printed after the storage scan",
+            file=sys.stderr,
+            flush=True,
+        )
+        for archive_index, (relative_path, expected_series, expected_number) in enumerate(
+            blobs, 1
+        ):
             path = storage.root / relative_path
             try:
                 storage.validate_cbz(path)
-            except (OSError, ValueError) as exc:
+                with zipfile.ZipFile(path) as archive:
+                    root = ElementTree.fromstring(archive.read("ComicInfo.xml"))
+                actual_series = (root.findtext("Series") or "").strip()
+                actual_number = (root.findtext("Number") or "").strip()
+                if actual_series != expected_series or actual_number != expected_number:
+                    metadata_mismatches.append(relative_path)
+            except (OSError, ValueError, ElementTree.ParseError, zipfile.BadZipFile) as exc:
                 invalid_archives.append(f"{relative_path}: {exc}")
+            if archive_index % report_every == 0 or archive_index == archive_total:
+                percent = round(archive_index / archive_total * 100, 1) if archive_total else 100.0
+                print(
+                    f"stage-check: {archive_index}/{archive_total} archives ({percent}%)",
+                    file=sys.stderr,
+                    flush=True,
+                )
         payload = {
             "ok": (
                 invalid == 0
                 and missing_projection == 0
+                and duplicate_providers == 0
+                and missing_kavita == 0
                 and not invalid_archives
+                and not metadata_mismatches
                 and first_page_ms < 1_000
             ),
             "database": "ok",
@@ -254,14 +427,36 @@ def main(argv: Sequence[str] | None = None) -> int:
             "jobs": counts,
             "active_artifacts_without_blob": invalid,
             "active_artifacts_without_projection": missing_projection,
-            "invalid_active_archives": invalid_archives,
+            "invalid_active_archive_count": len(invalid_archives),
+            "invalid_active_archives": stage_check_details(
+                invalid_archives,
+                limit=args.detail_limit,
+                full=args.full_details,
+            ),
+            "canonical_metadata_mismatch_count": len(metadata_mismatches),
+            "canonical_metadata_mismatches": stage_check_details(
+                metadata_mismatches,
+                limit=args.detail_limit,
+                full=args.full_details,
+            ),
+            "details_truncated": {
+                "invalid_active_archives": max(
+                    0,
+                    len(invalid_archives)
+                    - (len(invalid_archives) if args.full_details else args.detail_limit),
+                ),
+                "canonical_metadata_mismatches": max(
+                    0,
+                    len(metadata_mismatches)
+                    - (len(metadata_mismatches) if args.full_details else args.detail_limit),
+                ),
+            },
+            "duplicate_provider_identities": duplicate_providers,
+            "tracked_artifacts_without_kavita_projection": missing_kavita,
             "catalog_first_page_ms": first_page_ms,
             "storage_root": str(storage.root.resolve()),
         }
-        if args.json_output:
-            print(json.dumps(payload, sort_keys=True))
-        else:
-            print(" ".join(f"{key}={value}" for key, value in payload.items()))
+        print_stage_check(payload, json_output=args.json_output)
         return 0 if payload["ok"] else 1
     if args.command == "benchmark-workers":
         if args.duration < 1 or args.max_jobs < 1:
@@ -421,19 +616,20 @@ def main(argv: Sequence[str] | None = None) -> int:
         from app.kavita import configured_kavita_client
 
         async def check_kavita():
-            client = configured_kavita_client(local_library_root=settings.storage_root / "library")
+            library_root = settings.storage_root / "kavita-library"
+            client = configured_kavita_client(local_library_root=library_root)
             if not client.configured:
                 return {"ok": False, "configured": False, "reason": "Kavita is not configured"}
             expires = await client.authkey_expires()
             series = await client.list_series()
             if args.scan_test:
-                await client.scan_folder_or_all(settings.storage_root / "library")
+                await client.scan_folder_or_all(library_root)
             return {
                 "ok": True,
                 "configured": True,
                 "authkey_expires": expires,
                 "series_visible": len(series),
-                "mapped_root": str(client.kavita_path_for_local(settings.storage_root / "library")),
+                "mapped_root": str(client.kavita_path_for_local(library_root)),
                 "scan_test": bool(args.scan_test),
             }
 
@@ -448,8 +644,74 @@ def main(argv: Sequence[str] | None = None) -> int:
                 dedupe_key="stage-probe",
                 payload=MaintenancePayload(action="stage_probe"),
                 priority=1,
+                pool="health",
             )
         print(f"job_id={job.id} created={str(created).lower()}")
+        return 0
+    if args.command in {"audit-catalog-recovery", "repair-catalog-recovery"}:
+        apply = args.command == "repair-catalog-recovery" and args.apply
+        records = CatalogRecovery(create_session_factory(engine)).run(
+            args.legacy_database, apply=apply
+        )
+        write_recovery_report(args.report, records, applied=apply)
+        counts: dict[str, int] = {}
+        for record in records:
+            counts[record.action] = counts.get(record.action, 0) + 1
+        print(
+            " ".join(f"{key}={value}" for key, value in sorted(counts.items()))
+            + f" applied={str(apply).lower()} report={args.report}"
+        )
+        return 0
+    if args.command == "export-match-training":
+        count = export_training_data(
+            create_session_factory(engine), settings.storage_root, args.output
+        )
+        print(f"records={count} output={args.output}")
+        return 0
+    if args.command == "enqueue-library-repair":
+        if (args.series_id is None and not args.all_tracked) or (
+            args.series_id is not None and args.all_tracked
+        ):
+            parser.error("provide a series_id or --all-tracked")
+        sessions = create_session_factory(engine)
+        with sessions() as session, session.begin():
+            if args.all_tracked:
+                series_ids = session.scalars(
+                    select(CatalogSeries.id)
+                    .where(
+                        CatalogSeries.status.in_(
+                            ("interested", "reading", "caught_up", "paused")
+                        )
+                    )
+                    .where(
+                        exists(
+                            select(ChapterArtifact.id)
+                            .join(
+                                CatalogChapter,
+                                CatalogChapter.id == ChapterArtifact.chapter_id,
+                            )
+                            .where(CatalogChapter.series_id == CatalogSeries.id)
+                            .where(ChapterArtifact.state == "active")
+                        )
+                    )
+                    .order_by(CatalogSeries.id)
+                ).all()
+            else:
+                if args.series_id < 1 or session.get(CatalogSeries, args.series_id) is None:
+                    parser.error("series_id does not exist")
+                series_ids = [args.series_id]
+            created = 0
+            for series_id in series_ids:
+                _, was_created = JobQueue().enqueue(
+                    session,
+                    kind=JobKind.LIBRARY_REPAIR,
+                    dedupe_key=f"series:{series_id}:manual-repair",
+                    payload=LibraryRepairPayload(series_id=series_id, reason="manual_repair"),
+                    priority=85,
+                    series_key=str(series_id),
+                )
+                created += int(was_created)
+        print(f"eligible={len(series_ids)} created={created}")
         return 0
     if args.command == "worker":
         logging.basicConfig(
@@ -464,6 +726,7 @@ async def run_worker(settings: V2Settings, engine) -> int:
     from app.adapters.http import configure_provider_waiter, configure_request_observer
     from manga_manager.infrastructure.provider_scheduler import ProviderRequestScheduler
     from manga_manager.infrastructure.provider_telemetry import ProviderTelemetry
+    from manga_manager.application.cover_backfill import CoverBackfillHandler
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -477,9 +740,10 @@ async def run_worker(settings: V2Settings, engine) -> int:
     configure_request_observer(telemetry.active_observer)
     source_pull = SourcePullHandler(session_factory=sessions)
     source_refresh = SourceRefreshHandler(session_factory=sessions)
+    storage = create_storage(settings)
     chapter_download = ChapterDownloadHandler(
         session_factory=sessions,
-        storage=create_storage(settings),
+        storage=storage,
         cooldowns={
             source: settings.source_cooldown(source)
             for source in ("asura", "mangafire", "kingofshojo")
@@ -489,9 +753,11 @@ async def run_worker(settings: V2Settings, engine) -> int:
     )
     kavita_sync = KavitaSyncHandler(
         session_factory=sessions,
-        library_root=settings.storage_root / "library",
+        library_root=storage.kavita_root,
     )
+    library_repair = LibraryRepairHandler(session_factory=sessions, storage=storage)
     maintenance = MaintenanceHandler(session_factory=sessions)
+    cover_backfill = CoverBackfillHandler(session_factory=sessions)
     service = WorkerService(
         session_factory=sessions,
         handlers={
@@ -499,6 +765,8 @@ async def run_worker(settings: V2Settings, engine) -> int:
             JobKind.SOURCE_REFRESH: source_refresh,
             JobKind.CHAPTER_DOWNLOAD: chapter_download,
             JobKind.KAVITA_SYNC: kavita_sync,
+            JobKind.LIBRARY_REPAIR: library_repair,
+            JobKind.COVER_BACKFILL: cover_backfill,
             JobKind.MAINTENANCE: maintenance,
         },
         settings=settings,

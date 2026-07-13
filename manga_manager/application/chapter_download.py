@@ -4,7 +4,6 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html import escape
-from pathlib import Path
 
 import httpx
 from sqlalchemy import select
@@ -27,7 +26,7 @@ from manga_manager.application.job_handlers import (
     RetryableJobError,
     exception_message,
 )
-from manga_manager.domain.jobs import ChapterDownloadPayload, JobKind, KavitaSyncPayload
+from manga_manager.domain.jobs import ChapterDownloadPayload, JobKind, LibraryRepairPayload
 from manga_manager.infrastructure.artifact_repository import ArtifactRepository
 from manga_manager.infrastructure.db_models import (
     CatalogChapter,
@@ -131,6 +130,14 @@ class ChapterDownloadHandler:
             url=snapshot.release_url,
             published_at=snapshot.published_at,
         )
+        with self.session_factory() as progress_session, progress_session.begin():
+            self.queue.progress(
+                progress_session,
+                job_id=context.lease.id,
+                owner=context.lease.owner,
+                message=f"connecting to {snapshot.source}",
+                details={"phase": "download", "processed": 0, "total": 0, "unit": "pages"},
+            )
 
         def report_page(processed: int, total: int, byte_count: int) -> None:
             context.ensure_lease()
@@ -294,14 +301,15 @@ class ChapterDownloadHandler:
                 source=snapshot.source,
                 replace=True,
             )
+            # Publish the projection before making repair work claimable. Otherwise a fast
+            # maintenance worker can normalize the CBZ and the downloader can overwrite that
+            # projection with the stale pre-repair blob afterward.
+            self.storage.materialize(blob.relative_path, result.projection_relative_path)
             self.queue.enqueue(
                 session,
-                kind=JobKind.KAVITA_SYNC,
-                dedupe_key=f"series:{snapshot.series_id}",
-                payload=KavitaSyncPayload(
-                    series_id=snapshot.series_id,
-                    folder_path=str(self.storage.library_root / Path(projection_relative).parent),
-                ),
+                kind=JobKind.LIBRARY_REPAIR,
+                dedupe_key=f"artifact:{result.artifact_id}",
+                payload=LibraryRepairPayload(series_id=snapshot.series_id, reason="download"),
                 priority=100,
                 series_key=str(snapshot.series_id),
             )
@@ -319,7 +327,6 @@ class ChapterDownloadHandler:
                     details_json={"artifact_id": result.artifact_id},
                 )
             )
-        self.storage.materialize(blob.relative_path, result.projection_relative_path)
 
     def _reroute(
         self,
@@ -336,11 +343,22 @@ class ChapterDownloadHandler:
             if job is None or release is None or job.status != "leased":
                 return False
             coordinator = DownloadPlanCoordinator(self.queue)
+            payload = ChapterDownloadPayload.model_validate(job.payload)
+            attempted = set(payload.attempted_sources) | {snapshot.source}
+            if payload.preferred_only:
+                release.downloadable_after = retry_at
+                return False
             alternative = coordinator.fallback_release(
-                session, snapshot.chapter_id, snapshot.release_id
+                session,
+                snapshot.chapter_id,
+                snapshot.release_id,
+                excluded_sources=attempted,
             )
             if alternative is None:
                 release.downloadable_after = retry_at
+                job.payload = payload.model_copy(
+                    update={"attempted_sources": tuple(sorted(attempted))}
+                ).model_dump(mode="json")
                 session.add(
                     ChapterReleaseAttempt(
                         chapter_id=snapshot.chapter_id,
@@ -383,7 +401,7 @@ class ChapterDownloadHandler:
                 state = CatalogSourceState(source=source)
                 session.add(state)
                 session.flush()
-            failures = state.consecutive_failures + 1
+            failures = (state.consecutive_failures or 0) + 1
             if cooldown_until is None and failures >= self.circuit_breaker_failures:
                 cooldown_until = utcnow() + self._cooldown(source)
             state.consecutive_failures = failures

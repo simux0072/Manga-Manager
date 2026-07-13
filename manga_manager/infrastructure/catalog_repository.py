@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import select, text
+from sqlalchemy import delete, func, select, text
 from sqlalchemy.orm import Session
 
 from app.domain import ChapterItem, SeriesItem
@@ -23,6 +23,7 @@ from manga_manager.infrastructure.db_models import (
     CatalogSourceState,
     ProviderPolicy,
 )
+from app.adapters.asura import split_asura_source_id
 
 
 def utcnow() -> datetime:
@@ -40,10 +41,12 @@ class CatalogRepository:
         item: SeriesItem,
         chapters: Iterable[ChapterItem],
     ) -> CatalogSourceSeries:
+        normalized_source_id, observed_revision = self._normalized_identity(item)
         source_series = session.scalar(
             select(CatalogSourceSeries).where(
                 CatalogSourceSeries.source == item.source,
-                CatalogSourceSeries.source_id == item.source_id,
+                (CatalogSourceSeries.normalized_source_id == normalized_source_id)
+                | (CatalogSourceSeries.source_id == item.source_id),
             )
         )
         if source_series is None:
@@ -60,6 +63,11 @@ class CatalogRepository:
                 series_id=series.id,
                 source=item.source,
                 source_id=item.source_id,
+                normalized_source_id=normalized_source_id,
+                revision_override=(
+                    str(item.metadata.get("asura_revision_override") or "")
+                    if item.source == "asura" else ""
+                ),
                 title=item.title,
                 normalized_title=normalize_title(item.title),
                 url=item.url,
@@ -74,6 +82,12 @@ class CatalogRepository:
 
         now = utcnow()
         source_series.title = item.title
+        source_series.source_id = normalized_source_id if item.source == "asura" else item.source_id
+        source_series.normalized_source_id = normalized_source_id
+        if item.source == "asura":
+            source_series.revision_override = str(
+                item.metadata.get("asura_revision_override") or ""
+            )
         source_series.normalized_title = normalize_title(item.title)
         source_series.url = item.url
         source_series.description = item.description
@@ -97,8 +111,15 @@ class CatalogRepository:
         )
         for chapter_item in chapters:
             self._upsert_chapter(session, series.id, source_series.id, chapter_item)
+        self._refresh_match_scores(session, source_series)
         session.flush()
         return source_series
+
+    @staticmethod
+    def _normalized_identity(item: SeriesItem) -> tuple[str, str]:
+        if item.source == "asura":
+            return split_asura_source_id(item.source_id)
+        return item.source_id.strip(), ""
 
     def record_poll_success(
         self,
@@ -203,23 +224,49 @@ class CatalogRepository:
             )
             if existing is not None:
                 continue
-            same_cover = bool(
-                item.cover_url
-                and candidate.cover_url
-                and normalized_url(item.cover_url) == normalized_url(candidate.cover_url)
-            )
+            from manga_manager.application.matching_score import score_series_pair
+
+            evidence = score_series_pair(session, candidate.series_id, source_series.series_id)
             session.add(
                 CatalogMatchDecision(
                     left_source_series_id=left_id,
                     right_source_series_id=right_id,
-                    confidence=0.94 if same_cover else 0.70,
+                    confidence=float(evidence["score"]),
                     evidence_json={
+                        **evidence,
                         "title_or_alias": sorted(normalized_values),
-                        "cover_match": same_cover,
                         "policy": "manual_review_required_without_shared_external_id",
                     },
+                    scorer_version=str(evidence["scorer_version"]),
+                    feature_vector_json=evidence,
                 )
             )
+
+    @staticmethod
+    def _refresh_match_scores(session: Session, source_series: CatalogSourceSeries) -> None:
+        from manga_manager.application.matching_score import score_series_pair
+
+        decisions = session.scalars(
+            select(CatalogMatchDecision).where(
+                CatalogMatchDecision.decision == "pending",
+                (CatalogMatchDecision.left_source_series_id == source_series.id)
+                | (CatalogMatchDecision.right_source_series_id == source_series.id),
+            )
+        ).all()
+        for decision in decisions:
+            left = session.get(CatalogSourceSeries, decision.left_source_series_id)
+            right = session.get(CatalogSourceSeries, decision.right_source_series_id)
+            if left is None or right is None:
+                continue
+            evidence = score_series_pair(session, left.series_id, right.series_id)
+            decision.confidence = float(evidence["score"])
+            decision.evidence_json = {
+                **evidence,
+                "title_or_alias": [left.title, right.title],
+                "policy": "manual_review_required",
+            }
+            decision.scorer_version = str(evidence["scorer_version"])
+            decision.feature_vector_json = evidence
 
     def _sync_aliases(
         self,
@@ -228,8 +275,24 @@ class CatalogRepository:
         source_series_id: int,
         aliases: Iterable[str],
     ) -> None:
+        values = list(aliases)
+        desired = {normalize_title(value) for value in values if normalize_title(value)}
+        stale = delete(CatalogSeriesAlias).where(
+            CatalogSeriesAlias.source_series_id == source_series_id
+        )
+        if desired:
+            stale = stale.where(CatalogSeriesAlias.normalized_value.not_in(desired))
+        session.execute(stale)
+        session.execute(
+            delete(CatalogSeriesAlias).where(
+                CatalogSeriesAlias.source_series_id == source_series_id,
+                func.lower(CatalogSeriesAlias.display_value).in_(
+                    ("asura scans home", "home", "manga list")
+                ),
+            )
+        )
         seen: set[str] = set()
-        for display_value in aliases:
+        for display_value in values:
             normalized = normalize_title(display_value)
             if not normalized or normalized in seen:
                 continue
@@ -341,18 +404,37 @@ class CatalogRepository:
         release.title = item.title
         release.url = item.url
         release.published_at = item.published_at
+        self._recompute_latest(session, series_id)
+
+    @staticmethod
+    def _recompute_latest(session: Session, series_id: int) -> None:
         series = session.get(CatalogSeries, series_id)
-        release_time = item.published_at or utcnow()
-        current_latest = series.latest_release_at if series is not None else None
-        if current_latest is not None and current_latest.tzinfo is None:
-            current_latest = current_latest.replace(tzinfo=timezone.utc)
-        if release_time.tzinfo is None:
-            release_time = release_time.replace(tzinfo=timezone.utc)
-        if series is not None and (current_latest is None or release_time >= current_latest):
-            series.latest_release_at = release_time
-            series.latest_release_number = item.number
-            series.latest_release_source = item.source
-            series.integrity_state = "healthy"
+        if series is None:
+            return
+        numeric = session.execute(
+            select(CatalogChapter, CatalogChapterRelease)
+            .join(CatalogChapterRelease)
+            .where(CatalogChapter.series_id == series_id, CatalogChapter.sort_number.is_not(None))
+            .order_by(CatalogChapter.sort_number.desc(), CatalogChapterRelease.id.desc())
+            .limit(1)
+        ).first()
+        fallback = None
+        if numeric is None:
+            fallback = session.execute(
+                select(CatalogChapter, CatalogChapterRelease)
+                .join(CatalogChapterRelease)
+                .where(CatalogChapter.series_id == series_id)
+                .order_by(CatalogChapterRelease.published_at.desc().nullslast(), CatalogChapterRelease.id.desc())
+                .limit(1)
+            ).first()
+        selected = numeric or fallback
+        if selected is None:
+            return
+        chapter, release = selected
+        series.latest_release_number = chapter.display_number
+        series.latest_release_source = release.source
+        series.latest_release_at = release.published_at or release.first_seen_at
+        series.integrity_state = "healthy"
 
     def _source_state(self, session: Session, source: str) -> CatalogSourceState:
         state = session.get(CatalogSourceState, source)
@@ -360,7 +442,3 @@ class CatalogRepository:
             state = CatalogSourceState(source=source)
             session.add(state)
         return state
-
-
-def normalized_url(value: str) -> str:
-    return value.strip().lower().split("?", 1)[0].rstrip("/")

@@ -1,0 +1,87 @@
+from __future__ import annotations
+
+from sqlalchemy import func, select
+
+from manga_manager.application.cover_evidence import CoverEvidenceService
+from manga_manager.application.job_handlers import JobContext
+from manga_manager.domain.jobs import CoverBackfillPayload, JobKind
+from manga_manager.infrastructure.db_models import (
+    CatalogCoverSignature,
+    CatalogSourceSeries,
+    WorkJob,
+)
+from manga_manager.infrastructure.job_queue import JobQueue
+from manga_manager.worker.runtime import SessionFactory
+
+
+class CoverBackfillHandler:
+    def __init__(self, *, session_factory: SessionFactory) -> None:
+        self.service = CoverEvidenceService(session_factory)
+
+    async def __call__(self, context: JobContext) -> None:
+        payload = context.lease.payload
+        if not isinstance(payload, CoverBackfillPayload):
+            raise RuntimeError("cover backfill handler received the wrong payload")
+        context.ensure_lease()
+        with self.service.session_factory() as session, session.begin():
+            JobQueue().progress(
+                session,
+                job_id=context.lease.id,
+                owner=context.lease.owner,
+                message="fetching and fingerprinting cover",
+                details={"phase": "cover", "processed": 0, "total": 1, "unit": "covers"},
+            )
+        await self.service.refresh_for_source_series(payload.source_series_id)
+        context.ensure_lease()
+        with self.service.session_factory() as session, session.begin():
+            JobQueue().progress(
+                session,
+                job_id=context.lease.id,
+                owner=context.lease.owner,
+                message="cover signature ready",
+                details={"phase": "cover", "processed": 1, "total": 1, "unit": "covers"},
+            )
+
+
+class CoverBackfillPlanner:
+    def __init__(self, queue: JobQueue | None = None) -> None:
+        self.queue = queue or JobQueue()
+
+    def enqueue_pending(self, session, *, limit: int = 10, chapter_threshold: int = 25) -> int:
+        active_chapters = int(
+            session.scalar(
+                select(func.count())
+                .select_from(WorkJob)
+                .where(
+                    WorkJob.kind == JobKind.CHAPTER_DOWNLOAD.value,
+                    WorkJob.status.in_(("queued", "leased", "retry_wait")),
+                )
+            )
+            or 0
+        )
+        if active_chapters >= chapter_threshold:
+            return 0
+        rows = session.scalars(
+            select(CatalogSourceSeries)
+            .where(CatalogSourceSeries.cover_url != "")
+            .where(
+                ~select(CatalogCoverSignature.source_series_id)
+                .where(CatalogCoverSignature.source_series_id == CatalogSourceSeries.id)
+                .exists()
+            )
+            .order_by(CatalogSourceSeries.last_checked_at.desc(), CatalogSourceSeries.id)
+            .limit(limit)
+        ).all()
+        created = 0
+        for row in rows:
+            _job, was_created = self.queue.enqueue(
+                session,
+                kind=JobKind.COVER_BACKFILL,
+                dedupe_key=f"cover:{row.id}",
+                payload=CoverBackfillPayload(source_series_id=row.id),
+                priority=300,
+                source=row.source,
+                group_key="cover-backfill",
+            )
+            created += int(was_created)
+        return created

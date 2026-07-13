@@ -66,3 +66,23 @@ def test_cli_exposes_transition_commands() -> None:
         ]
     )
     assert validate.command == "validate-legacy"
+    recovery = parser.parse_args(
+        ["repair-catalog-recovery", "legacy.db", "--report", "recovery.json", "--apply"]
+    )
+    assert recovery.command == "repair-catalog-recovery"
+    assert recovery.apply is True
+    training = parser.parse_args(["export-match-training", "training-data"])
+    assert training.command == "export-match-training"
+    library_repair = parser.parse_args(["enqueue-library-repair", "--all-tracked"])
+    assert library_repair.command == "enqueue-library-repair"
+    assert library_repair.all_tracked is True
+    provider_repair = parser.parse_args(
+        ["repair-provider-identities", "--report", "providers.json", "--apply"]
+    )
+    assert provider_repair.command == "repair-provider-identities"
+    assert provider_repair.apply is True
+    refresh_repair = parser.parse_args(
+        ["reconcile-refresh-queue", "--report", "refresh.json"]
+    )
+    assert refresh_repair.command == "reconcile-refresh-queue"
+    assert refresh_repair.apply is False

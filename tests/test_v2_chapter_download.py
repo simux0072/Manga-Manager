@@ -288,9 +288,10 @@ async def test_rate_limit_reroutes_same_chapter_to_next_provider(
 
     with sessions() as session:
         jobs = session.scalars(select(WorkJob).order_by(WorkJob.id)).all()
-        assert [row.status for row in jobs] == ["cancelled", "queued"]
-        assert jobs[1].source == "mangafire"
-        assert jobs[1].payload["chapter_release_id"] == releases[1].id
+        assert [row.status for row in jobs] == ["retry_wait"]
+        assert jobs[0].id == job.id
+        assert jobs[0].source == "mangafire"
+        assert jobs[0].payload["chapter_release_id"] == releases[1].id
         attempts = session.scalars(
             select(ChapterReleaseAttempt).order_by(ChapterReleaseAttempt.id)
         ).all()

@@ -67,21 +67,23 @@ class WorkerService:
             ),
             (
                 "download:asura",
-                2,
+                self.settings.asura_download_concurrency,
                 {JobKind.CHAPTER_DOWNLOAD},
             ),
             (
                 "download:kingofshojo",
-                4,
+                self.settings.kingofshojo_download_concurrency,
                 {JobKind.CHAPTER_DOWNLOAD},
             ),
             (
                 "download:mangafire",
-                4,
+                self.settings.mangafire_download_concurrency,
                 {JobKind.CHAPTER_DOWNLOAD},
             ),
             ("kavita", 1, {JobKind.KAVITA_SYNC}),
-            ("maintenance", 1, {JobKind.MAINTENANCE}),
+            ("maintenance", 1, {JobKind.LIBRARY_REPAIR}),
+            ("health", 1, {JobKind.MAINTENANCE}),
+            ("cover_backfill", 1, {JobKind.COVER_BACKFILL}),
         ]
         specs: list[tuple[int, str, set[JobKind]]] = []
         for pool, count, kinds in requested:

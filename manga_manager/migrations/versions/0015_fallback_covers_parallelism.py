@@ -20,7 +20,8 @@ def upgrade() -> None:
     op.execute(
         "UPDATE job SET pool = 'pull:' || source WHERE kind = 'source_pull' AND source <> ''"
     )
-    op.alter_column("provider_request_sample", "run_id", existing_type=sa.Integer(), nullable=True)
+    with op.batch_alter_table("provider_request_sample") as batch:
+        batch.alter_column("run_id", existing_type=sa.Integer(), nullable=True)
     op.add_column(
         "series_v2", sa.Column("cover_checksum", sa.String(64), nullable=False, server_default="")
     )
@@ -108,4 +109,5 @@ def downgrade() -> None:
     op.drop_column("series_v2", "cover_relative_path")
     op.drop_column("series_v2", "cover_checksum")
     op.execute("DELETE FROM provider_request_sample WHERE run_id IS NULL")
-    op.alter_column("provider_request_sample", "run_id", existing_type=sa.Integer(), nullable=False)
+    with op.batch_alter_table("provider_request_sample") as batch:
+        batch.alter_column("run_id", existing_type=sa.Integer(), nullable=False)

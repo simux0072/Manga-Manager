@@ -34,7 +34,8 @@ def sessions():
     with engine.begin() as connection:
         connection.execute(
             text(
-                "TRUNCATE job_event, worker_heartbeat, storage_state, job "
+                "TRUNCATE job_event, worker_heartbeat, storage_state, job, "
+                "workload_cycle, job_daily_aggregate "
                 "RESTART IDENTITY CASCADE"
             )
         )
@@ -96,6 +97,10 @@ def test_partial_unique_index_deduplicates_concurrent_enqueue(sessions) -> None:
         results = list(executor.map(enqueue, range(2)))
     assert len({job_id for job_id, _created in results}) == 1
     assert sorted(created for _job_id, created in results) == [False, True]
+    with factory() as session:
+        assert session.scalar(
+            text("SELECT count(*) FROM workload_cycle WHERE status='active'")
+        ) == 1
 
 
 def test_provider_permit_cap_is_atomic_across_workers(sessions) -> None:
@@ -219,7 +224,7 @@ def test_v2_migrations_round_trip_on_postgresql(sessions) -> None:
     command.upgrade(config, "head")
     with Session(create_engine(DATABASE_URL)) as session:
         assert session.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0016_refresh_storage_hardening"
+            "0018_workflow_progress_identity"
         )
         indexes = set(
             session.scalars(

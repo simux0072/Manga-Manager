@@ -9,7 +9,10 @@ from sqlalchemy import Engine, select, text
 from app.settings import settings as adapter_settings
 from app.kavita import configured_kavita_client
 from manga_manager.application.download_plans import DownloadPlanCoordinator
+from manga_manager.application.cover_backfill import CoverBackfillPlanner
 from manga_manager.application.kavita_sync import KavitaSyncPlanner
+from manga_manager.application.library_repair import LibraryRepairPlanner
+from manga_manager.application.job_retention import JobRetention
 from manga_manager.domain.jobs import JobKind, MaintenancePayload, SourcePullPayload
 from manga_manager.infrastructure.db_models import CatalogSourceState, ProviderPolicy
 from manga_manager.infrastructure.job_queue import JobQueue
@@ -112,8 +115,11 @@ class SourcePollScheduler:
         with self.session_factory() as session, session.begin():
             self.storage_capacity.refresh(session)
             DownloadPlanCoordinator(self.queue).bootstrap(session)
+            LibraryRepairPlanner(self.queue).enqueue_pending(session, limit=25)
+            count += CoverBackfillPlanner(self.queue).enqueue_pending(session, limit=10)
+            JobRetention().prune(session, now=current, batch=250)
             kavita = configured_kavita_client(
-                local_library_root=self.settings.storage_root / "library"
+                local_library_root=self.settings.storage_root / "kavita-library"
             )
             if kavita.configured:
                 KavitaSyncPlanner(self.queue).enqueue_pending(session, limit=25)
