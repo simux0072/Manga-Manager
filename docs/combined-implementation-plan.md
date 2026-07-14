@@ -18,21 +18,19 @@ part of this implementation.
 - [x] In-place provider rerouting, fair independent pools, and health isolation
 - [x] Grouped, paginated, live Job Center with three progress layers
 - [x] Terminal retention, daily aggregates, rollout docs, and operational safeguards
-- [ ] Python, PostgreSQL, frontend, browser, lint, build, staging, and recovery validation
-- [ ] Final diff review and structured commits
+- [x] Python, PostgreSQL, frontend, browser, lint, build, staging, and recovery validation
+- [x] Final diff review and structured commits
 
 ## Current Implementation State
 
 - Implemented: every catalog, matching, queue, worker-pool, progress, retention, UI, repair, staging,
   and documentation item below. Duplicate release repair now preserves artifacts, attempts, and job
   payload references. Staging and unattended validation use isolated names and single-run locking.
-- Remaining validation: rerun only the isolated staging rehearsal after the prior two unattended
-  instances raced. Both local and CI ARM64 validation passed; the race was in the wrapper, not the
-  application or image.
-- Latest validation: 180 Python tests plus eight PostgreSQL scheduling/recovery tests, migration
-  round-trip, Ruff, Vitest, production build, workflow parsing, and all 32 Firefox Playwright tests
-  pass. GitHub's prior browser failure occurred only during old setup-uv cache cleanup and is fixed
-  by the pending workflow commit.
+- Complete: the isolated staging rehearsal passed migrations, repair dry-run/apply pairs,
+  stage-check, the 1 GiB memory stress test, backup/restore, restart recovery, and probe execution.
+- Final validation: 180 Python tests plus eight PostgreSQL scheduling/recovery tests, migration
+  round-trip, Ruff, Vitest, production build, workflow parsing, all 32 Firefox Playwright tests,
+  local ARM64 runtime, and GitHub Verify run `29302565178` pass.
 
 ## Provider Identity and Chapter Metadata
 
