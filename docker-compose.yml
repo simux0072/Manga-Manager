@@ -1,3 +1,9 @@
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: 10m
+    max-file: "3"
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -14,13 +20,14 @@ services:
       retries: 5
     mem_limit: 384m
     restart: unless-stopped
+    logging: *default-logging
     networks: [internal]
 
   migrate:
     build: .
     environment:
       V2_DATABASE_URL: postgresql+psycopg://manga:${POSTGRES_PASSWORD:-manga}@postgres:5432/manga_manager
-    command: ["uv", "run", "--frozen", "manga-manager", "migrate"]
+    command: ["manga-manager", "migrate"]
     depends_on:
       postgres:
         condition: service_healthy
@@ -35,19 +42,20 @@ services:
       V2_DATABASE_URL: postgresql+psycopg://manga:${POSTGRES_PASSWORD:-manga}@postgres:5432/manga_manager
       V2_STORAGE_ROOT: /data
       V2_MIN_FREE_BYTES: ${V2_MIN_FREE_BYTES:-5368709120}
-    command: ["uv", "run", "--frozen", "uvicorn", "manga_manager.web.app:app", "--host", "0.0.0.0", "--port", "8000"]
+    command: ["uvicorn", "manga_manager.web.app:app", "--host", "0.0.0.0", "--port", "8000"]
     ports: ["${MANGA_MANAGER_PORT:-8000}:8000"]
     volumes: ["${MANGA_STORAGE_ROOT:-./storage-v2}:/data"]
     depends_on:
       migrate:
         condition: service_completed_successfully
     healthcheck:
-      test: ["CMD", "uv", "run", "--frozen", "python", "-c", "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=3))['ok']"]
+      test: ["CMD", "python", "-c", "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/healthz',timeout=3))['ok']"]
       interval: 15s
       timeout: 5s
       retries: 5
     mem_limit: 256m
     restart: unless-stopped
+    logging: *default-logging
     networks: [internal]
     labels:
       traefik.enable: ${TRAEFIK_ENABLE:-false}
@@ -61,7 +69,7 @@ services:
       V2_WORKER_ID: manga-manager
       V2_STORAGE_ROOT: /data
       V2_MIN_FREE_BYTES: ${V2_MIN_FREE_BYTES:-5368709120}
-    command: ["uv", "run", "--frozen", "manga-manager", "worker"]
+    command: ["manga-manager", "worker"]
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -69,12 +77,13 @@ services:
     restart: unless-stopped
     mem_limit: 1g
     healthcheck:
-      test: ["CMD", "uv", "run", "--frozen", "manga-manager", "doctor"]
+      test: ["CMD", "manga-manager", "doctor"]
       interval: 30s
       timeout: 10s
       start_period: 30s
       retries: 3
     networks: [internal]
+    logging: *default-logging
 
   maintenance:
     build: .
@@ -82,7 +91,7 @@ services:
     environment:
       V2_DATABASE_URL: postgresql+psycopg://manga:${POSTGRES_PASSWORD:-manga}@postgres:5432/manga_manager
       V2_STORAGE_ROOT: /data
-    command: ["uv", "run", "--frozen", "manga-manager", "reconcile-storage"]
+    command: ["manga-manager", "reconcile-storage"]
     depends_on:
       migrate:
         condition: service_completed_successfully

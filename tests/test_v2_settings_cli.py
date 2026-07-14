@@ -26,6 +26,11 @@ def test_cli_exposes_transition_commands() -> None:
     parser = build_parser()
     assert parser.parse_args(["migrate"]).command == "migrate"
     assert parser.parse_args(["worker"]).command == "worker"
+    diagnostics = parser.parse_args(
+        ["diagnostic-bundle", "--output", "/tmp/diagnostics.json", "--recent-failures", "25"]
+    )
+    assert diagnostics.command == "diagnostic-bundle"
+    assert diagnostics.recent_failures == 25
     pull = parser.parse_args(["enqueue-pull", "asura"])
     assert pull.command == "enqueue-pull"
     assert pull.source == "asura"

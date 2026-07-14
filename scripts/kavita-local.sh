@@ -2,14 +2,16 @@
 set -eu
 
 command="${1:-status}"
-project=manga-manager-stage
-network="$project-net"
-container=manga-manager-kavita
-volume=manga-manager-kavita-config
-state_dir="$PWD/.local"
-env_file="$state_dir/kavita.env"
+project="${STAGE_PROJECT:-manga-manager-stage}"
+network="${STAGE_NETWORK:-$project-net}"
+container="${KAVITA_CONTAINER:-$project-kavita}"
+volume="${KAVITA_CONFIG_VOLUME:-$project-kavita-config}"
+state_dir="${STAGE_STATE_DIR:-$PWD/.local}"
+env_file="${KAVITA_ENV_FILE:-$state_dir/kavita.env}"
+env_dir=$(dirname "$env_file")
+env_name=$(basename "$env_file")
 storage="${STAGE_STORAGE_ROOT:-$PWD/storage-v2-stage}"
-image="${KAVITA_IMAGE:-jvmilazz0/kavita:latest}"
+image="${KAVITA_IMAGE:-jvmilazz0/kavita:0.9.0.2}"
 
 case "$command" in
   down)
@@ -29,9 +31,9 @@ case "$command" in
   *) echo "usage: scripts/kavita-local.sh up|down|status|credentials" >&2; exit 2 ;;
 esac
 
-mkdir -p "$state_dir" "$storage/kavita-library"
+mkdir -p "$state_dir" "$env_dir" "$storage/kavita-library"
 chmod 700 "$state_dir"
-exec 8>"$state_dir/kavita-local.lock"
+exec 8>"$state_dir/$project-kavita-local.lock"
 if ! flock -n 8; then
   echo "another Kavita provisioning operation is already running" >&2
   exit 75
@@ -51,6 +53,7 @@ if docker container inspect "$container" >/dev/null 2>&1; then
 fi
 if ! docker container inspect "$container" >/dev/null 2>&1; then
   docker run -d --name "$container" --network "$network" -p "${KAVITA_PORT:-15000}:5000" \
+    --log-opt max-size=10m --log-opt max-file=3 \
     -e "TZ=${TZ:-UTC}" -v "$volume:/kavita/config" -v "$storage/kavita-library:/manga:ro" \
     --restart unless-stopped "$image" >/dev/null
 fi
@@ -67,12 +70,12 @@ fi
 app_image="$project:local"
 # Provisioning and the staged service must use the current checkout, not a stale local tag.
 docker build -t "$app_image" .
-docker run --rm --user "$(id -u):$(id -g)" --network "$network" -v "$state_dir:/state" \
+docker run --rm --user "$(id -u):$(id -g)" --network "$network" -v "$env_dir:/state" \
   -v "$PWD/scripts/kavita-e2e-setup.py:/app/scripts/kavita-e2e-setup.py:ro" \
   -e UV_CACHE_DIR=/tmp/uv-cache \
   -e KAVITA_E2E_URL="http://$container:5000" -e KAVITA_E2E_USERNAME="$username" \
   -e KAVITA_E2E_PASSWORD="$password" -e KAVITA_E2E_API_KEY="$api_key" \
-  -e KAVITA_ENV_OUTPUT=/state/kavita.env "$app_image" \
+  -e "KAVITA_ENV_OUTPUT=/state/$env_name" "$app_image" \
   /app/.venv/bin/python scripts/kavita-e2e-setup.py >/dev/null
 set -a
 . "$env_file"

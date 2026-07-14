@@ -71,10 +71,10 @@ jobs:
           done
           docker run --rm --platform linux/arm64 --network host \
             -e V2_DATABASE_URL=postgresql+psycopg://manga:manga@127.0.0.1:5432/manga_manager \
-            manga-manager:arm64-ci uv run --frozen manga-manager migrate
+            manga-manager:arm64-ci manga-manager migrate
           docker run --rm --platform linux/arm64 --network host \
             -e V2_DATABASE_URL=postgresql+psycopg://manga:manga@127.0.0.1:5432/manga_manager \
-            manga-manager:arm64-ci uv run --frozen manga-manager doctor
+            manga-manager:arm64-ci manga-manager doctor
 
   browser:
     runs-on: ubuntu-latest

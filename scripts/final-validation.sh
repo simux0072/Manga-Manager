@@ -58,7 +58,7 @@ set +e
   docker buildx build --platform linux/arm64 --load --tag "$arm_image" .
   docker image inspect "$arm_image" --format 'architecture={{.Architecture}} os={{.Os}}'
   docker run --rm --platform linux/arm64 "$arm_image" \
-    uv run --frozen manga-manager --help
+    manga-manager --help
 } 2>&1 | tee "$arm_log"
 arm_status=${PIPESTATUS[0]}
 set -e

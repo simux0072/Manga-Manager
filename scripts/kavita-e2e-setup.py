@@ -10,7 +10,9 @@ import urllib.error
 import urllib.request
 
 
-BASE_URL = os.environ.get("KAVITA_E2E_URL", "http://manga-manager-kavita-e2e:5000").rstrip("/")
+BASE_URL = os.environ.get("KAVITA_E2E_URL", "http://manga-manager-stage-kavita:5000").rstrip(
+    "/"
+)
 USERNAME = os.environ.get("KAVITA_E2E_USERNAME", "manga-manager-e2e")
 PASSWORD = os.environ.get("KAVITA_E2E_PASSWORD") or secrets.token_urlsafe(18)
 EXISTING_API_KEY = os.environ.get("KAVITA_E2E_API_KEY", "")

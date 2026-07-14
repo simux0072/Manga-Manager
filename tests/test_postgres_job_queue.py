@@ -14,6 +14,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from manga_manager.application.library_repair import enqueue_library_repair
+from manga_manager.application.diagnostics import build_diagnostic_bundle
 from manga_manager.domain.jobs import (
     ChapterDownloadPayload,
     JobKind,
@@ -252,6 +253,32 @@ def test_scheduler_advisory_lock_has_one_leader(sessions) -> None:
     replacement = try_acquire_scheduler_leadership(engine)
     assert replacement is not None
     replacement.release()
+
+
+def test_diagnostic_bundle_is_bounded_and_redacted(sessions, tmp_path: Path) -> None:
+    engine, factory = sessions
+    enqueue_jobs(factory, 1)
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE job SET status='failed',error_code='test_failure',"
+                "error_message='token=secret https://example.test/path?api_key=secret'"
+            )
+        )
+    storage = tmp_path / "storage"
+    storage.mkdir()
+
+    payload = build_diagnostic_bundle(
+        engine,
+        storage_root=storage,
+        recent_failure_limit=1,
+    )
+
+    assert payload["migration"] == "0018_workflow_progress_identity"
+    assert payload["database_bytes"] > 0
+    assert len(payload["recent_failures"]) == 1
+    assert "secret" not in payload["recent_failures"][0]["error_message"]
+    assert payload["storage"]["filesystem_total_bytes"] > 0
 
 
 def test_v2_migrations_round_trip_on_postgresql(sessions) -> None:

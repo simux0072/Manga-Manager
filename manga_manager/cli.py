@@ -32,6 +32,7 @@ from manga_manager.application.library_repair import (
 from manga_manager.application.catalog_recovery import CatalogRecovery, write_recovery_report
 from manga_manager.application.match_training import export_training_data
 from manga_manager.application.maintenance import MaintenanceHandler
+from manga_manager.application.diagnostics import build_diagnostic_bundle
 from manga_manager.application.provider_identity_repair import ProviderIdentityRepair
 from manga_manager.application.refresh_queue_reconcile import RefreshQueueReconciler
 from manga_manager.domain.jobs import (
@@ -95,6 +96,11 @@ def build_parser() -> argparse.ArgumentParser:
     subcommands.add_parser("migrate", help="upgrade the v2 PostgreSQL schema")
     subcommands.add_parser("worker", help="run the durable v2 worker")
     subcommands.add_parser("doctor", help="check v2 database connectivity and migration state")
+    diagnostics = subcommands.add_parser(
+        "diagnostic-bundle", help="write a bounded credential-redacted diagnostic snapshot"
+    )
+    diagnostics.add_argument("--output", type=Path, required=True)
+    diagnostics.add_argument("--recent-failures", type=int, default=200)
     stage = subcommands.add_parser("stage-check", help="verify staged database and storage health")
     stage.add_argument("--json", action="store_true", dest="json_output")
     stage.add_argument(
@@ -271,6 +277,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
 
     engine = create_database_engine(database_url)
+    if args.command == "diagnostic-bundle":
+        try:
+            payload = build_diagnostic_bundle(
+                engine,
+                storage_root=settings.storage_root,
+                recent_failure_limit=args.recent_failures,
+            )
+        except ValueError as exc:
+            parser.error(str(exc))
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        temporary = args.output.with_name(f".{args.output.name}.tmp")
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+        temporary.chmod(0o600)
+        temporary.replace(args.output)
+        print(
+            f"diagnostics={args.output} failures={len(payload['recent_failures'])} "
+            f"database_bytes={payload['database_bytes']}"
+        )
+        return 0
     if args.command == "repair-provider-identities":
         sessions = create_session_factory(engine)
         service = ProviderIdentityRepair()
