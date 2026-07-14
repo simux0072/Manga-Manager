@@ -27,3 +27,15 @@ UV_CACHE_DIR=/tmp/uv-cache uv run manga-manager benchmark-workers --source kingo
 Operations exposes learned jobs/pages, request intervals, endpoint cooldowns, recent benchmarks,
 frontier counts, workers, and leased permits. Do not raise static limits based on a short clean run;
 provider policies automatically expire and are re-explored conservatively.
+
+Health probes, cover backfill, library repair, Kavita, provider pulls, and each provider's downloads
+use independent PostgreSQL claim lanes. This permits useful work to overlap without bypassing global
+limits. Cover backfill has one low-priority worker and is scheduled only below 25 active chapter jobs.
+Fallback changes the provider on the same logical job, remembers attempted sources, and waits for the
+earliest cooldown instead of oscillating through cancel/recreate loops.
+
+The Job Center groups work only after applying its selected state tab. Provider polls share one
+workflow key with their discovered refreshes; chapter downloads group by workload cycle and canonical
+manga. Group and child feeds use keyset cursors so live SSE invalidations cannot shift offset pages.
+Succeeded/cancelled rows are rolled into daily aggregates after 14 days and failures after 90 days;
+active rows are never pruned and aggregate history is retained for 365 days.

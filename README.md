@@ -26,8 +26,10 @@ scripts/kavita-local.sh down
 ```
 
 Kavita credentials are generated once in `.local/kavita.env` with mode `0600`. The library is
-created automatically and mapped to the staged Manga Manager library. Use the Operations action or
-`manga-manager enqueue-kavita-pending` to synchronize existing downloaded series.
+created automatically and mapped to the tracked-only `storage-v2-stage/kavita-library` projection.
+Use the Operations action or `manga-manager enqueue-kavita-pending` to synchronize existing
+downloaded series. Manga Manager rewrites canonical `ComicInfo.xml`, waits for Kavita's asynchronous
+scan to finish, then uploads the chosen series cover to both the series and every chapter.
 
 ## Development
 
@@ -54,10 +56,36 @@ storage by default. Local staging uses 1 GiB (`STAGE_MIN_FREE_BYTES` overrides i
 - Provider request limits, cooldowns, fallbacks, and leased permits are global across workers.
 - `manga-manager enqueue-kavita-pending --limit 100` queues downloaded tracked series missing a
   current Kavita mapping.
+- `manga-manager enqueue-library-repair --all-tracked` queues a resumable canonical metadata and
+  tracked-only Kavita projection pass without needing the legacy SQLite catalog.
+- The scheduler automatically queues the same bounded repair for tracked artifacts missing their
+  Kavita projection, so upgrades heal incrementally without a one-off command.
+- Matches are review-only. Suggested matches combine title evidence with crop hashes and local ORB
+  geometry; Manual merge ranks the whole tracked library and accepts two or more provider-distinct
+  records (up to the configured provider count). Reviewed labels can be exported with
+  `export-match-training` without requiring a model.
 
 Legacy SQLite is not an application runtime. `audit-legacy`, `repair-legacy`, `validate-legacy`,
-`migrate-legacy-library`, and `import-cbz` remain available for one-time recovery.
+`migrate-legacy-library`, `audit-catalog-recovery`, `repair-catalog-recovery`, and `import-cbz`
+remain available for one-time recovery.
 
 See [local staging](docs/local-staging.md), [catalog repair](docs/catalog-repair.md),
 [concurrency tuning](docs/concurrency-tuning.md), [backup/restore](docs/postgresql-backup-restore.md),
 and [Pi deployment/rollback](docs/pi-deployment-and-rollback.md).
+
+### Provider identity and grouped queue rollout
+
+After migration, audit rotating provider identities before applying repairs:
+
+```bash
+uv run manga-manager repair-provider-identities --report reports/provider-identities-dry-run.json
+uv run manga-manager repair-provider-identities --report reports/provider-identities-applied.json --apply
+uv run manga-manager reconcile-refresh-queue --report reports/refresh-queue-dry-run.json
+uv run manga-manager reconcile-refresh-queue --report reports/refresh-queue-applied.json --apply
+```
+
+The Job Center reports both logical groups and raw tasks. A large refresh count normally represents
+distinct series discovered by one provider poll, not duplicate homepage requests. Active refreshes
+are deduplicated by provider identity and only materially newer observations are coalesced into the
+existing job. Refresh reconciliation preserves compatible v1/v2 work, regroups legacy rows, and
+rebuilds only unsupported payload versions; leased work receives one deferred replacement.

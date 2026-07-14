@@ -16,6 +16,8 @@ storage-v2/
 storage-v2-stage/
 pictures/
 backups/
+reports/
+training-data/
 node_modules/
 frontend/node_modules/
 frontend/dist/

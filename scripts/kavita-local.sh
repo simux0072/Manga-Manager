@@ -29,15 +29,24 @@ case "$command" in
   *) echo "usage: scripts/kavita-local.sh up|down|status|credentials" >&2; exit 2 ;;
 esac
 
-mkdir -p "$state_dir" "$storage/library"
+mkdir -p "$state_dir" "$storage/kavita-library"
 chmod 700 "$state_dir"
 docker network inspect "$network" >/dev/null 2>&1 || docker network create "$network" >/dev/null
 docker volume inspect "$volume" >/dev/null 2>&1 || docker volume create "$volume" >/dev/null
+expected_mount=$(cd "$storage/kavita-library" && pwd)
 if docker container inspect "$container" >/dev/null 2>&1; then
-  docker start "$container" >/dev/null
-else
+  current_mount=$(docker inspect -f \
+    '{{range .Mounts}}{{if eq .Destination "/manga"}}{{.Source}}{{end}}{{end}}' \
+    "$container")
+  if [ "$current_mount" != "$expected_mount" ]; then
+    docker rm -f "$container" >/dev/null
+  else
+    docker start "$container" >/dev/null
+  fi
+fi
+if ! docker container inspect "$container" >/dev/null 2>&1; then
   docker run -d --name "$container" --network "$network" -p "${KAVITA_PORT:-15000}:5000" \
-    -e "TZ=${TZ:-UTC}" -v "$volume:/kavita/config" -v "$storage/library:/manga:ro" \
+    -e "TZ=${TZ:-UTC}" -v "$volume:/kavita/config" -v "$storage/kavita-library:/manga:ro" \
     --restart unless-stopped "$image" >/dev/null
 fi
 

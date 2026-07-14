@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-project=manga-manager-stage
+project="${STAGE_PROJECT:-manga-manager-stage}"
 network="$project-net"
 postgres="$project-postgres"
 web="$project-web"
@@ -15,6 +15,14 @@ mode="${1:-rehearse}"
 build_requested=false
 if [ "$mode" = "serve" ] && [ "${2:-}" = "--build" ]; then build_requested=true; fi
 if [ "$mode" != "serve" ] && [ "$mode" != "down" ]; then build_requested=true; fi
+sources_enabled="${STAGE_ENABLE_SOURCES:-}"
+if [ -z "$sources_enabled" ]; then
+  if [ "$mode" = "serve" ] || [ -n "${STAGE_SMOKE_SOURCE:-}" ]; then
+    sources_enabled=true
+  else
+    sources_enabled=false
+  fi
+fi
 
 teardown() {
   docker rm -f "$worker" "$web" "$postgres" 2>/dev/null || true
@@ -37,6 +45,26 @@ wait_for_job() {
     esac
     attempts=$((attempts + 1))
     [ "$attempts" -lt "${STAGE_JOB_WAIT_ATTEMPTS:-120}" ] || return 1
+    sleep 1
+  done
+}
+
+wait_for_kind() {
+  kind="$1"
+  attempts=0
+  while :; do
+    active=$(docker exec "$postgres" psql -U manga -d manga_manager -Atc \
+      "SELECT count(*) FROM job WHERE kind='$kind' AND status IN ('queued','leased','retry_wait')")
+    failed=$(docker exec "$postgres" psql -U manga -d manga_manager -Atc \
+      "SELECT count(*) FROM job WHERE kind='$kind' AND status='failed'")
+    [ "${failed:-0}" -eq 0 ] || {
+      docker exec "$postgres" psql -U manga -d manga_manager -c \
+        "SELECT id,status,error_code,error_message FROM job WHERE kind='$kind' AND status='failed'"
+      return 1
+    }
+    [ "${active:-0}" -gt 0 ] || return 0
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt "${STAGE_REPAIR_WAIT_ATTEMPTS:-7200}" ] || return 1
     sleep 1
   done
 }
@@ -72,7 +100,7 @@ if [ "$build_requested" = true ] || ! docker image inspect "$image" >/dev/null 2
 fi
 docker network inspect "$network" >/dev/null 2>&1 || docker network create "$network" >/dev/null
 docker volume inspect "$db_volume" >/dev/null 2>&1 || docker volume create "$db_volume" >/dev/null
-docker rm -f "$postgres" "$web" "$worker" 2>/dev/null || true
+docker rm -f "$postgres" "$web" "$worker" >/dev/null 2>&1 || true
 docker run -d --name "$postgres" --network "$network" --memory 384m \
   -e POSTGRES_DB=manga_manager -e POSTGRES_USER=manga -e POSTGRES_PASSWORD=manga \
   -v "$db_volume:/var/lib/postgresql/data" postgres:16-alpine >/dev/null
@@ -112,6 +140,10 @@ if [ -n "${STAGE_LEGACY_DATABASE:-}" ]; then
         manga-manager migrate-legacy-library "$container_database" \
         --storage-root "$container_storage" \
         --report "$container_data/legacy-library-import.json" --apply
+      docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+        -e "V2_STORAGE_ROOT=$container_data" -v "$PWD:/host" "$image" uv run --frozen \
+        manga-manager repair-catalog-recovery "$container_database" \
+        --report "$container_data/catalog-recovery.json" --apply
       ;;
     *)
       docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
@@ -120,14 +152,33 @@ if [ -n "${STAGE_LEGACY_DATABASE:-}" ]; then
         -v "$legacy_storage:/legacy/storage:ro" "$image" uv run --frozen manga-manager \
         migrate-legacy-library /legacy/catalog.db --storage-root /legacy/storage \
         --report /data/legacy-library-import.json --apply
+      docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+        -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" \
+        -v "$legacy_database:/legacy/catalog.db:ro" "$image" uv run --frozen \
+        manga-manager repair-catalog-recovery /legacy/catalog.db \
+        --report /data/catalog-recovery.json --apply
       ;;
   esac
   docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
     -e V2_STORAGE_ROOT=/data -e V2_MIN_FREE_BYTES=0 -v "$data_dir:/data" "$image" \
     uv run --frozen manga-manager reconcile-storage
 fi
+docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+  -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" uv run --frozen manga-manager \
+  repair-provider-identities --report /data/provider-identities-dry-run.json
+docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+  -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" uv run --frozen manga-manager \
+  repair-provider-identities --report /data/provider-identities-applied.json --apply
+docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+  -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" uv run --frozen manga-manager \
+  reconcile-refresh-queue --report /data/refresh-queue-dry-run.json
+docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+  -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" uv run --frozen manga-manager \
+  reconcile-refresh-queue --report /data/refresh-queue-applied.json --apply
 docker run -d --name "$web" --network "$network" --memory 256m -p "${STAGE_PORT:-18000}:8000" \
   -e "V2_DATABASE_URL=$database_url" -e V2_STORAGE_ROOT=/data \
+  -e "V2_ENABLE_ASURA=$sources_enabled" -e "V2_ENABLE_MANGAFIRE=$sources_enabled" \
+  -e "V2_ENABLE_KINGOFSHOJO=$sources_enabled" \
   -e "V2_MIN_FREE_BYTES=$stage_min_free_bytes" \
   -e "KAVITA_URL=${KAVITA_URL:-}" -e "KAVITA_API_KEY=${KAVITA_API_KEY:-}" \
   -e "KAVITA_LIBRARY_ROOT=${KAVITA_LIBRARY_ROOT:-}" \
@@ -137,6 +188,8 @@ docker run -d --name "$worker" --network "$network" --memory 1g \
   --health-cmd "uv run --frozen manga-manager doctor" --health-interval 30s \
   --health-timeout 10s --health-start-period 30s --health-retries 3 \
   -e "V2_DATABASE_URL=$database_url" -e V2_STORAGE_ROOT=/data \
+  -e "V2_ENABLE_ASURA=$sources_enabled" -e "V2_ENABLE_MANGAFIRE=$sources_enabled" \
+  -e "V2_ENABLE_KINGOFSHOJO=$sources_enabled" \
   -e "V2_MIN_FREE_BYTES=$stage_min_free_bytes" \
   -e "KAVITA_URL=${KAVITA_URL:-}" -e "KAVITA_API_KEY=${KAVITA_API_KEY:-}" \
   -e "KAVITA_LIBRARY_ROOT=${KAVITA_LIBRARY_ROOT:-}" \
@@ -144,14 +197,23 @@ docker run -d --name "$worker" --network "$network" --memory 1g \
   uv run --frozen manga-manager worker >/dev/null
 
 attempt=0
-until docker exec "$web" uv run --frozen python -c "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/healthz'))['ok']"; do
-  attempt=$((attempt + 1)); [ "$attempt" -lt 30 ] || { docker logs "$web"; exit 1; }
+until docker exec "$web" uv run --frozen python -c "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/healthz'))['ok']" >/dev/null 2>&1; do
+  attempt=$((attempt + 1)); [ "$attempt" -lt "${STAGE_WEB_WAIT_ATTEMPTS:-120}" ] || {
+    docker logs "$web"
+    exit 1
+  }
   sleep 1
 done
 if [ "$mode" = "serve" ]; then
   printf '%s\n' "Manga Manager: http://127.0.0.1:${STAGE_PORT:-18000}" \
     "Stop: scripts/stage-local.sh down"
   exit 0
+fi
+if [ -n "${STAGE_LEGACY_DATABASE:-}" ]; then
+  wait_for_kind library_repair
+fi
+if [ -n "${KAVITA_URL:-}" ] && [ -n "${KAVITA_API_KEY:-}" ]; then
+  wait_for_kind kavita_sync
 fi
 docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
   -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" uv run --frozen manga-manager stage-check --json
@@ -182,8 +244,11 @@ docker exec "$postgres" dropdb -U manga manga_manager_restore
 
 docker restart "$web" "$worker" >/dev/null
 attempt=0
-until docker exec "$web" uv run --frozen python -c "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/healthz'))['ok']"; do
-  attempt=$((attempt + 1)); [ "$attempt" -lt 30 ] || { docker logs "$web"; exit 1; }
+until docker exec "$web" uv run --frozen python -c "import json,urllib.request; assert json.load(urllib.request.urlopen('http://127.0.0.1:8000/healthz'))['ok']" >/dev/null 2>&1; do
+  attempt=$((attempt + 1)); [ "$attempt" -lt "${STAGE_WEB_WAIT_ATTEMPTS:-120}" ] || {
+    docker logs "$web"
+    exit 1
+  }
   sleep 1
 done
 recovery_output=$(docker run --rm --network "$network" -e "V2_DATABASE_URL=$database_url" "$image" \
