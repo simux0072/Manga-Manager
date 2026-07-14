@@ -42,6 +42,9 @@ most one follow-up pass when genuinely new merge cleanup arrives.
 
 The Job Center groups work only after applying its selected state tab. Provider polls share one
 workflow key with their discovered refreshes; chapter downloads group by workload cycle and canonical
-manga. Group and child feeds use keyset cursors so live SSE invalidations cannot shift offset pages.
+manga. Metadata repair, Kavita synchronization, cover evidence, and health work group by kind within
+the current workload cycle, while a single task remains a normal job card. Group progress includes
+terminal siblings even when the selected tab shows only active children. Group and child feeds use
+keyset cursors so live SSE invalidations cannot shift offset pages.
 Succeeded/cancelled rows are rolled into daily aggregates after 14 days and failures after 90 days;
 active rows are never pruned and aggregate history is retained for 365 days.

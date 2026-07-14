@@ -27,3 +27,9 @@
 .match-batch-bar{position:sticky;top:0;z-index:3;display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;padding:1rem;margin-bottom:1rem;border:1px solid var(--border);border-radius:14px;background:color-mix(in srgb,var(--panel) 94%,transparent);backdrop-filter:blur(14px)}
 .match-select{position:absolute;top:.8rem;left:.8rem;z-index:2;padding:.35rem .55rem;border-radius:8px;background:var(--panel)}
 .match-card{position:relative}
+:root{--border:var(--line);--success:var(--green);--danger:var(--red)}
+html{scrollbar-gutter:stable}html.drawer-open{overflow:hidden}
+.job-drawer{inset:8px 8px 8px auto;width:min(560px,calc(100vw - 16px));overflow:hidden;border:1px solid #344258;border-radius:18px}
+.drawer-body{overscroll-behavior:contain;scrollbar-gutter:stable;scrollbar-color:#50627d transparent;scrollbar-width:thin}
+.cycle-legend{display:flex;flex-wrap:wrap;gap:.35rem .8rem;margin-top:.6rem;color:var(--muted);font-size:.72rem}.cycle-legend span:first-child{color:var(--text);font-weight:700}.danger-text{color:var(--red)!important}
+@media(max-width:640px){.job-drawer{inset:0;width:100%;border-radius:0;border-top:0;border-right:0;border-bottom:0}}

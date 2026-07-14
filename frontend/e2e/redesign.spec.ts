@@ -26,8 +26,14 @@ test('discovery filters immediately and jobs use an overlay drawer',async({page}
   const widthBefore=await page.locator('main').evaluate(node=>node.getBoundingClientRect().width)
   await page.getByRole('button',{name:/open job center/i}).click()
   await expect(page.getByRole('complementary',{name:'Job center'})).toBeVisible()
+  await expect(page.locator('html')).toHaveClass(/drawer-open/)
+  const drawerBounds=await page.getByRole('complementary',{name:'Job center'}).boundingBox()
+  expect(drawerBounds).not.toBeNull()
+  expect((page.viewportSize()?.width||0)-(drawerBounds!.x+drawerBounds!.width)).toBeGreaterThanOrEqual(7)
   const widthAfter=await page.locator('main').evaluate(node=>node.getBoundingClientRect().width)
   expect(widthAfter).toBe(widthBefore)
+  await page.getByRole('button',{name:'Close jobs'}).click()
+  await expect(page.locator('html')).not.toHaveClass(/drawer-open/)
 })
 
 test('manual merge workspace is searchable and limits selection to three',async({page})=>{

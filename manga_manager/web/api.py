@@ -917,7 +917,19 @@ def create_api_router(
         )
         if cycle is None:
             return {"id": None, "status": "settled", "total": 0, "successful": 0,
-                    "failed": 0, "cancelled": 0, "remaining": 0, "added": 0}
+                    "failed": 0, "cancelled": 0, "superseded": 0,
+                    "remaining": 0, "added": 0}
+        superseded = int(
+            session.scalar(
+                select(func.coalesce(func.sum(WorkJob.logical_units), 0)).where(
+                    WorkJob.cycle_id == cycle.id,
+                    WorkJob.status == "cancelled",
+                    WorkJob.error_message.like("coalesced into library repair job %"),
+                )
+            )
+            or 0
+        )
+        cancelled = max(cycle.cancelled_units - superseded, 0)
         settled = cycle.successful_units + cycle.failed_units + cycle.cancelled_units
         return {
             "id": cycle.id,
@@ -925,7 +937,8 @@ def create_api_router(
             "total": cycle.total_units,
             "successful": cycle.successful_units,
             "failed": cycle.failed_units,
-            "cancelled": cycle.cancelled_units,
+            "cancelled": cancelled,
+            "superseded": superseded,
             "remaining": max(cycle.total_units - settled, 0),
             "added": cycle.added_units,
             "started_at": cycle.started_at.isoformat(),
@@ -1019,11 +1032,27 @@ def create_api_router(
             }
             serialized = serialize_jobs(session, [representative])[0]
             is_pull_group = representative.kind in {"source_pull", "source_refresh"}
-            total = int(row.task_count)
-            done = sum(status_counts.get(value, 0) for value in ("succeeded", "failed", "cancelled"))
-            successful = status_counts.get("succeeded", 0)
-            failed_count = status_counts.get("failed", 0)
-            cancelled_count = status_counts.get("cancelled", 0)
+            all_status_counts = dict(
+                session.execute(
+                    select(WorkJob.status, func.count())
+                    .where(
+                        func.coalesce(
+                            func.nullif(WorkJob.group_key, ""),
+                            WorkJob.kind + ":" + func.cast(WorkJob.id, String),
+                        )
+                        == row.group_key
+                    )
+                    .group_by(WorkJob.status)
+                ).all()
+            )
+            total = sum(int(value) for value in all_status_counts.values())
+            done = sum(
+                int(all_status_counts.get(value, 0))
+                for value in ("succeeded", "failed", "cancelled")
+            )
+            successful = int(all_status_counts.get("succeeded", 0))
+            failed_count = int(all_status_counts.get("failed", 0))
+            cancelled_count = int(all_status_counts.get("cancelled", 0))
             active_view = not state or bool(set(state).intersection(ACTIVE_JOB_STATES))
             if active_view and (
                 ":download:" in row.group_key or row.group_key.startswith("download:")
@@ -1045,6 +1074,14 @@ def create_api_router(
                 "title": (
                     f"{representative.source.replace('_', ' ').title()} catalog pull"
                     if is_pull_group
+                    else "Normalize library metadata"
+                    if representative.kind == "library_repair"
+                    else "Synchronize downloaded manga with Kavita"
+                    if representative.kind == "kavita_sync"
+                    else "Build cover matching evidence"
+                    if representative.kind == "cover_backfill"
+                    else "Maintenance and health checks"
+                    if representative.kind == "maintenance"
                     else serialized["context"].get("title") or serialized["description"]
                 ),
                 "cover_url": serialized["context"].get("cover_url", ""),
@@ -1458,6 +1495,21 @@ def serialize_jobs(session: Session, rows: list[WorkJob]) -> list[dict[str, Any]
         if row.kind == "chapter_download" and row.payload.get("chapter_release_id")
     ]
     chapter_context: dict[int, dict[str, Any]] = {}
+    series_ids = {
+        int(row.payload["series_id"])
+        for row in rows
+        if row.kind in {"library_repair", "kavita_sync"} and row.payload.get("series_id")
+    }
+    series_context = {
+        series.id: {
+            "series_id": series.id,
+            "title": series.title,
+            "cover_url": series.cover_url,
+        }
+        for series in session.scalars(
+            select(CatalogSeries).where(CatalogSeries.id.in_(series_ids or {-1}))
+        )
+    }
     if release_ids:
         for release, chapter, series in session.execute(
             select(CatalogChapterRelease, CatalogChapter, CatalogSeries)
@@ -1507,13 +1559,30 @@ def serialize_jobs(session: Session, rows: list[WorkJob]) -> list[dict[str, Any]
         elif row.kind == "source_refresh":
             description = f"Refresh {row.payload.get('title', 'source series')}"
         elif row.kind == "kavita_sync":
-            description = "Synchronize downloaded manga with Kavita"
+            series_id = int(row.payload.get("series_id", 0))
+            context = series_context.get(series_id, {})
+            description = (
+                f"Synchronize {context['title']} with Kavita"
+                if context
+                else "Synchronize downloaded manga with Kavita"
+            )
         elif row.kind == "library_repair":
-            description = f"Normalize library metadata · series #{row.payload.get('series_id', '?')}"
+            series_id = int(row.payload.get("series_id", 0))
+            context = series_context.get(series_id, {})
+            description = (
+                f"Normalize library metadata · {context['title']}"
+                if context
+                else f"Normalize library metadata · series #{series_id or '?'}"
+            )
         elif row.kind == "cover_backfill":
             description = f"Build cover evidence · source series #{row.payload.get('source_series_id', '?')}"
         elif row.kind == "maintenance":
-            description = "Run storage and database health probe"
+            action = str(row.payload.get("action", ""))
+            if action.startswith("provider_probe_"):
+                source = action.removeprefix("provider_probe_").replace("_", " ").title()
+                description = f"Probe {source} provider recovery"
+            else:
+                description = "Run storage and database health probe"
         else:
             description = row.kind.replace("_", " ").title()
         result.append(

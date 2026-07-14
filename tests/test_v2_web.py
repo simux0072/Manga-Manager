@@ -500,6 +500,16 @@ async def test_job_group_and_child_keyset_cursors_do_not_repeat_rows() -> None:
                     priority=group + 1,
                     status="queued",
                 ))
+        session.add(
+            WorkJob(
+                kind="maintenance",
+                dedupe_key="cursor:0:complete",
+                payload={"version": 1, "action": "stage_probe"},
+                group_key="health:0",
+                priority=1,
+                status="succeeded",
+            )
+        )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -523,6 +533,9 @@ async def test_job_group_and_child_keyset_cursors_do_not_repeat_rows() -> None:
     assert first.status_code == second.status_code == 200
     assert first_keys.isdisjoint(second_keys)
     assert child_first.json()["items"][0]["id"] != child_second.json()["items"][0]["id"]
+    health = next(row for row in first.json()["items"] if row["key"] == "health:0")
+    assert health["progress"]["total"] == 3
+    assert health["progress"]["current"] == 1
 
 
 async def test_operations_hides_stale_worker_processes() -> None:

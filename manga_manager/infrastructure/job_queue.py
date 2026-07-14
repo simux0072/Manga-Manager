@@ -779,8 +779,13 @@ class JobQueue:
             return f"cycle:{cycle_id}:download:{series_key}"
         if kind in {JobKind.SOURCE_PULL, JobKind.SOURCE_REFRESH}:
             return workflow_key or f"pull:{source}"
-        if kind is JobKind.LIBRARY_REPAIR and series_key:
-            return f"repair:{series_key}"
+        if kind in {
+            JobKind.LIBRARY_REPAIR,
+            JobKind.KAVITA_SYNC,
+            JobKind.COVER_BACKFILL,
+            JobKind.MAINTENANCE,
+        }:
+            return f"cycle:{cycle_id}:maintenance:{kind.value}"
         return f"{kind.value}:{dedupe_key}"
 
     @staticmethod

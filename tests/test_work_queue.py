@@ -720,3 +720,31 @@ def test_download_group_is_scoped_to_workload_cycle(session: Session) -> None:
         series_key="42",
     )
     assert job.group_key == f"cycle:{job.cycle_id}:download:42"
+
+
+def test_maintenance_lanes_group_by_kind_within_the_workload_cycle(session: Session) -> None:
+    queue = JobQueue()
+    repair, _ = queue.enqueue(
+        session,
+        kind=JobKind.LIBRARY_REPAIR,
+        dedupe_key="series:42:repair",
+        payload=LibraryRepairPayload(series_id=42),
+        series_key="42",
+    )
+    second_repair, _ = queue.enqueue(
+        session,
+        kind=JobKind.LIBRARY_REPAIR,
+        dedupe_key="series:43:repair",
+        payload=LibraryRepairPayload(series_id=43),
+        series_key="43",
+    )
+    kavita, _ = queue.enqueue(
+        session,
+        kind=JobKind.KAVITA_SYNC,
+        dedupe_key="series:42",
+        payload=KavitaSyncPayload(series_id=42),
+        series_key="42",
+    )
+    assert repair.group_key == second_repair.group_key
+    assert repair.group_key == f"cycle:{repair.cycle_id}:maintenance:library_repair"
+    assert kavita.group_key == f"cycle:{kavita.cycle_id}:maintenance:kavita_sync"

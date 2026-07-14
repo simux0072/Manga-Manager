@@ -46,6 +46,7 @@ describe('media library frontend',()=>{
     vi.stubGlobal('fetch',vi.fn((input:string|URL|Request)=>{
       const url=String(input)
       if(url.includes('/api/v2/operations'))return response({job_counts:{},health:{series:1,chapters:1,active_artifacts:0,missing_projections:0},sources:[],workers:[],permits:{}})
+      if(url.includes('/api/v2/workload-cycle'))return response({id:1,status:'active',total:10,successful:6,failed:0,cancelled:0,superseded:2,remaining:2,added:10})
       if(url.includes('/api/v2/discovery'))return response({items:[series],next_cursor:null})
       if(url.includes('/api/v2/jobs'))return response({items:[],next_cursor:null})
       return response({items:[],next_cursor:null})
@@ -68,8 +69,12 @@ describe('media library frontend',()=>{
     await screen.findByText(series.title)
     await userEvent.click(screen.getByRole('button',{name:/active/i}))
     expect(screen.getByRole('complementary',{name:'Job center'})).toBeInTheDocument()
+    expect(document.documentElement).toHaveClass('drawer-open')
+    expect(await screen.findByText('2 duplicates removed')).toBeInTheDocument()
     expect(screen.getByRole('button',{name:'failed'})).toBeInTheDocument()
     expect(screen.getByRole('button',{name:'running'})).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button',{name:'Close jobs'}))
+    expect(document.documentElement).not.toHaveClass('drawer-open')
   })
 
   it('previews and confirms a manual cross-provider merge',async()=>{

@@ -183,7 +183,10 @@ class LibraryRepairPlanner:
             except ValueError:
                 continue
             canonical_key = f"series:{series_id}:repair"
+            cycle_id = group[0].cycle_id or 0
+            repair_group_key = f"cycle:{cycle_id}:maintenance:library_repair"
             if len(group) == 1 and group[0].dedupe_key == canonical_key:
+                group[0].group_key = repair_group_key
                 continue
             keeper = next(
                 (job for job in group if job.status == JobState.LEASED.value),
@@ -223,7 +226,7 @@ class LibraryRepairPlanner:
             if keeper.dedupe_key != canonical_key:
                 keeper.dedupe_key = canonical_key
                 canonicalized += 1
-            keeper.group_key = f"repair:{series_key}"
+            keeper.group_key = repair_group_key
         session.flush()
         return canonicalized, cancelled
 
