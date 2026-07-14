@@ -31,6 +31,11 @@ esac
 
 mkdir -p "$state_dir" "$storage/kavita-library"
 chmod 700 "$state_dir"
+exec 8>"$state_dir/kavita-local.lock"
+if ! flock -n 8; then
+  echo "another Kavita provisioning operation is already running" >&2
+  exit 75
+fi
 docker network inspect "$network" >/dev/null 2>&1 || docker network create "$network" >/dev/null
 docker volume inspect "$volume" >/dev/null 2>&1 || docker volume create "$volume" >/dev/null
 expected_mount=$(cd "$storage/kavita-library" && pwd)

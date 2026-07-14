@@ -2,6 +2,13 @@
 set -eu
 
 project="${STAGE_PROJECT:-manga-manager-stage}"
+state_dir="${STAGE_STATE_DIR:-$PWD/.local}"
+mkdir -p "$state_dir"
+exec 9>"$state_dir/$project-stage.lock"
+if ! flock -n 9; then
+  echo "another $project startup or teardown is already running" >&2
+  exit 75
+fi
 network="$project-net"
 postgres="$project-postgres"
 web="$project-web"
@@ -15,6 +22,10 @@ mode="${1:-rehearse}"
 build_requested=false
 if [ "$mode" = "serve" ] && [ "${2:-}" = "--build" ]; then build_requested=true; fi
 if [ "$mode" != "serve" ] && [ "$mode" != "down" ]; then build_requested=true; fi
+run_repairs="${STAGE_RUN_REPAIRS:-}"
+if [ -z "$run_repairs" ]; then
+  if [ "$mode" = "serve" ]; then run_repairs=false; else run_repairs=true; fi
+fi
 sources_enabled="${STAGE_ENABLE_SOURCES:-}"
 if [ -z "$sources_enabled" ]; then
   if [ "$mode" = "serve" ] || [ -n "${STAGE_SMOKE_SOURCE:-}" ]; then
@@ -163,18 +174,20 @@ if [ -n "${STAGE_LEGACY_DATABASE:-}" ]; then
     -e V2_STORAGE_ROOT=/data -e V2_MIN_FREE_BYTES=0 -v "$data_dir:/data" "$image" \
     uv run --frozen manga-manager reconcile-storage
 fi
-docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
-  -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" uv run --frozen manga-manager \
-  repair-provider-identities --report /data/provider-identities-dry-run.json
-docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
-  -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" uv run --frozen manga-manager \
-  repair-provider-identities --report /data/provider-identities-applied.json --apply
-docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
-  -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" uv run --frozen manga-manager \
-  reconcile-refresh-queue --report /data/refresh-queue-dry-run.json
-docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
-  -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" uv run --frozen manga-manager \
-  reconcile-refresh-queue --report /data/refresh-queue-applied.json --apply
+if [ "$run_repairs" = true ]; then
+  docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+    -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" uv run --frozen manga-manager \
+    repair-provider-identities --report /data/provider-identities-dry-run.json
+  docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+    -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" uv run --frozen manga-manager \
+    repair-provider-identities --report /data/provider-identities-applied.json --apply
+  docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+    -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" uv run --frozen manga-manager \
+    reconcile-refresh-queue --report /data/refresh-queue-dry-run.json
+  docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+    -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" uv run --frozen manga-manager \
+    reconcile-refresh-queue --report /data/refresh-queue-applied.json --apply
+fi
 docker run -d --name "$web" --network "$network" --memory 256m -p "${STAGE_PORT:-18000}:8000" \
   -e "V2_DATABASE_URL=$database_url" -e V2_STORAGE_ROOT=/data \
   -e "V2_ENABLE_ASURA=$sources_enabled" -e "V2_ENABLE_MANGAFIRE=$sources_enabled" \

@@ -467,7 +467,11 @@ def _consolidate_overlapping_provider_identities(
             if conflict is None:
                 alias.source_series_id = keeper.id
             else:
-                session.delete(alias)
+                # A direct statement keeps ORM state aligned before deleting the duplicate source
+                # identity, whose database cascade would otherwise trigger a second DELETE warning.
+                session.execute(
+                    delete(CatalogSeriesAlias).where(CatalogSeriesAlias.id == alias.id)
+                )
         for identifier in session.scalars(
             select(CatalogExternalIdentifier).where(
                 CatalogExternalIdentifier.source_series_id == duplicate.id

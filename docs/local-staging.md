@@ -15,6 +15,12 @@ scripts/stage-local.sh serve --build
 scripts/stage-local.sh down
 ```
 
+Run only one launcher at a time. `scripts/kavita-local.sh up` provisions Kavita and then starts
+Manga Manager itself, so it replaces (rather than accompanies) `stage-local.sh serve --build`.
+Launch scripts use locks and reject a concurrent startup before it can restart PostgreSQL.
+Normal `serve` mode skips provider/queue repair; full rehearsals still run repairs. Set
+`STAGE_RUN_REPAIRS=true` only for an intentional, backed-up maintenance startup with workers quiet.
+
 For an automatically provisioned local Kavita integration:
 
 ```bash

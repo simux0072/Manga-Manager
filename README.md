@@ -25,6 +25,8 @@ scripts/kavita-local.sh credentials
 scripts/kavita-local.sh down
 ```
 
+`kavita-local.sh up` starts both services; do not run `stage-local.sh serve` concurrently.
+
 Kavita credentials are generated once in `.local/kavita.env` with mode `0600`. The library is
 created automatically and mapped to the tracked-only `storage-v2-stage/kavita-library` projection.
 Use the Operations action or `manga-manager enqueue-kavita-pending` to synchronize existing
