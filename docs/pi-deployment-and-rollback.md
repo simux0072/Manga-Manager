@@ -7,13 +7,26 @@ the local ARM64 rehearsal passes, and keep Authelia in front of this private app
 
 Before cutover:
 
-1. Run the local stage rehearsal with `STAGE_PLATFORM=linux/arm64`.
-2. Create a paired PostgreSQL/storage backup and record image digests and environment files.
-3. Mount Manga Manager's tracked-only `kavita-library/` into Kavita read-only and set
+1. Clone the repository on the Pi and run `scripts/test-environment.sh up` followed by
+   `TEST_ENV_SKIP_BROWSER=true scripts/test-environment.sh check`. This uses isolated PostgreSQL,
+   storage, ports, and Kavita; browser automation remains covered by CI and can be checked manually
+   from another machine against port 18001.
+2. Run `scripts/test-environment.sh scale-check`; verify the first catalog and grouped-job pages are
+   below one second and the worker remains below its 1 GiB limit.
+3. Optionally enqueue one pull per provider and at most one chapter per provider. Do not use a large
+   real catalog for initial acceptance.
+4. Reset the test environment and run the local stage rehearsal with `STAGE_PLATFORM=linux/arm64`.
+5. Create a paired PostgreSQL/storage backup and record image digests and environment files.
+6. Mount Manga Manager's tracked-only `kavita-library/` into Kavita read-only and set
    `KAVITA_LIBRARY_ROOT` to Kavita's view (for example `/manga`). Do not mount the full `library/`.
-4. Run migrations as a one-shot job, then start web and worker.
-5. Verify `/healthz`, Operations, a pull, a chapter download, a Kavita scan, and series/chapter covers.
-6. Only then switch the Traefik router.
+7. Run migrations as a one-shot job, then start web and worker.
+8. Verify `/healthz`, Operations, a pull, a chapter download, a Kavita scan, and series/chapter covers.
+9. Track two real manga and observe them for 24 hours before expanding the catalog.
+10. Only then switch the Traefik router.
+
+The test environment never talks to the normal Kavita configuration. Its media is generated locally
+and contains no copyrighted content. Use the production storage path only after isolated acceptance
+passes.
 
 For rollback, switch the router away, stop worker then web, restore the paired database/storage set,
 start the previous web image, verify health, start the previous worker, and restore the router. Never

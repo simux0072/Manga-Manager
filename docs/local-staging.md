@@ -15,6 +15,24 @@ scripts/stage-local.sh serve --build
 scripts/stage-local.sh down
 ```
 
+For normal feature work, prefer the small deterministic environment so provider traffic and a large
+archive tree do not slow builds:
+
+```bash
+scripts/test-environment.sh up
+scripts/test-environment.sh check
+scripts/test-environment.sh scale-check
+scripts/test-environment.sh down       # preserve its small database
+scripts/test-environment.sh reset --yes
+```
+
+It uses project `manga-manager-test`, ports 18001/15001, an isolated Kavita configuration, disabled
+live sources, two generated manga, and four tiny generated CBZs. `scale-check` uses a separate
+temporary project on port 18002, stops its worker before inserting 2,000 series and 25,000 jobs,
+checks cursor completeness/grouping/latency, and always tears itself down.
+Kavita is pinned to `jvmilazz0/kavita:0.9.0.2` for repeatability; set `KAVITA_IMAGE` explicitly to
+test a planned upgrade.
+
 Run only one launcher at a time. `scripts/kavita-local.sh up` provisions Kavita and then starts
 Manga Manager itself, so it replaces (rather than accompanies) `stage-local.sh serve --build`.
 Launch scripts use locks and reject a concurrent startup before it can restart PostgreSQL.
@@ -73,6 +91,26 @@ projections during a slow scan. Wait for them to settle, briefly stop the worker
 from the web container for a stable result. Failure output includes counts and at most 25 paths per
 category by default. Pass `--full-details` only when a complete machine-readable failure manifest is
 needed.
+
+Before deleting a staging catalog, use the preview-first reset workflow:
+
+```bash
+scripts/reset-local-data.sh preview
+scripts/reset-local-data.sh archive
+scripts/reset-local-data.sh apply --archive-dir local-archives/pre-reset-TIMESTAMP \
+  --include-legacy --yes
+```
+
+The archive command stops writers, creates a custom PostgreSQL dump and redacted diagnostics, then
+restores the dump into a disposable database. Apply refuses to run without the verified dump and
+checksum. It removes only known project resources; the local archive remains ignored and must be
+deleted manually after Raspberry Pi acceptance. `--include-legacy` also removes ignored legacy
+SQLite/storage data and generated browser/build output, while preserving `.env`, `.venv`,
+`frontend/node_modules`, and package caches.
+
+After the reset, reclaim old global Docker build cache separately only if this host is not relying on
+it for other projects: `docker builder prune --filter until=24h`. This is intentionally not part of
+the reset script because Docker build cache is host-global rather than Manga Manager-owned.
 
 Run frontend browser checks against the staged server with:
 

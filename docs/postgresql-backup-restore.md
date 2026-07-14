@@ -3,6 +3,10 @@
 Pair every database backup with a snapshot or backup of `V2_STORAGE_ROOT`. Stop the worker before
 the final pair so no artifact row can be committed between the two snapshots.
 
+For the local pre-reset archive, prefer `scripts/reset-local-data.sh archive`. It creates a custom
+dump, SHA-256 checksum, credential-redacted diagnostic bundle, and proves the dump can be restored
+before reporting success. Its output under `local-archives/` is ignored by Git.
+
 ```bash
 docker exec manga-manager-postgres pg_dump -U manga -d manga_manager -Fc \
   -f /tmp/manga-manager.dump

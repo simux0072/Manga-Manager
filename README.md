@@ -27,6 +27,19 @@ scripts/kavita-local.sh down
 
 `kavita-local.sh up` starts both services; do not run `stage-local.sh serve` concurrently.
 
+For fast, deterministic development without downloading a real catalog:
+
+```bash
+scripts/test-environment.sh up
+scripts/test-environment.sh check
+scripts/test-environment.sh scale-check
+scripts/test-environment.sh reset --yes
+```
+
+This isolated stack generates two synthetic manga and tiny valid CBZs at runtime. The scale check
+uses 2,000 database-only series and 25,000 jobs, then removes its disposable volume. No fixture media
+or databases are stored in Git.
+
 Kavita credentials are generated once in `.local/kavita.env` with mode `0600`. The library is
 created automatically and mapped to the tracked-only `storage-v2-stage/kavita-library` projection.
 Use the Operations action or `manga-manager enqueue-kavita-pending` to synchronize existing
@@ -66,6 +79,8 @@ storage by default. Local staging uses 1 GiB (`STAGE_MIN_FREE_BYTES` overrides i
   geometry; Manual merge ranks the whole tracked library and accepts two or more provider-distinct
   records (up to the configured provider count). Reviewed labels can be exported with
   `export-match-training` without requiring a model.
+- `manga-manager diagnostic-bundle --output diagnostics.json` writes a bounded, credential-redacted
+  database/provider/worker/storage snapshot suitable for issue reports.
 
 Legacy SQLite is not an application runtime. `audit-legacy`, `repair-legacy`, `validate-legacy`,
 `migrate-legacy-library`, `audit-catalog-recovery`, `repair-catalog-recovery`, and `import-cbz`

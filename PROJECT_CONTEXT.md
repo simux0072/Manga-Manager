@@ -32,8 +32,11 @@ bounded pending sync work.
 - Local service: `scripts/stage-local.sh serve --build`
 - Local service plus Kavita: `scripts/kavita-local.sh up`
 - Full rehearsal: `scripts/stage-local.sh`
+- Deterministic small/scale environment: `scripts/test-environment.sh up|check|scale-check`
+- Safe staging reset: `scripts/reset-local-data.sh preview|archive|apply`
 - PostgreSQL migration: `manga-manager migrate`
 - Legacy recovery: `audit-legacy`, `repair-legacy`, `validate-legacy`, `migrate-legacy-library`
 
 The Raspberry Pi/Traefik switch remains a separate deployment action. Generated storage, databases,
 logs, reports, backups, `.env`, and `.local/` credentials must never be committed.
+Synthetic fixtures are generated at runtime; test databases, covers, and CBZs remain ignored.
