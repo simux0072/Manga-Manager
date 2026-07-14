@@ -14,6 +14,8 @@ def test_media_cards_drawer_and_mobile_shell_contract() -> None:
     assert "minmax(320px,1fr)" in css
     assert ".job-drawer{position:fixed" in css
     assert ".drawer-scrim{position:fixed" in css
+    assert "width:min(560px,calc(100vw - 16px))" in css
+    assert "@media(max-width:640px){.job-drawer{inset:0" not in css
     assert "@media(max-width:640px)" in css
     assert ".bottom-nav{position:fixed" in css
 

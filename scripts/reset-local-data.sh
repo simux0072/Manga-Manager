@@ -99,6 +99,15 @@ ensure_postgres() {
   done
 }
 
+require_migrated_database() {
+  migration_table=$(docker exec "$postgres" psql -U manga -d manga_manager -Atc \
+    "SELECT to_regclass('public.alembic_version')")
+  [ "$migration_table" = "alembic_version" ] || {
+    echo "database is not migrated; run 'manga-manager migrate' before archiving" >&2
+    exit 1
+  }
+}
+
 create_archive() {
   timestamp=$(date -u +%Y%m%dT%H%M%SZ)
   [ -n "$archive_dir" ] || archive_dir="$PWD/local-archives/pre-reset-$timestamp"
@@ -109,6 +118,7 @@ create_archive() {
   docker stop "$worker" "$web" "$kavita_container" ${legacy_kavita_container:+"$legacy_kavita_container"} \
     >/dev/null 2>&1 || true
   ensure_postgres
+  require_migrated_database
   docker image inspect "$image" >/dev/null 2>&1 || {
     echo "application image not found: $image (build it before archiving)" >&2
     exit 1

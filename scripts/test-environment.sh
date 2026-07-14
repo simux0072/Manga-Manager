@@ -66,6 +66,22 @@ wait_for_mutations() {
   done
 }
 
+wait_for_stage_check() {
+  attempts=0
+  while :; do
+    if output=$(run_cli manga-manager stage-check --json 2>&1); then
+      printf '%s\n' "$output"
+      return 0
+    fi
+    printf '%s\n' "$output"
+    printf '%s\n' "$output" | grep -q '"busy": true' || return 1
+    attempts=$((attempts + 1))
+    [ "$attempts" -lt "${TEST_ENV_STAGE_CHECK_ATTEMPTS:-120}" ] || return 1
+    wait_for_mutations
+    sleep 1
+  done
+}
+
 case "$command" in
   up)
     mkdir -p "$root"
@@ -81,7 +97,7 @@ case "$command" in
   check)
     curl -fsS "http://127.0.0.1:$port/healthz" >/dev/null
     wait_for_mutations
-    run_cli manga-manager stage-check --json
+    wait_for_stage_check
     probe=$(run_cli manga-manager enqueue-probe)
     probe_id=$(printf '%s\n' "$probe" | sed -n 's/^job_id=\([0-9][0-9]*\).*/\1/p')
     attempts=0

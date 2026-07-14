@@ -77,6 +77,8 @@ def test_runtime_entrypoints_do_not_reinvoke_uv() -> None:
     environment = (ROOT / "scripts" / "test-environment.sh").read_text()
     assert "HostConfig.Memory" in environment
     assert "1073741824" in environment
+    assert "wait_for_stage_check" in environment
+    assert '\"busy\": true' in environment
 
 
 def test_reset_preview_names_legacy_kavita_resources() -> None:
@@ -98,6 +100,8 @@ def test_reset_archive_checksum_is_relocatable() -> None:
 
     assert 'sha256sum "$dump_name"' in reset_script
     assert 'sha256sum "$archive_dir/$dump_name"' not in reset_script
+    assert "SELECT to_regclass('public.alembic_version')" in reset_script
+    assert "database is not migrated" in reset_script
 
 
 def test_test_environment_refuses_reset_root_outside_repository() -> None:

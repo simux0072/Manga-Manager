@@ -20,3 +20,14 @@ reviewable outcomes.
 
 The large legacy archive was not used as a release fixture because mechanical-disk validation was
 I/O-bound. Subsequent acceptance uses generated small and database-only scale profiles.
+
+## 2026-07-14 post-reset acceptance
+
+- The 48 MB custom PostgreSQL archive passed SHA-256 verification, JSON diagnostics validation, and
+  a disposable restore at migration `0018_workflow_progress_identity` before the old media reset.
+- The isolated small environment passed CBZ integrity, Kavita series/chapter cover checks,
+  PostgreSQL backup/restore, deterministic probe execution, and all 32 Firefox viewport tests.
+- The isolated scale environment traversed 1,600 discovery rows exactly once and grouped 1,563
+  queued metadata tasks into one entry; first pages returned in 55 ms and 318 ms.
+- Runtime memory was 85 MiB worker, 93 MiB web, and 52 MiB PostgreSQL, within the configured 1 GiB,
+  256 MiB, and 384 MiB limits.
