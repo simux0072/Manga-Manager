@@ -115,7 +115,15 @@ class SourcePollScheduler:
         with self.session_factory() as session, session.begin():
             self.storage_capacity.refresh(session)
             DownloadPlanCoordinator(self.queue).bootstrap(session)
-            LibraryRepairPlanner(self.queue).enqueue_pending(session, limit=25)
+            repair_planner = LibraryRepairPlanner(self.queue)
+            canonicalized, cancelled = repair_planner.reconcile_active_jobs(session)
+            if canonicalized or cancelled:
+                logger.info(
+                    "coalesced library repair backlog: canonicalized=%s cancelled=%s",
+                    canonicalized,
+                    cancelled,
+                )
+            repair_planner.enqueue_pending(session, limit=25)
             count += CoverBackfillPlanner(self.queue).enqueue_pending(session, limit=10)
             JobRetention().prune(session, now=current, batch=250)
             kavita = configured_kavita_client(

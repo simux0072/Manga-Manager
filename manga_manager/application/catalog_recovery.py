@@ -8,10 +8,10 @@ from pathlib import Path
 from sqlalchemy import func, select
 
 from manga_manager.application.download_plans import DownloadPlanCoordinator
+from manga_manager.application.library_repair import enqueue_library_repair
 from manga_manager.domain.catalog import normalize_title
 from manga_manager.domain.jobs import (
     JobKind,
-    LibraryRepairPayload,
     SourcePullPayload,
     SourceRefreshPayload,
 )
@@ -171,13 +171,12 @@ class CatalogRecovery:
                     series.status = "reading" if record.legacy_status == "reading" else "interested"
                     coordinator.track(session, series.id)
                     recovered_series_ids.add(series.id)
-                    self.queue.enqueue(
+                    enqueue_library_repair(
                         session,
-                        kind=JobKind.LIBRARY_REPAIR,
-                        dedupe_key=f"series:{series.id}:legacy-recovery",
-                        payload=LibraryRepairPayload(series_id=series.id, reason="legacy_recovery"),
+                        series_id=series.id,
+                        reason="legacy_recovery",
                         priority=85,
-                        series_key=str(series.id),
+                        queue=self.queue,
                     )
                 elif record.action == "review_merge":
                     for series_id in record.series_ids:
@@ -191,15 +190,12 @@ class CatalogRecovery:
                         )
                         coordinator.track(session, series.id)
                         recovered_series_ids.add(series.id)
-                        self.queue.enqueue(
+                        enqueue_library_repair(
                             session,
-                            kind=JobKind.LIBRARY_REPAIR,
-                            dedupe_key=f"series:{series.id}:legacy-recovery",
-                            payload=LibraryRepairPayload(
-                                series_id=series.id, reason="legacy_recovery"
-                            ),
+                            series_id=series.id,
+                            reason="legacy_recovery",
                             priority=85,
-                            series_key=str(series.id),
+                            queue=self.queue,
                         )
                     self._create_review_pairs(session, record)
                 elif record.action == "create_track":
@@ -230,15 +226,12 @@ class CatalogRecovery:
                         refresh_sources.add(source)
                     coordinator.track(session, series.id)
                     recovered_series_ids.add(series.id)
-                    self.queue.enqueue(
+                    enqueue_library_repair(
                         session,
-                        kind=JobKind.LIBRARY_REPAIR,
-                        dedupe_key=f"series:{series.id}:legacy-recovery",
-                        payload=LibraryRepairPayload(
-                            series_id=series.id, reason="legacy_recovery"
-                        ),
+                        series_id=series.id,
+                        reason="legacy_recovery",
                         priority=85,
-                        series_key=str(series.id),
+                        queue=self.queue,
                     )
                     session.add(
                         CatalogObservation(

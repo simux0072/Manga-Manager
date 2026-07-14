@@ -15,7 +15,11 @@ from sqlalchemy.pool import StaticPool
 
 from manga_manager.application.cbz_import import LegacyCbzImporter
 from manga_manager.application.job_handlers import JobContext
-from manga_manager.application.library_repair import LibraryRepairHandler, LibraryRepairPlanner
+from manga_manager.application.library_repair import (
+    LibraryRepairHandler,
+    LibraryRepairPlanner,
+    enqueue_library_repair,
+)
 from manga_manager.domain.jobs import JobKind, LibraryRepairPayload
 from manga_manager.infrastructure.db_models import (
     ArtifactBlob,
@@ -174,3 +178,125 @@ def test_planner_queues_missing_tracked_projection_once(tmp_path: Path) -> None:
     with sessions() as session, session.begin():
         assert LibraryRepairPlanner().enqueue_pending(session) == (1, 0)
         assert session.scalar(select(func.count()).select_from(WorkJob)) == 1
+
+
+def test_repair_enqueue_coalesces_by_series_and_preserves_merge_cleanup() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    JobBase.metadata.create_all(engine)
+    sessions = sessionmaker(engine, expire_on_commit=False)
+    with sessions() as session, session.begin():
+        first, created = enqueue_library_repair(
+            session, series_id=12, reason="download", priority=100
+        )
+        assert created is True
+        second, created = enqueue_library_repair(
+            session, series_id=12, reason="download", priority=100
+        )
+        assert created is False
+        assert second.id == first.id
+        merged, created = enqueue_library_repair(
+            session,
+            series_id=12,
+            reason="merge",
+            priority=90,
+            obsolete_storage_keys=("old-b", "old-a"),
+        )
+        assert created is False
+        assert merged.id == first.id
+
+    with sessions() as session:
+        jobs = session.scalars(select(WorkJob)).all()
+        assert len(jobs) == 1
+        assert jobs[0].dedupe_key == "series:12:repair"
+        payload = LibraryRepairPayload.model_validate(jobs[0].payload)
+        assert payload.reason == "merge"
+        assert payload.obsolete_storage_keys == ("old-a", "old-b")
+
+
+def test_reconciler_collapses_legacy_artifact_jobs_per_series() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    JobBase.metadata.create_all(engine)
+    sessions = sessionmaker(engine, expire_on_commit=False)
+    with sessions() as session, session.begin():
+        queue = JobQueue()
+        for key, reason, obsolete in (
+            ("artifact:101", "download", ()),
+            ("artifact:102", "download", ()),
+            ("series:21:merge", "merge", ("old-title",)),
+        ):
+            queue.enqueue(
+                session,
+                kind=JobKind.LIBRARY_REPAIR,
+                dedupe_key=key,
+                payload=LibraryRepairPayload(
+                    series_id=21,
+                    reason=reason,
+                    obsolete_storage_keys=obsolete,
+                ),
+                series_key="21",
+            )
+        canonicalized, cancelled = LibraryRepairPlanner(queue).reconcile_active_jobs(session)
+        assert (canonicalized, cancelled) == (1, 2)
+
+    with sessions() as session:
+        active = session.scalars(
+            select(WorkJob).where(WorkJob.status.in_(("queued", "leased", "retry_wait")))
+        ).all()
+        assert len(active) == 1
+        assert active[0].dedupe_key == "series:21:repair"
+        payload = LibraryRepairPayload.model_validate(active[0].payload)
+        assert payload.reason == "merge"
+        assert payload.obsolete_storage_keys == ("old-title",)
+        assert session.scalar(
+            select(func.count()).select_from(WorkJob).where(WorkJob.status == "cancelled")
+        ) == 2
+
+
+def test_reconciler_preserves_new_cleanup_request_while_repair_is_leased() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    JobBase.metadata.create_all(engine)
+    sessions = sessionmaker(engine, expire_on_commit=False)
+    queue = JobQueue()
+    now = datetime.now(timezone.utc)
+    with sessions() as session, session.begin():
+        queue.enqueue(
+            session,
+            kind=JobKind.LIBRARY_REPAIR,
+            dedupe_key="artifact:201",
+            payload=LibraryRepairPayload(series_id=31, reason="download"),
+            series_key="31",
+            available_at=now,
+        )
+        lease = queue.claim(
+            session,
+            owner="repair-worker",
+            lease_for=timedelta(minutes=5),
+            now=now,
+            kinds={JobKind.LIBRARY_REPAIR},
+        )
+        assert lease is not None
+        queue.enqueue(
+            session,
+            kind=JobKind.LIBRARY_REPAIR,
+            dedupe_key="series:31:merge",
+            payload=LibraryRepairPayload(
+                series_id=31,
+                reason="merge",
+                obsolete_storage_keys=("retired-folder",),
+            ),
+            series_key="31",
+            available_at=now,
+        )
+        assert LibraryRepairPlanner(queue).reconcile_active_jobs(session) == (1, 1)
+        current = session.get(WorkJob, lease.id)
+        assert current is not None
+        pending = LibraryRepairPayload.model_validate(current.pending_payload)
+        assert pending.obsolete_storage_keys == ("retired-folder",)
+        assert queue.succeed(
+            session,
+            job_id=lease.id,
+            owner="repair-worker",
+            now=now + timedelta(seconds=1),
+        )
+        assert current.status == "queued"
+        assert current.dedupe_key == "series:31:repair"

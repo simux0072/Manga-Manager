@@ -16,12 +16,12 @@ from app.kavita import configured_kavita_client
 
 from manga_manager.domain.jobs import (
     JobKind,
-    LibraryRepairPayload,
     MaintenancePayload,
     SourcePullPayload,
 )
 from manga_manager.application.download_plans import DownloadPlanCoordinator
 from manga_manager.application.kavita_sync import KavitaSyncPlanner
+from manga_manager.application.library_repair import enqueue_library_repair
 from manga_manager.application.match_training import record_training_label
 from manga_manager.application.matching_score import strongest_candidate_score
 
@@ -375,13 +375,11 @@ def create_api_router(
                 coordinator.track(session, row.id)
             else:
                 coordinator.untrack(session, row.id)
-            JobQueue().enqueue(
+            enqueue_library_repair(
                 session,
-                kind=JobKind.LIBRARY_REPAIR,
-                dedupe_key=f"series:{row.id}:tracking",
-                payload=LibraryRepairPayload(series_id=row.id, reason="tracking"),
+                series_id=row.id,
+                reason="tracking",
                 priority=75,
-                series_key=str(row.id),
             )
         return {
             "item": serialize_series(session, [row], include_progress=True)[0],

@@ -13,7 +13,13 @@ from alembic.config import Config
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
-from manga_manager.domain.jobs import ChapterDownloadPayload, JobKind, MaintenancePayload
+from manga_manager.application.library_repair import enqueue_library_repair
+from manga_manager.domain.jobs import (
+    ChapterDownloadPayload,
+    JobKind,
+    LibraryRepairPayload,
+    MaintenancePayload,
+)
 from manga_manager.infrastructure.database import DEFAULT_ALEMBIC_CONFIG, run_migrations
 from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.infrastructure.scheduler_leadership import (
@@ -101,6 +107,39 @@ def test_partial_unique_index_deduplicates_concurrent_enqueue(sessions) -> None:
         assert session.scalar(
             text("SELECT count(*) FROM workload_cycle WHERE status='active'")
         ) == 1
+
+
+def test_concurrent_library_repairs_coalesce_without_losing_merge_cleanup(sessions) -> None:
+    _engine, factory = sessions
+    barrier = Barrier(2)
+
+    def enqueue(reason: str) -> tuple[int, bool]:
+        with factory() as session, session.begin():
+            barrier.wait()
+            job, created = enqueue_library_repair(
+                session,
+                series_id=44,
+                reason=reason,
+                obsolete_storage_keys=("retired-title",) if reason == "merge" else (),
+                priority=90 if reason == "merge" else 100,
+            )
+            return job.id, created
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(enqueue, ("download", "merge")))
+    assert len({job_id for job_id, _created in results}) == 1
+    assert sorted(created for _job_id, created in results) == [False, True]
+    with factory() as session:
+        payload = LibraryRepairPayload.model_validate(
+            session.execute(
+                text(
+                    "SELECT payload FROM job WHERE kind='library_repair' "
+                    "AND status IN ('queued','leased','retry_wait')"
+                )
+            ).scalar_one()
+        )
+        assert payload.reason == "merge"
+        assert payload.obsolete_storage_keys == ("retired-title",)
 
 
 def test_provider_permit_cap_is_atomic_across_workers(sessions) -> None:

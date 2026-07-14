@@ -8,9 +8,16 @@ from pathlib import Path
 from xml.etree import ElementTree
 
 from sqlalchemy import delete, func, or_, select
+from sqlalchemy.orm import Session
 
 from manga_manager.application.job_handlers import DeferredJobError, JobContext, RetryableJobError
-from manga_manager.domain.jobs import JobKind, KavitaSyncPayload, LibraryRepairPayload
+from manga_manager.domain.jobs import (
+    ACTIVE_JOB_STATES,
+    JobKind,
+    JobState,
+    KavitaSyncPayload,
+    LibraryRepairPayload,
+)
 from manga_manager.infrastructure.db_models import (
     ArtifactBlob,
     ArtifactMetadataRewrite,
@@ -19,6 +26,7 @@ from manga_manager.infrastructure.db_models import (
     ChapterArtifact,
     KavitaProjection,
     LibraryProjection,
+    WorkJob,
 )
 from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.infrastructure.storage import ContentAddressedStorage
@@ -27,6 +35,15 @@ from manga_manager.worker.runtime import SessionFactory
 
 
 TRACKED = {"interested", "reading", "caught_up", "paused"}
+ACTIVE_REPAIR_STATES = tuple(state.value for state in ACTIVE_JOB_STATES)
+REPAIR_REASON_PRIORITY = {
+    "merge": 60,
+    "manual_repair": 50,
+    "legacy_recovery": 40,
+    "tracking": 30,
+    "download": 20,
+    "automatic_projection_repair": 10,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,11 +60,172 @@ class RepairChapter:
     chapter_title: str
 
 
+def _merged_repair_payload(
+    series_id: int, payloads: list[LibraryRepairPayload]
+) -> LibraryRepairPayload:
+    obsolete_storage_keys = tuple(
+        sorted({key for payload in payloads for key in payload.obsolete_storage_keys if key})
+    )
+    reason = max(
+        (payload.reason for payload in payloads),
+        key=lambda value: REPAIR_REASON_PRIORITY.get(value, 0),
+        default="metadata",
+    )
+    if obsolete_storage_keys:
+        reason = "merge"
+    return LibraryRepairPayload(
+        series_id=series_id,
+        reason=reason,
+        obsolete_storage_keys=obsolete_storage_keys,
+    )
+
+
+def enqueue_library_repair(
+    session: Session,
+    *,
+    series_id: int,
+    reason: str,
+    priority: int,
+    obsolete_storage_keys: tuple[str, ...] = (),
+    queue: JobQueue | None = None,
+) -> tuple[WorkJob, bool]:
+    """Coalesce all new repair requests into one active job per canonical series."""
+
+    work_queue = queue or JobQueue()
+    dedupe_key = f"series:{series_id}:repair"
+    incoming = LibraryRepairPayload(
+        series_id=series_id,
+        reason=reason,
+        obsolete_storage_keys=obsolete_storage_keys,
+    )
+    existing = session.scalar(
+        select(WorkJob)
+        .where(
+            WorkJob.kind == JobKind.LIBRARY_REPAIR.value,
+            WorkJob.dedupe_key == dedupe_key,
+            WorkJob.status.in_(ACTIVE_REPAIR_STATES),
+        )
+        .with_for_update()
+    )
+
+    def merge_into(job: WorkJob) -> tuple[WorkJob, bool]:
+        job.priority = min(job.priority, priority)
+        payloads = [LibraryRepairPayload.model_validate(job.payload), incoming]
+        if job.pending_payload:
+            payloads.append(LibraryRepairPayload.model_validate(job.pending_payload))
+        payload = _merged_repair_payload(series_id, payloads)
+        current = (
+            LibraryRepairPayload.model_validate(job.pending_payload)
+            if job.status == JobState.LEASED.value and job.pending_payload
+            else LibraryRepairPayload.model_validate(job.payload)
+        )
+        if payload == current:
+            return job, False
+        if job.status == JobState.LEASED.value:
+            job.pending_payload = payload.model_dump(mode="json")
+        else:
+            job.payload = payload.model_dump(mode="json")
+            job.error_code = ""
+            job.error_message = ""
+        return job, False
+
+    if existing is not None:
+        return merge_into(existing)
+
+    job, created = work_queue.enqueue(
+        session,
+        kind=JobKind.LIBRARY_REPAIR,
+        dedupe_key=dedupe_key,
+        payload=incoming,
+        priority=priority,
+        series_key=str(series_id),
+    )
+    if created:
+        return job, True
+    # A concurrent transaction may have inserted the canonical job after the
+    # SELECT above. Lock and merge instead of dropping cleanup information.
+    existing = session.scalar(
+        select(WorkJob).where(WorkJob.id == job.id).with_for_update()
+    )
+    if existing is None:
+        raise RuntimeError("coalesced library repair job disappeared")
+    return merge_into(existing)
+
+
 class LibraryRepairPlanner:
     """Queue bounded repair work for tracked artifacts not yet projected to Kavita."""
 
     def __init__(self, queue: JobQueue | None = None) -> None:
         self.queue = queue or JobQueue()
+
+    def reconcile_active_jobs(self, session: Session) -> tuple[int, int]:
+        """Collapse legacy per-artifact repair jobs without losing merge cleanup work."""
+
+        jobs = session.scalars(
+            select(WorkJob)
+            .where(
+                WorkJob.kind == JobKind.LIBRARY_REPAIR.value,
+                WorkJob.status.in_(ACTIVE_REPAIR_STATES),
+                WorkJob.series_key != "",
+            )
+            .order_by(WorkJob.series_key, WorkJob.id)
+            .with_for_update()
+        ).all()
+        grouped: dict[str, list[WorkJob]] = {}
+        for job in jobs:
+            grouped.setdefault(job.series_key, []).append(job)
+
+        cancelled = 0
+        canonicalized = 0
+        for series_key, group in grouped.items():
+            try:
+                series_id = int(series_key)
+            except ValueError:
+                continue
+            canonical_key = f"series:{series_id}:repair"
+            if len(group) == 1 and group[0].dedupe_key == canonical_key:
+                continue
+            keeper = next(
+                (job for job in group if job.status == JobState.LEASED.value),
+                group[0],
+            )
+            payloads: list[LibraryRepairPayload] = []
+            for job in group:
+                payloads.append(LibraryRepairPayload.model_validate(job.payload))
+                if job.pending_payload:
+                    payloads.append(LibraryRepairPayload.model_validate(job.pending_payload))
+            merged = _merged_repair_payload(series_id, payloads)
+            for job in group:
+                if job.id == keeper.id:
+                    continue
+                if self.queue.cancel(
+                    session,
+                    job_id=job.id,
+                    reason=f"coalesced into library repair job {keeper.id}",
+                ):
+                    cancelled += 1
+            session.flush()
+            if keeper.status == JobState.LEASED.value:
+                current = LibraryRepairPayload.model_validate(keeper.payload)
+                pending = (
+                    LibraryRepairPayload.model_validate(keeper.pending_payload)
+                    if keeper.pending_payload
+                    else current
+                )
+                current_keys = set(current.obsolete_storage_keys) | set(
+                    pending.obsolete_storage_keys
+                )
+                if set(merged.obsolete_storage_keys) - current_keys:
+                    keeper.pending_payload = merged.model_dump(mode="json")
+            else:
+                keeper.payload = merged.model_dump(mode="json")
+                keeper.pending_payload = {}
+            if keeper.dedupe_key != canonical_key:
+                keeper.dedupe_key = canonical_key
+                canonicalized += 1
+            keeper.group_key = f"repair:{series_key}"
+        session.flush()
+        return canonicalized, cancelled
 
     def enqueue_pending(self, session, *, limit: int = 25) -> tuple[int, int]:
         active_artifact = (
@@ -101,16 +279,12 @@ class LibraryRepairPlanner:
         ).all()
         created = 0
         for series_id in rows:
-            _, was_created = self.queue.enqueue(
+            _, was_created = enqueue_library_repair(
                 session,
-                kind=JobKind.LIBRARY_REPAIR,
-                dedupe_key=f"series:{series_id}:automatic-repair",
-                payload=LibraryRepairPayload(
-                    series_id=series_id,
-                    reason="automatic_projection_repair",
-                ),
+                series_id=series_id,
+                reason="automatic_projection_repair",
                 priority=80,
-                series_key=str(series_id),
+                queue=self.queue,
             )
             created += int(was_created)
         return len(rows), created

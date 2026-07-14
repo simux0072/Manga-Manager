@@ -26,7 +26,8 @@ from manga_manager.application.job_handlers import (
     RetryableJobError,
     exception_message,
 )
-from manga_manager.domain.jobs import ChapterDownloadPayload, JobKind, LibraryRepairPayload
+from manga_manager.application.library_repair import enqueue_library_repair
+from manga_manager.domain.jobs import ChapterDownloadPayload
 from manga_manager.infrastructure.artifact_repository import ArtifactRepository
 from manga_manager.infrastructure.db_models import (
     CatalogChapter,
@@ -305,13 +306,12 @@ class ChapterDownloadHandler:
             # maintenance worker can normalize the CBZ and the downloader can overwrite that
             # projection with the stale pre-repair blob afterward.
             self.storage.materialize(blob.relative_path, result.projection_relative_path)
-            self.queue.enqueue(
+            enqueue_library_repair(
                 session,
-                kind=JobKind.LIBRARY_REPAIR,
-                dedupe_key=f"artifact:{result.artifact_id}",
-                payload=LibraryRepairPayload(series_id=snapshot.series_id, reason="download"),
+                series_id=snapshot.series_id,
+                reason="download",
                 priority=100,
-                series_key=str(snapshot.series_id),
+                queue=self.queue,
             )
             session.add(
                 ChapterReleaseAttempt(

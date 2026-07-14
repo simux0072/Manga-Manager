@@ -28,10 +28,10 @@ from manga_manager.infrastructure.db_models import (
     WorkJob,
 )
 from manga_manager.settings import V2Settings
-from manga_manager.domain.jobs import JobKind, LibraryRepairPayload
+from manga_manager.application.library_repair import enqueue_library_repair
+from manga_manager.domain.jobs import JobKind
 from manga_manager.domain.providers import SOURCE_PRIORITY, provider_names
 from manga_manager.domain.matching import provider_identities_equivalent
-from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.web.api import create_api_router
 
 
@@ -384,17 +384,12 @@ def merge_canonical_series(session: Session, series_ids: list[int]) -> int:
             ),
         )
     session.flush()
-    JobQueue().enqueue(
+    enqueue_library_repair(
         session,
-        kind=JobKind.LIBRARY_REPAIR,
-        dedupe_key=f"series:{target.id}:merge",
-        payload=LibraryRepairPayload(
-            series_id=target.id,
-            reason="merge",
-            obsolete_storage_keys=obsolete_storage_keys,
-        ),
+        series_id=target.id,
+        reason="merge",
+        obsolete_storage_keys=obsolete_storage_keys,
         priority=90,
-        series_key=str(target.id),
     )
     return target.id
 

@@ -25,7 +25,10 @@ from manga_manager.application.legacy_repair import (
 from manga_manager.application.cbz_import import LegacyCbzImporter, write_report
 from manga_manager.application.chapter_download import ChapterDownloadHandler
 from manga_manager.application.kavita_sync import KavitaSyncHandler, KavitaSyncPlanner
-from manga_manager.application.library_repair import LibraryRepairHandler
+from manga_manager.application.library_repair import (
+    LibraryRepairHandler,
+    enqueue_library_repair,
+)
 from manga_manager.application.catalog_recovery import CatalogRecovery, write_recovery_report
 from manga_manager.application.match_training import export_training_data
 from manga_manager.application.maintenance import MaintenanceHandler
@@ -35,7 +38,6 @@ from manga_manager.domain.jobs import (
     ChapterDownloadPayload,
     JobKind,
     KavitaSyncPayload,
-    LibraryRepairPayload,
     MaintenancePayload,
     SourcePullPayload,
 )
@@ -702,13 +704,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 series_ids = [args.series_id]
             created = 0
             for series_id in series_ids:
-                _, was_created = JobQueue().enqueue(
+                _, was_created = enqueue_library_repair(
                     session,
-                    kind=JobKind.LIBRARY_REPAIR,
-                    dedupe_key=f"series:{series_id}:manual-repair",
-                    payload=LibraryRepairPayload(series_id=series_id, reason="manual_repair"),
+                    series_id=series_id,
+                    reason="manual_repair",
                     priority=85,
-                    series_key=str(series_id),
                 )
                 created += int(was_created)
         print(f"eligible={len(series_ids)} created={created}")

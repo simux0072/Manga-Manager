@@ -34,6 +34,12 @@ limits. Cover backfill has one low-priority worker and is scheduled only below 2
 Fallback changes the provider on the same logical job, remembers attempted sources, and waits for the
 earliest cooldown instead of oscillating through cancel/recreate loops.
 
+Metadata normalization is incremental, not a final whole-library phase. Download, tracking, merge,
+recovery, and automatic repair requests coalesce into one active repair per canonical series. The
+scheduler also collapses older per-artifact repair backlogs, retaining one series job and preserving
+all obsolete storage keys required by completed merges. A repair already in progress receives at
+most one follow-up pass when genuinely new merge cleanup arrives.
+
 The Job Center groups work only after applying its selected state tab. Provider polls share one
 workflow key with their discovered refreshes; chapter downloads group by workload cycle and canonical
 manga. Group and child feeds use keyset cursors so live SSE invalidations cannot shift offset pages.
