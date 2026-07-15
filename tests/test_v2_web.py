@@ -509,6 +509,43 @@ async def test_jobs_activity_and_operations_have_human_context() -> None:
     assert probe.status_code == 200
 
 
+async def test_failed_views_exclude_failures_resolved_by_a_later_success() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        session.add_all(
+            [
+                WorkJob(
+                    kind="kavita_sync",
+                    dedupe_key="series:resolved",
+                    payload={"version": 1, "series_id": 2, "folder_path": ""},
+                    status="failed",
+                ),
+                WorkJob(
+                    kind="kavita_sync",
+                    dedupe_key="series:resolved",
+                    payload={"version": 1, "series_id": 2, "folder_path": ""},
+                    status="succeeded",
+                ),
+                WorkJob(
+                    kind="cover_backfill",
+                    dedupe_key="cover:unresolved",
+                    payload={"version": 1, "source_series_id": 1},
+                    status="failed",
+                ),
+            ]
+        )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        jobs = await client.get("/api/v2/jobs", params={"state": "failed"})
+        groups = await client.get("/api/v2/job-groups", params={"state": "failed"})
+        operations = await client.get("/api/v2/operations")
+
+    assert [row["kind"] for row in jobs.json()["items"]] == ["cover_backfill"]
+    assert [row["kind"] for row in groups.json()["items"]] == ["cover_backfill"]
+    assert operations.json()["job_counts"]["failed"] == 1
+
+
 async def test_workload_cycle_uses_live_active_units_when_counters_lag() -> None:
     app, sessions = app_with_catalog()
     with sessions() as session, session.begin():

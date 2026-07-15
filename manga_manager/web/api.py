@@ -57,6 +57,24 @@ TRACKED_STATES = ("interested", "reading", "caught_up", "paused")
 ACTIVE_JOB_STATES = ("queued", "leased", "retry_wait")
 
 
+def job_state_predicate(states: list[str]):
+    """Filter failed jobs to failures not resolved by a later successful equivalent job."""
+    if not states:
+        return None
+    non_failed = [state for state in states if state != "failed"]
+    if "failed" not in states:
+        return WorkJob.status.in_(non_failed)
+    later = aliased(WorkJob)
+    unresolved = ~select(later.id).where(
+        later.kind == WorkJob.kind,
+        later.dedupe_key == WorkJob.dedupe_key,
+        later.id > WorkJob.id,
+        later.status == "succeeded",
+    ).exists()
+    failed = and_(WorkJob.status == "failed", unresolved)
+    return or_(WorkJob.status.in_(non_failed), failed) if non_failed else failed
+
+
 class SeriesStateChange(BaseModel):
     status: str
 
@@ -904,7 +922,7 @@ def create_api_router(
     ):
         query = select(WorkJob)
         if state:
-            query = query.where(WorkJob.status.in_(state))
+            query = query.where(job_state_predicate(state))
         if cursor:
             query = query.where(WorkJob.id < cursor)
         rows = session.scalars(query.order_by(WorkJob.id.desc()).limit(limit)).all()
@@ -1000,7 +1018,7 @@ def create_api_router(
             available_at.label("available_at"),
         )
         if state:
-            query = query.where(WorkJob.status.in_(state))
+            query = query.where(job_state_predicate(state))
         query = query.group_by(key)
         if cursor:
             cursor_running, cursor_priority, cursor_available, cursor_id = decode_job_cursor(cursor)
@@ -1024,7 +1042,7 @@ def create_api_router(
                 ) == row.group_key
             )
             if state:
-                child_query = child_query.where(WorkJob.status.in_(state))
+                child_query = child_query.where(job_state_predicate(state))
             representative = session.scalar(
                 child_query.order_by(
                     (WorkJob.status == "leased").desc(),
@@ -1047,18 +1065,15 @@ def create_api_router(
             }
             serialized = serialize_jobs(session, [representative])[0]
             is_pull_group = representative.kind in {"source_pull", "source_refresh"}
-            all_status_counts = dict(
-                session.execute(
-                    select(WorkJob.status, func.count())
-                    .where(
+            count_query = select(WorkJob.status, func.count()).where(
                         func.coalesce(
                             func.nullif(WorkJob.group_key, ""),
                             WorkJob.kind + ":" + func.cast(WorkJob.id, String),
                         )
                         == row.group_key
                     )
-                    .group_by(WorkJob.status)
-                ).all()
+            all_status_counts = dict(
+                session.execute(count_query.group_by(WorkJob.status)).all()
             )
             total = sum(int(value) for value in all_status_counts.values())
             done = sum(
@@ -1129,7 +1144,7 @@ def create_api_router(
     ):
         query = select(WorkJob).where(WorkJob.group_key == group_key)
         if state:
-            query = query.where(WorkJob.status.in_(state))
+            query = query.where(job_state_predicate(state))
         if cursor:
             running, priority, available, job_id = decode_job_cursor(cursor)
             is_running = case((WorkJob.status == "leased", 1), else_=0)
@@ -1195,6 +1210,14 @@ def create_api_router(
     async def operations(session: SessionDep):
         counts = dict(
             session.execute(select(WorkJob.status, func.count()).group_by(WorkJob.status)).all()
+        )
+        counts["failed"] = int(
+            session.scalar(
+                select(func.count())
+                .select_from(WorkJob)
+                .where(job_state_predicate(["failed"]))
+            )
+            or 0
         )
         active_group_key = func.coalesce(
             func.nullif(WorkJob.group_key, ""),
