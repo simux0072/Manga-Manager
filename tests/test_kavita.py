@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from app.kavita import KavitaClient
+from app.kavita import KavitaClient, KavitaSeries
 
 
 class FakeResponse:
@@ -178,3 +178,91 @@ def test_kavita_path_translation_different_container_path(tmp_path):
     )
 
     assert client.kavita_path_for_local(local_path) == Path("/kavita-manga/Manga/Example")
+
+
+@pytest.mark.asyncio
+async def test_kavita_root_scan_skips_ambiguous_folder_endpoint(monkeypatch, tmp_path):
+    client = KavitaClient(
+        "http://kavita/",
+        "secret",
+        local_library_root=tmp_path / "library",
+        kavita_library_root=Path("/manga"),
+    )
+    calls: list[str] = []
+
+    async def scan_all():
+        calls.append("all")
+
+    async def scan_folder(_folder_path):
+        calls.append("folder")
+
+    async def list_series():
+        calls.append("list")
+        return []
+
+    monkeypatch.setattr(client, "scan_all", scan_all)
+    monkeypatch.setattr(client, "scan_folder", scan_folder)
+    monkeypatch.setattr(client, "list_series", list_series)
+
+    await client.scan_folder_or_all(tmp_path / "library")
+
+    assert calls == ["all"]
+
+
+@pytest.mark.asyncio
+async def test_kavita_duplicate_folder_scan_uses_full_scan(monkeypatch, tmp_path):
+    client = KavitaClient(
+        "http://kavita/",
+        "secret",
+        local_library_root=tmp_path / "library",
+        kavita_library_root=Path("/manga"),
+    )
+    calls: list[str] = []
+
+    async def scan_all():
+        calls.append("all")
+
+    async def scan_folder(_folder_path):
+        calls.append("folder")
+
+    async def list_series():
+        return [
+            KavitaSeries(id=1, name="Example", folder_path="/manga/Example"),
+            KavitaSeries(id=2, name="Example duplicate", folder_path="/manga/Example/"),
+        ]
+
+    monkeypatch.setattr(client, "scan_all", scan_all)
+    monkeypatch.setattr(client, "scan_folder", scan_folder)
+    monkeypatch.setattr(client, "list_series", list_series)
+
+    await client.scan_folder_or_all(tmp_path / "library" / "Example")
+
+    assert calls == ["all"]
+
+
+@pytest.mark.asyncio
+async def test_kavita_unique_folder_keeps_targeted_scan(monkeypatch, tmp_path):
+    client = KavitaClient(
+        "http://kavita/",
+        "secret",
+        local_library_root=tmp_path / "library",
+        kavita_library_root=Path("/manga"),
+    )
+    calls: list[str] = []
+
+    async def scan_all():
+        calls.append("all")
+
+    async def scan_folder(_folder_path):
+        calls.append("folder")
+
+    async def list_series():
+        return [KavitaSeries(id=1, name="Example", folder_path="/manga/Example")]
+
+    monkeypatch.setattr(client, "scan_all", scan_all)
+    monkeypatch.setattr(client, "scan_folder", scan_folder)
+    monkeypatch.setattr(client, "list_series", list_series)
+
+    await client.scan_folder_or_all(tmp_path / "library" / "Example")
+
+    assert calls == ["folder"]
