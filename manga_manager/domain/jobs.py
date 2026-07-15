@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import StrEnum
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -68,6 +69,7 @@ class CoverBackfillPayload(JobPayload):
 class KavitaSyncPayload(JobPayload):
     series_id: int = Field(gt=0)
     folder_path: str = Field(default="", max_length=4096)
+    reading_status: Literal["", "read", "unread"] = ""
 
 
 class LibraryRepairPayload(JobPayload):

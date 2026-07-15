@@ -107,6 +107,8 @@ async def test_kavita_client_folder_scan_series_and_want_to_read(monkeypatch, tm
     progress = await client.chapter_progress(42, pages_total=11)
     wanted = await client.want_to_read()
     await client.add_want_to_read([7])
+    await client.mark_series_read(7)
+    await client.mark_series_unread(7)
     await client.upload_series_cover(7, "data:image/png;base64,Y292ZXI=")
     await client.upload_chapter_cover(42, "Y292ZXI=")
 
@@ -125,6 +127,20 @@ async def test_kavita_client_folder_scan_series_and_want_to_read(monkeypatch, tm
     assert progress.pages_read == 11
     assert progress.pages_total == 11
     assert wanted[0].name == "Wanted"
+    assert {
+        "method": "POST",
+        "url": "http://kavita/api/Reader/mark-read",
+        "headers": {"x-api-key": "secret"},
+        "json": {"seriesId": 7},
+        "params": None,
+    } in FakeFullAsyncClient.requests
+    assert {
+        "method": "POST",
+        "url": "http://kavita/api/Reader/mark-unread",
+        "headers": {"x-api-key": "secret"},
+        "json": {"seriesId": 7},
+        "params": None,
+    } in FakeFullAsyncClient.requests
     assert {
         "method": "POST",
         "url": "http://kavita/api/Upload/series",

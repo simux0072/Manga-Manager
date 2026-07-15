@@ -257,6 +257,29 @@ async def test_chapter_and_bulk_read_state() -> None:
         assert session.get(CatalogChapterReadingState, chapter_id).status == "read"
 
 
+async def test_caught_up_marks_every_chapter_read_and_queues_kavita_write() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session:
+        series = session.query(CatalogSeries).filter_by(title="Tracked").one()
+        series_id = series.id
+        chapter_id = session.query(CatalogChapter).filter_by(series_id=series_id).one().id
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.patch(
+            f"/api/v2/series/{series_id}", json={"status": "caught_up"}
+        )
+    assert response.status_code == 200
+    assert response.json()["item"]["status"] == "caught_up"
+    assert response.json()["item"]["read_count"] == 1
+    with sessions() as session:
+        reading = session.get(CatalogChapterReadingState, chapter_id)
+        assert reading is not None and reading.status == "read"
+        job = session.query(WorkJob).filter_by(kind="kavita_sync").one()
+        assert job.payload["reading_status"] == "read"
+        assert job.priority == 20
+
+
 async def test_matches_return_human_evidence_and_require_confirmation() -> None:
     app, sessions = app_with_catalog()
     with sessions() as session:

@@ -179,6 +179,23 @@ class KavitaClient:
         payload = response.json()
         return parse_read_progress(payload, chapter_id, pages_total)
 
+    async def mark_series_read(self, series_id: int) -> None:
+        await self._mark_series("mark-read", series_id)
+
+    async def mark_series_unread(self, series_id: int) -> None:
+        await self._mark_series("mark-unread", series_id)
+
+    async def _mark_series(self, action: str, series_id: int) -> None:
+        if not self.configured:
+            return
+        async with httpx.AsyncClient(timeout=20) as client:
+            response = await client.post(
+                f"{self.base_url}/api/Reader/{action}",
+                headers=self.headers(),
+                json={"seriesId": series_id},
+            )
+            response.raise_for_status()
+
     async def want_to_read(self) -> list[KavitaSeries]:
         if not self.configured:
             return []

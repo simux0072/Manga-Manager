@@ -16,6 +16,7 @@ from app.kavita import configured_kavita_client
 
 from manga_manager.domain.jobs import (
     JobKind,
+    KavitaSyncPayload,
     MaintenancePayload,
     SourcePullPayload,
 )
@@ -253,6 +254,39 @@ def create_api_router(
 
     SessionDep = Annotated[Session, Depends(sessions)]
 
+    def mark_series_read_and_queue_kavita(
+        session: Session,
+        series: CatalogSeries,
+        changed_at: datetime,
+    ) -> int:
+        chapter_ids = session.scalars(
+            select(CatalogChapter.id).where(CatalogChapter.series_id == series.id)
+        ).all()
+        for chapter_id in chapter_ids:
+            reading = session.get(CatalogChapterReadingState, chapter_id)
+            if reading is None:
+                reading = CatalogChapterReadingState(chapter_id=chapter_id)
+                session.add(reading)
+            reading.status = "read"
+            reading.read_at = reading.read_at or changed_at
+            reading.updated_at = changed_at
+        if series.status not in {"paused", "untracked"}:
+            series.status = "caught_up"
+        series.updated_at = changed_at
+        kavita_job, _created = JobQueue().enqueue(
+            session,
+            kind=JobKind.KAVITA_SYNC,
+            dedupe_key=f"series:{series.id}",
+            payload=KavitaSyncPayload(series_id=series.id, reading_status="read"),
+            priority=20,
+            series_key=str(series.id),
+            coalesce=True,
+        )
+        if kavita_job.status in {"queued", "retry_wait"}:
+            kavita_job.priority = min(kavita_job.priority, 20)
+            kavita_job.available_at = changed_at
+        return len(chapter_ids)
+
     @router.get("/providers")
     async def providers():
         return {"items": list(provider_names())}
@@ -387,7 +421,10 @@ def create_api_router(
                 raise HTTPException(404, "series not found")
             previous = row.status
             row.status = change.status
-            row.updated_at = utcnow()
+            changed_at = utcnow()
+            row.updated_at = changed_at
+            if change.status == "caught_up":
+                mark_series_read_and_queue_kavita(session, row, changed_at)
             coordinator = DownloadPlanCoordinator()
             if change.status in TRACKED_STATES:
                 coordinator.track(session, row.id)
@@ -425,18 +462,11 @@ def create_api_router(
     async def read_all(series_id: int, session: SessionDep):
         now = utcnow()
         with session.begin():
-            chapter_ids = session.scalars(
-                select(CatalogChapter.id).where(CatalogChapter.series_id == series_id)
-            ).all()
-            for chapter_id in chapter_ids:
-                row = session.get(CatalogChapterReadingState, chapter_id)
-                if row is None:
-                    row = CatalogChapterReadingState(chapter_id=chapter_id)
-                    session.add(row)
-                row.status = "read"
-                row.read_at = now
-                row.updated_at = now
-        return {"series_id": series_id, "updated": len(chapter_ids)}
+            series = session.get(CatalogSeries, series_id)
+            if series is None:
+                raise HTTPException(404, "series not found")
+            updated = mark_series_read_and_queue_kavita(session, series, now)
+        return {"series_id": series_id, "updated": updated}
 
     @router.get("/updates")
     async def updates(

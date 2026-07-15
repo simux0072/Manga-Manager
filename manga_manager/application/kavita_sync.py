@@ -57,6 +57,10 @@ class KavitaClientProtocol(Protocol):
         self, chapter_id: int, pages_total: int = 0
     ) -> KavitaReadProgress | None: ...
 
+    async def mark_series_read(self, series_id: int) -> None: ...
+
+    async def mark_series_unread(self, series_id: int) -> None: ...
+
     async def add_want_to_read(self, series_ids: list[int]) -> None: ...
 
     async def remove_want_to_read(self, series_ids: list[int]) -> None: ...
@@ -198,6 +202,10 @@ class KavitaSyncHandler:
                 )
                 raise RetryableJobError("kavita_match_missing", "Kavita series match not found")
             self._progress(context, 2, f"matched Kavita series and {len(chapters)} chapters")
+            if payload.reading_status == "read":
+                await client.mark_series_read(match.id)
+            elif payload.reading_status == "unread":
+                await client.mark_series_unread(match.id)
             if snapshot.tracked:
                 await client.add_want_to_read([match.id])
             else:

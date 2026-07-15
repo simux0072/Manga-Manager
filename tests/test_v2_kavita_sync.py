@@ -5,6 +5,7 @@ import io
 import zipfile
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -63,6 +64,8 @@ class FakeKavitaClient:
         self.series_covers: list[tuple[int, str]] = []
         self.chapter_covers: list[tuple[int, str]] = []
         self.pages_read: int | None = None
+        self.marked_read: list[int] = []
+        self.marked_unread: list[int] = []
 
     async def scan_folder_or_all(self, folder_path: Path) -> None:
         assert self.sessions.active == 0
@@ -86,6 +89,12 @@ class FakeKavitaClient:
             pages_read=pages_total if self.pages_read is None else self.pages_read,
             pages_total=pages_total,
         )
+
+    async def mark_series_read(self, series_id: int) -> None:
+        self.marked_read.append(series_id)
+
+    async def mark_series_unread(self, series_id: int) -> None:
+        self.marked_unread.append(series_id)
 
     async def add_want_to_read(self, series_ids: list[int]) -> None:
         self.wanted.extend(series_ids)
@@ -243,6 +252,26 @@ async def test_kavita_sync_maps_series_and_chapters_without_open_database_sessio
         assert reading is not None and reading.status == "unread"
         assert reading.read_at is None
         assert series.status == "interested"
+
+    client.pages_read = None
+    write_lease = replace(
+        lease,
+        payload=KavitaSyncPayload(series_id=series_id, reading_status="read"),
+    )
+    await KavitaSyncHandler(
+        session_factory=sessions,
+        library_root=storage.kavita_root,
+        client_factory=lambda: client,
+        cover_fetcher=fetch_cover,
+    )(JobContext(lease=write_lease, lease_lost=asyncio.Event()))
+    assert client.marked_read == [20]
+    with sessions() as session:
+        series = session.get(CatalogSeries, series_id)
+        chapter = session.scalar(select(CatalogChapter))
+        assert series is not None and chapter is not None
+        reading = session.get(CatalogChapterReadingState, chapter.id)
+        assert reading is not None and reading.status == "read"
+        assert series.status == "caught_up"
 
 
 @pytest.mark.asyncio
