@@ -15,7 +15,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
-from app.kavita import KavitaChapter, KavitaSeries
+from app.kavita import KavitaChapter, KavitaReadProgress, KavitaSeries
 from manga_manager.application.cbz_import import LegacyCbzImporter
 from manga_manager.application.job_handlers import JobContext
 from manga_manager.application.kavita_sync import (
@@ -28,6 +28,7 @@ from manga_manager.domain.jobs import JobKind, KavitaSyncPayload
 from manga_manager.infrastructure.db_models import (
     ArtifactBlob,
     CatalogChapter,
+    CatalogChapterReadingState,
     CatalogSeries,
     ChapterArtifact,
     JobBase,
@@ -73,7 +74,17 @@ class FakeKavitaClient:
     async def series_detail(self, series_id: int) -> list[KavitaChapter]:
         assert self.sessions.active == 0
         assert series_id == 20
-        return [KavitaChapter(id=30, number="1", volume_id=4)]
+        return [KavitaChapter(id=30, number="1", volume_id=4, pages_total=1)]
+
+    async def chapter_progress(
+        self, chapter_id: int, pages_total: int = 0
+    ) -> KavitaReadProgress:
+        assert self.sessions.active == 0
+        return KavitaReadProgress(
+            chapter_id=chapter_id,
+            pages_read=pages_total,
+            pages_total=pages_total,
+        )
 
     async def add_want_to_read(self, series_ids: list[int]) -> None:
         self.wanted.extend(series_ids)
@@ -109,7 +120,9 @@ async def test_kavita_sync_maps_series_and_chapters_without_open_database_sessio
         poolclass=StaticPool,
     )
     JobBase.metadata.create_all(engine)
-    sessions = TrackingSessions(sessionmaker(engine, expire_on_commit=False))
+    sessions = TrackingSessions(
+        sessionmaker(engine, autoflush=False, expire_on_commit=False)
+    )
     storage = ContentAddressedStorage(
         tmp_path / "storage-v2",
         max_page_bytes=1024 * 1024,
@@ -194,6 +207,9 @@ async def test_kavita_sync_maps_series_and_chapters_without_open_database_sessio
         assert chapter is not None and chapter.kavita_chapter_id == 30
         assert chapter.kavita_cover_checksum == series.kavita_cover_checksum
         assert chapter.kavita_volume_id == 4
+        reading = session.get(CatalogChapterReadingState, chapter.id)
+        assert reading is not None and reading.status == "read"
+        assert series.status == "caught_up"
 
 
 @pytest.mark.asyncio

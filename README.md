@@ -44,7 +44,9 @@ Kavita credentials are generated once in `.local/kavita.env` with mode `0600`. T
 created automatically and mapped to the tracked-only `storage-v2-stage/kavita-library` projection.
 Use the Operations action or `manga-manager enqueue-kavita-pending` to synchronize existing
 downloaded series. Manga Manager rewrites canonical `ComicInfo.xml`, waits for Kavita's asynchronous
-scan to finish, then uploads the chosen series cover to both the series and every chapter.
+scan to finish, then uploads the chosen series cover to both the series and every chapter. It also
+imports Kavita chapter progress on each synchronization; the scheduler refreshes tracked series at
+most every ten minutes, while the Operations action requests an immediate refresh.
 
 ## Development
 
@@ -75,6 +77,9 @@ storage by default. Local staging uses 1 GiB (`STAGE_MIN_FREE_BYTES` overrides i
   tracked-only Kavita projection pass without needing the legacy SQLite catalog.
 - The scheduler automatically queues the same bounded repair for tracked artifacts missing their
   Kavita projection, so upgrades heal incrementally without a one-off command.
+- Cover evidence jobs stop after a bounded failed attempt for a specific cover URL and become
+  eligible again when that URL changes. A temporarily unavailable cover no longer prevents Kavita
+  series/chapter mapping or reading-progress synchronization.
 - Matches are review-only. Suggested matches combine title evidence with crop hashes and local ORB
   geometry; Manual merge ranks the whole tracked library and accepts two or more provider-distinct
   records (up to the configured provider count). Reviewed labels can be exported with

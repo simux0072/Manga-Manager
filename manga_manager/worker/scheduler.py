@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import Engine, select, text
 
@@ -130,7 +130,11 @@ class SourcePollScheduler:
                 local_library_root=self.settings.storage_root / "kavita-library"
             )
             if kavita.configured:
-                KavitaSyncPlanner(self.queue).enqueue_pending(session, limit=25)
+                KavitaSyncPlanner(self.queue).enqueue_pending(
+                    session,
+                    limit=25,
+                    reading_refresh_after=timedelta(minutes=10),
+                )
             for policy in session.scalars(select(ProviderPolicy)).all():
                 next_probe = (policy.metadata_json or {}).get("next_recovery_probe")
                 if next_probe:

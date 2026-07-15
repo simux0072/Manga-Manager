@@ -15,11 +15,15 @@ ENV UV_COMPILE_BYTECODE=1
 ENV UV_LINK_MODE=copy
 ENV PATH="/app/.venv/bin:$PATH"
 
-COPY pyproject.toml uv.lock README.md ./
-RUN uv sync --frozen --no-dev --no-install-project
+COPY pyproject.toml uv.lock ./
+# The project metadata references README.md, but dependency installation does not need its content.
+# Keeping documentation out of this layer avoids reinstalling OpenCV and the Python stack for a
+# README-only change, which is especially expensive on the supported mechanical-disk staging host.
+RUN touch README.md && uv sync --frozen --no-dev --no-install-project
 
 COPY app ./app
 COPY manga_manager ./manga_manager
+COPY README.md ./
 COPY alembic.v2.ini ./
 COPY scripts ./scripts
 COPY --from=frontend-build /frontend/dist ./frontend/dist

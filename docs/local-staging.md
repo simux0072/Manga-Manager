@@ -30,8 +30,9 @@ It uses project `manga-manager-test`, ports 18001/15001, an isolated Kavita conf
 live sources, two generated manga, and four tiny generated CBZs. `scale-check` uses a separate
 temporary project on port 18002, stops its worker before inserting 2,000 series and 25,000 jobs,
 checks cursor completeness/grouping/latency, and always tears itself down.
-Kavita is pinned to `jvmilazz0/kavita:0.9.0.2` for repeatability; set `KAVITA_IMAGE` explicitly to
-test a planned upgrade.
+Kavita is temporarily pinned to `jvmilazz0/kavita:0.8.9` because `0.9.0.2` cannot initialize an
+empty local-test database reliably. This isolated instance is not public-facing. Set `KAVITA_IMAGE`
+explicitly to retest a future fixed release before updating the pin.
 
 Run only one launcher at a time. `scripts/kavita-local.sh up` provisions Kavita and then starts
 Manga Manager itself, so it replaces (rather than accompanies) `stage-local.sh serve --build`.
@@ -53,6 +54,16 @@ on port 18000 and Kavita on port 15000. Kavita reads only `kavita-library/`; unt
 removed from that projection while content-addressed blobs remain intact. `STAGE_MIN_FREE_BYTES`
 overrides the 1 GiB staging reserve. Web readiness retries quietly for 120 seconds; set
 `STAGE_WEB_WAIT_ATTEMPTS` to a larger number on unusually slow storage.
+
+`KAVITA_WAIT_SECONDS` controls the provisioning readiness deadline (900 seconds by default for
+mechanical disks).
+The launcher recreates the container when the configured image changes, while preserving its named
+configuration volume. It completes the I/O-heavy Manga Manager image build before starting Kavita,
+so first-run SQLite journal writes do not compete with image export on a mechanical disk. Reset the
+isolated volume before switching between incompatible versions.
+Staging gives PostgreSQL up to 300 seconds for a graceful checkpoint before replacing its container;
+`STAGE_POSTGRES_STOP_SECONDS` can raise that limit on an unusually slow disk. Do not interrupt this
+stop phase: forcing it causes PostgreSQL to repeat the same work as crash recovery at next startup.
 
 For the full import and rollback rehearsal:
 

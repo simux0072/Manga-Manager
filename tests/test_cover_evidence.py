@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import io
 
 import numpy as np
-
 from PIL import Image, ImageDraw
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
 
 from manga_manager.application.cover_evidence import (
     ALGORITHM,
@@ -13,7 +15,14 @@ from manga_manager.application.cover_evidence import (
     fingerprint_cover,
     hamming_distance,
 )
-from manga_manager.infrastructure.db_models import CatalogCoverSignature
+from manga_manager.application.cover_backfill import CoverBackfillPlanner
+from manga_manager.infrastructure.db_models import (
+    CatalogCoverSignature,
+    CatalogSeries,
+    CatalogSourceSeries,
+    JobBase,
+    WorkJob,
+)
 
 
 def cover(*, badge: bool = False, inverted: bool = False) -> bytes:
@@ -85,3 +94,49 @@ def test_corrupt_signature_is_treated_as_inconclusive() -> None:
     assert evidence["cover_compared"] is False
     assert evidence["cover_signature_invalid"] is True
     assert evidence["cover_match"] is False
+
+
+def test_cover_backfill_does_not_requeue_an_exhausted_url_forever() -> None:
+    engine = create_engine("sqlite://")
+    JobBase.metadata.create_all(engine)
+    sessions = sessionmaker(engine, expire_on_commit=False)
+    with sessions() as session, session.begin():
+        series = CatalogSeries(title="Example", normalized_title="example")
+        session.add(series)
+        session.flush()
+        exhausted = CatalogSourceSeries(
+            series_id=series.id,
+            source="asura",
+            source_id="exhausted",
+            title="Example",
+            normalized_title="example",
+            url="https://asurascans.com/comics/example",
+            cover_url="https://cdn.asurascans.com/missing.webp",
+        )
+        pending = CatalogSourceSeries(
+            series_id=series.id,
+            source="mangafire",
+            source_id="pending",
+            title="Example",
+            normalized_title="example",
+            url="https://mangafire.to/manga/example",
+            cover_url="https://static.mfcdn.nl/cover.jpg",
+        )
+        session.add_all([exhausted, pending])
+        session.flush()
+        revision = hashlib.sha1(exhausted.cover_url.encode("utf-8")).hexdigest()[:12]
+        session.add(
+            WorkJob(
+                kind="cover_backfill",
+                dedupe_key=f"cover:{exhausted.id}:{revision}",
+                payload={"version": 1, "source_series_id": exhausted.id},
+                status="failed",
+            )
+        )
+
+    with sessions() as session, session.begin():
+        created = CoverBackfillPlanner().enqueue_pending(session, limit=10)
+        queued = session.query(WorkJob).filter_by(status="queued").all()
+
+    assert created == 1
+    assert [row.payload["source_series_id"] for row in queued] == [pending.id]

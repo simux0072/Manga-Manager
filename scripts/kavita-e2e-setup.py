@@ -33,43 +33,7 @@ def request(path: str, *, method: str = "GET", payload=None, token: str = ""):
     return json.loads(raw) if raw else None
 
 
-def main() -> None:
-    for _ in range(max(1, WAIT_SECONDS)):
-        try:
-            if request("/api/Admin/exists") is False:
-                user = request(
-                    "/api/Account/register",
-                    method="POST",
-                    payload={"username": USERNAME, "password": PASSWORD, "email": None},
-                )
-            else:
-                user = request(
-                    "/api/Account/login",
-                    method="POST",
-                    payload={"username": USERNAME, "password": PASSWORD, "apiKey": None},
-                )
-            break
-        except urllib.error.HTTPError as exc:
-            if exc.code in {401, 403}:
-                raise RuntimeError(
-                    "Kavita already has a different administrator; preserve .local/kavita.env "
-                    "or reset the local Kavita config volume"
-                ) from exc
-            time.sleep(1)
-        except OSError:
-            time.sleep(1)
-    else:
-        raise RuntimeError("Kavita did not become ready")
-    token = str(user["token"])
-    auth_key_value = EXISTING_API_KEY
-    if not auth_key_value:
-        auth_key = request(
-            "/api/Account/create-auth-key",
-            method="POST",
-            token=token,
-            payload={"name": "Manga Manager E2E", "keyLength": 32, "expiresUtc": None},
-        )
-        auth_key_value = str(auth_key.get("key") or auth_key.get("authKey"))
+def ensure_library(token: str) -> dict:
     libraries = request("/api/Library/libraries", token=token) or []
     library = next((row for row in libraries if row.get("name") == "Manga Manager E2E"), None)
     library_payload = {
@@ -93,12 +57,19 @@ def main() -> None:
         "excludePatterns": [],
     }
     if library is None:
-        library = request(
+        request(
             "/api/Library/create",
             method="POST",
             token=token,
             payload=library_payload,
         )
+        libraries = request("/api/Library/libraries", token=token) or []
+        library = next(
+            (row for row in libraries if row.get("name") == "Manga Manager E2E"),
+            None,
+        )
+        if library is None:
+            raise RuntimeError("Kavita accepted library creation but did not return the library")
     else:
         request(
             "/api/Library/update",
@@ -106,6 +77,52 @@ def main() -> None:
             token=token,
             payload=library_payload,
         )
+    return library
+
+
+def main() -> None:
+    last_error = "no response"
+    for _ in range(max(1, WAIT_SECONDS)):
+        try:
+            if request("/api/Admin/exists") is False:
+                user = request(
+                    "/api/Account/register",
+                    method="POST",
+                    payload={"username": USERNAME, "password": PASSWORD, "email": None},
+                )
+            else:
+                user = request(
+                    "/api/Account/login",
+                    method="POST",
+                    payload={"username": USERNAME, "password": PASSWORD, "apiKey": None},
+                )
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code in {401, 403}:
+                raise RuntimeError(
+                    "Kavita already has a different administrator; preserve .local/kavita.env "
+                    "or reset the local Kavita config volume"
+                ) from exc
+            last_error = f"HTTP {exc.code} from {exc.url}"
+            time.sleep(1)
+        except OSError as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            time.sleep(1)
+    else:
+        raise RuntimeError(
+            f"Kavita did not become ready within {WAIT_SECONDS}s; last error: {last_error}"
+        )
+    token = str(user["token"])
+    auth_key_value = EXISTING_API_KEY
+    if not auth_key_value:
+        auth_key = request(
+            "/api/Account/create-auth-key",
+            method="POST",
+            token=token,
+            payload={"name": "Manga Manager E2E", "keyLength": 32, "expiresUtc": None},
+        )
+        auth_key_value = str(auth_key.get("key") or auth_key.get("authKey"))
+    library = ensure_library(token)
     result = {
         "url": BASE_URL,
         "username": USERNAME,

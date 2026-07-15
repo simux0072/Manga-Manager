@@ -17,6 +17,7 @@ from manga_manager.infrastructure.db_models import (
     MatchTrainingLabel,
     WorkerHeartbeat,
     WorkJob,
+    WorkloadCycle,
 )
 from manga_manager.web.api import operational_error_message
 from manga_manager.web.app import create_app
@@ -208,12 +209,33 @@ async def test_updates_group_unread_tracked_chapters_by_series() -> None:
                 published_at=datetime(2026, 7, 11, tzinfo=timezone.utc),
             )
         )
+        newest_number = CatalogChapter(
+            series_id=series.id,
+            canonical_number="20",
+            display_number="20",
+            title="Newest numeric chapter",
+            sort_number=20,
+        )
+        session.add(newest_number)
+        session.flush()
+        session.add(
+            CatalogChapterRelease(
+                chapter_id=newest_number.id,
+                source_series_id=source.id,
+                source="mangafire",
+                source_release_id="20",
+                title="Chapter 20",
+                url="https://example.test/tracked/20",
+                published_at=datetime(2026, 7, 9, tzinfo=timezone.utc),
+            )
+        )
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         response = await client.get("/api/v2/updates")
     assert len(response.json()["items"]) == 1
     assert [chapter["number"] for chapter in response.json()["items"][0]["unread_chapters"]] == [
+        "20",
         "2",
         "1",
     ]
@@ -485,6 +507,36 @@ async def test_jobs_activity_and_operations_have_human_context() -> None:
     assert activity.json()["items"][0]["job"]["description"] == description
     assert operations.json()["health"]["series"] == 2
     assert probe.status_code == 200
+
+
+async def test_workload_cycle_uses_live_active_units_when_counters_lag() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        cycle = WorkloadCycle(
+            status="active",
+            total_units=3,
+            successful_units=3,
+            added_units=3,
+        )
+        session.add(cycle)
+        session.flush()
+        session.add(
+            WorkJob(
+                kind="maintenance",
+                dedupe_key="late-active-job",
+                payload={"version": 1, "action": "stage_probe"},
+                status="queued",
+                cycle_id=cycle.id,
+                logical_units=1,
+            )
+        )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/api/v2/workload-cycle")
+    assert response.status_code == 200
+    assert response.json()["remaining"] == 1
+    assert response.json()["total"] == 4
 
 
 async def test_job_group_and_child_keyset_cursors_do_not_repeat_rows() -> None:

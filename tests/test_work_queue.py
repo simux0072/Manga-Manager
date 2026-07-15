@@ -624,6 +624,9 @@ def test_capped_pool_does_not_block_other_pool_fairness(session: Session) -> Non
 
 
 def test_workload_cycle_counts_terminal_units_and_settles(session: Session) -> None:
+    # Production sessions deliberately disable autoflush; terminal cycle accounting must not
+    # count the in-memory job that is currently being finished as still leased.
+    session.autoflush = False
     queue = JobQueue()
     job, _ = queue.enqueue(
         session,
@@ -638,6 +641,28 @@ def test_workload_cycle_counts_terminal_units_and_settles(session: Session) -> N
     cycle = session.get(WorkloadCycle, job.cycle_id)
     assert cycle is not None
     assert (cycle.total_units, cycle.successful_units, cycle.status) == (1, 1, "settled")
+
+
+def test_enqueue_repairs_a_stale_active_cycle_before_starting_new_work(
+    session: Session,
+) -> None:
+    session.autoflush = False
+    stale = WorkloadCycle(status="active", total_units=4, successful_units=4)
+    session.add(stale)
+    session.flush()
+
+    job, created = JobQueue().enqueue(
+        session,
+        kind=JobKind.MAINTENANCE,
+        dedupe_key="cycle:after-stale",
+        payload=MaintenancePayload(action="stage_probe"),
+        available_at=NOW,
+    )
+
+    assert created
+    assert stale.status == "settled"
+    assert job.cycle_id != stale.id
+    assert session.get(WorkloadCycle, job.cycle_id).total_units == 1
 
 
 def test_refresh_enqueue_coalesces_without_growing_queue(session: Session) -> None:

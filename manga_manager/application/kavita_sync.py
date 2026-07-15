@@ -14,7 +14,12 @@ import httpx
 from PIL import Image
 from sqlalchemy import exists, or_, select
 
-from app.kavita import KavitaChapter, KavitaSeries, configured_kavita_client
+from app.kavita import (
+    KavitaChapter,
+    KavitaReadProgress,
+    KavitaSeries,
+    configured_kavita_client,
+)
 from manga_manager.application.job_handlers import (
     DeferredJobError,
     JobContext,
@@ -26,6 +31,7 @@ from manga_manager.domain.jobs import JobKind, KavitaSyncPayload
 from manga_manager.domain.providers import SOURCE_PRIORITY
 from manga_manager.infrastructure.db_models import (
     CatalogChapter,
+    CatalogChapterReadingState,
     CatalogCoverAsset,
     CatalogExternalIdentifier,
     CatalogSeries,
@@ -47,6 +53,10 @@ class KavitaClientProtocol(Protocol):
 
     async def series_detail(self, series_id: int) -> list[KavitaChapter]: ...
 
+    async def chapter_progress(
+        self, chapter_id: int, pages_total: int = 0
+    ) -> KavitaReadProgress | None: ...
+
     async def add_want_to_read(self, series_ids: list[int]) -> None: ...
 
     async def remove_want_to_read(self, series_ids: list[int]) -> None: ...
@@ -64,8 +74,20 @@ class KavitaSyncPlanner:
     def __init__(self, queue: JobQueue | None = None) -> None:
         self.queue = queue or JobQueue()
 
-    def enqueue_pending(self, session, *, limit: int = 100) -> tuple[int, int]:
+    def enqueue_pending(
+        self,
+        session,
+        *,
+        limit: int = 100,
+        reading_refresh_after: timedelta | None = None,
+    ) -> tuple[int, int]:
         tracked = {"interested", "reading", "caught_up", "paused"}
+        stale_reading = (
+            CatalogSeries.kavita_synced_at
+            < datetime.now(timezone.utc) - reading_refresh_after
+            if reading_refresh_after is not None
+            else False
+        )
         rows = session.scalars(
             select(CatalogSeries)
             .where(CatalogSeries.status.in_(tracked))
@@ -81,6 +103,7 @@ class KavitaSyncPlanner:
                     CatalogSeries.kavita_series_id.is_(None),
                     CatalogSeries.kavita_synced_at.is_(None),
                     CatalogSeries.kavita_synced_at < CatalogSeries.updated_at,
+                    stale_reading,
                 )
             )
             .order_by(CatalogSeries.kavita_synced_at.asc().nullsfirst(), CatalogSeries.id)
@@ -159,6 +182,7 @@ class KavitaSyncHandler:
                 retry_after=timedelta(hours=1),
             )
 
+        cover_error = ""
         try:
             self._progress(context, 0, "requesting Kavita library scan")
             await client.scan_folder_or_all(snapshot.folder_path)
@@ -178,7 +202,11 @@ class KavitaSyncHandler:
                 await client.add_want_to_read([match.id])
             else:
                 await client.remove_want_to_read([match.id])
-            cover = await self._cover(snapshot)
+            try:
+                cover = await self._cover(snapshot)
+            except ValueError as exc:
+                cover = None
+                cover_error = str(exc)
             if cover is not None:
                 checksum, relative_path, content_type, content = cover
                 same_kavita_series = snapshot.existing_kavita_id == match.id
@@ -204,7 +232,8 @@ class KavitaSyncHandler:
                 checksum = ""
                 relative_path = ""
             self._progress(context, 3, "Kavita cover metadata synchronized")
-        except RetryableJobError:
+            reading_progress = await self._reading_progress(client, chapters)
+        except (RetryableJobError, DeferredJobError):
             raise
         except Exception as exc:
             raise RetryableJobError("kavita_unavailable", exception_message(exc)) from exc
@@ -236,7 +265,44 @@ class KavitaSyncHandler:
                 chapter.kavita_mapped_at = datetime.now(timezone.utc)
                 if cover is not None:
                     chapter.kavita_cover_checksum = checksum
-        self._progress(context, 4, "Kavita synchronization complete")
+                progress = reading_progress.get(mapped.id)
+                if progress is None or progress.pages_read <= 0:
+                    continue
+                reading = session.get(CatalogChapterReadingState, chapter.id)
+                if reading is None:
+                    reading = CatalogChapterReadingState(chapter_id=chapter.id)
+                    session.add(reading)
+                complete = bool(
+                    progress.pages_total > 0
+                    and progress.pages_read >= progress.pages_total
+                )
+                if complete:
+                    reading.status = "read"
+                    reading.read_at = datetime.now(timezone.utc)
+                elif reading.status != "read":
+                    reading.status = "reading"
+                reading.updated_at = datetime.now(timezone.utc)
+            # Runtime sessions disable autoflush. Persist newly imported progress before the
+            # aggregate query that promotes the series reading state.
+            session.flush()
+            reading_rows = session.scalars(
+                select(CatalogChapterReadingState)
+                .join(CatalogChapter, CatalogChapter.id == CatalogChapterReadingState.chapter_id)
+                .where(CatalogChapter.series_id == series.id)
+            ).all()
+            read_count = sum(row.status == "read" for row in reading_rows)
+            if read_count and read_count == len(by_number):
+                if series.status not in {"paused", "untracked"}:
+                    series.status = "caught_up"
+            elif reading_rows and series.status == "interested":
+                series.status = "reading"
+        self._progress(
+            context,
+            4,
+            "Kavita synchronization complete"
+            if not cover_error
+            else "Kavita synchronized; series cover remains pending",
+        )
 
     def _progress(self, context: JobContext, current: int, message: str) -> None:
         context.ensure_lease()
@@ -313,6 +379,25 @@ class KavitaSyncHandler:
             except Exception as exc:
                 last_error = exc
         raise ValueError("no source supplied a valid series cover") from last_error
+
+    @staticmethod
+    async def _reading_progress(
+        client: KavitaClientProtocol,
+        chapters: list[KavitaChapter],
+    ) -> dict[int, KavitaReadProgress]:
+        semaphore = asyncio.Semaphore(4)
+
+        async def fetch(chapter: KavitaChapter) -> KavitaReadProgress | None:
+            if chapter.pages_total <= 0:
+                return None
+            try:
+                async with semaphore:
+                    return await client.chapter_progress(chapter.id, chapter.pages_total)
+            except (httpx.HTTPError, ValueError, TypeError):
+                return None
+
+        rows = await asyncio.gather(*(fetch(chapter) for chapter in chapters))
+        return {row.chapter_id: row for row in rows if row is not None}
 
     async def _validated_cover(self, cover_url: str) -> tuple[str, str, str, bytes]:
         content = await self.cover_fetcher(cover_url)
@@ -421,6 +506,11 @@ class KavitaSyncHandler:
                 cached_covers, key=lambda row: priorities.get(row[0], 0), reverse=True
             )
         )
+        if series.cover_relative_path:
+            ordered_cached_covers = (
+                series.cover_relative_path,
+                *(path for path in ordered_cached_covers if path != series.cover_relative_path),
+            )
         chapter_cover_checksums = dict(
             session.execute(
                 select(

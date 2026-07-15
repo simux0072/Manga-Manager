@@ -77,6 +77,20 @@ describe('media library frontend',()=>{
     expect(document.documentElement).not.toHaveClass('drawer-open')
   })
 
+  it('loads failed operations independently from recent successful jobs',async()=>{
+    const failedJob={id:77,kind:'kavita_sync',description:'Synchronize Example with Kavita',source:'',pool:'kavita',cycle_id:1,workflow_key:'',group_key:'kavita',status:'failed',queue_position:null,attempt:3,max_attempts:3,error_code:'cover_fetch_failed',error_message:'cover unavailable',available_at:'2026-07-15T00:00:00Z',created_at:'2026-07-15T00:00:00Z',updated_at:'2026-07-15T00:00:00Z',completed_at:'2026-07-15T00:00:00Z',progress:{phase:'',current:0,total:0,unit:'',bytes:0,message:'',updated_at:null,percent:null},context:{}}
+    vi.stubGlobal('fetch',vi.fn((input:string|URL|Request)=>{
+      const url=String(input)
+      if(url.includes('/api/v2/operations'))return response({job_counts:{failed:1},health:{series:1,chapters:1,active_artifacts:0,missing_projections:0,storage_free_bytes:0},sources:[],workers:[],permits:{}})
+      if(url.includes('/api/v2/jobs')&&url.includes('state=failed'))return response({items:[failedJob],next_cursor:null})
+      if(url.includes('/api/v2/jobs'))return response({items:[],next_cursor:null})
+      return response({items:[],next_cursor:null})
+    }))
+    renderApp('/operations')
+    expect(await screen.findByText('Synchronize Example with Kavita')).toBeInTheDocument()
+    expect(screen.getByText('cover unavailable')).toBeInTheDocument()
+  })
+
   it('previews and confirms a manual cross-provider merge',async()=>{
     vi.stubGlobal('fetch',vi.fn((input:string|URL|Request,init?:RequestInit)=>{
       const url=String(input)

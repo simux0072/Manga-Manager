@@ -478,7 +478,12 @@ def create_api_router(
                 CatalogChapterReadingState.chapter_id == CatalogChapter.id,
             )
             .where(CatalogChapter.series_id.in_(series_ids), unread)
-            .order_by(release_time.desc(), CatalogChapterRelease.id.desc())
+            .order_by(
+                CatalogChapter.series_id,
+                CatalogChapter.sort_number.desc().nullslast(),
+                release_time.desc(),
+                CatalogChapterRelease.id.desc(),
+            )
         ).all()
         by_series: dict[int, list[dict[str, Any]]] = defaultdict(list)
         seen_chapters: set[int] = set()
@@ -919,6 +924,15 @@ def create_api_router(
             return {"id": None, "status": "settled", "total": 0, "successful": 0,
                     "failed": 0, "cancelled": 0, "superseded": 0,
                     "remaining": 0, "added": 0}
+        active_units = int(
+            session.scalar(
+                select(func.coalesce(func.sum(WorkJob.logical_units), 0)).where(
+                    WorkJob.cycle_id == cycle.id,
+                    WorkJob.status.in_(ACTIVE_JOB_STATES),
+                )
+            )
+            or 0
+        )
         superseded = int(
             session.scalar(
                 select(func.coalesce(func.sum(WorkJob.logical_units), 0)).where(
@@ -931,15 +945,16 @@ def create_api_router(
         )
         cancelled = max(cycle.cancelled_units - superseded, 0)
         settled = cycle.successful_units + cycle.failed_units + cycle.cancelled_units
+        effective_total = max(cycle.total_units, settled + active_units)
         return {
             "id": cycle.id,
             "status": cycle.status,
-            "total": cycle.total_units,
+            "total": effective_total,
             "successful": cycle.successful_units,
             "failed": cycle.failed_units,
             "cancelled": cancelled,
             "superseded": superseded,
-            "remaining": max(cycle.total_units - settled, 0),
+            "remaining": active_units,
             "added": cycle.added_units,
             "started_at": cycle.started_at.isoformat(),
             "updated_at": cycle.updated_at.isoformat(),
@@ -1357,7 +1372,11 @@ def create_api_router(
     @router.post("/operations/kavita-sync")
     async def sync_pending_kavita(session: SessionDep, limit: int = Query(100, ge=1, le=500)):
         with session.begin():
-            pending, created = KavitaSyncPlanner().enqueue_pending(session, limit=limit)
+            pending, created = KavitaSyncPlanner().enqueue_pending(
+                session,
+                limit=limit,
+                reading_refresh_after=timedelta(seconds=0),
+            )
         return {"pending": pending, "created": created}
 
     @router.post("/jobs/{job_id}/retry")
@@ -1393,11 +1412,19 @@ def create_api_router(
                         .order_by(JobEvent.id)
                         .limit(100)
                     ).all()
+                    job_kinds = dict(
+                        session.execute(
+                            select(WorkJob.id, WorkJob.kind).where(
+                                WorkJob.id.in_([event.job_id for event in rows] or [-1])
+                            )
+                        ).all()
+                    )
                     for event in rows:
                         cursor = event.id
                         payload = {
                             "event_id": event.id,
                             "job_id": event.job_id,
+                            "kind": job_kinds.get(event.job_id, ""),
                             "state": event.status,
                             "type": event.event_type,
                             "message": event.message,

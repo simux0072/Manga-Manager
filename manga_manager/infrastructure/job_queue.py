@@ -734,6 +734,21 @@ class JobQueue:
             .with_for_update()
             .limit(1)
         )
+        if cycle is not None:
+            active = session.scalar(
+                select(func.count())
+                .select_from(WorkJob)
+                .where(
+                    WorkJob.cycle_id == cycle.id,
+                    WorkJob.status.in_(_state_values(ACTIVE_JOB_STATES)),
+                )
+            )
+            if not active:
+                cycle.status = "settled"
+                cycle.settled_at = utcnow()
+                cycle.updated_at = cycle.settled_at
+                session.flush([cycle])
+                cycle = None
         if cycle is None:
             cycle = WorkloadCycle()
             session.add(cycle)
@@ -760,6 +775,7 @@ class JobQueue:
             select(func.count())
             .select_from(WorkJob)
             .where(WorkJob.cycle_id == cycle.id)
+            .where(WorkJob.id != job.id)
             .where(WorkJob.status.in_(_state_values(ACTIVE_JOB_STATES)))
         )
         if not remaining:

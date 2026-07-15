@@ -35,8 +35,18 @@ if [ -z "$sources_enabled" ]; then
   fi
 fi
 
+remove_postgres() {
+  if docker container inspect "$postgres" >/dev/null 2>&1; then
+    # PostgreSQL can need several minutes to checkpoint on the supported mechanical-disk host.
+    # A forced removal makes the next startup repeat that work as crash recovery.
+    docker stop --time "${STAGE_POSTGRES_STOP_SECONDS:-300}" "$postgres" >/dev/null
+    docker rm "$postgres" >/dev/null
+  fi
+}
+
 teardown() {
-  docker rm -f "$worker" "$web" "$postgres" 2>/dev/null || true
+  docker rm -f "$worker" "$web" 2>/dev/null || true
+  remove_postgres 2>/dev/null || true
   docker network rm "$network" 2>/dev/null || true
   if [ "${1:-}" = "--volumes" ]; then
     docker volume rm "$db_volume" 2>/dev/null || true
@@ -111,7 +121,8 @@ if [ "$build_requested" = true ] || ! docker image inspect "$image" >/dev/null 2
 fi
 docker network inspect "$network" >/dev/null 2>&1 || docker network create "$network" >/dev/null
 docker volume inspect "$db_volume" >/dev/null 2>&1 || docker volume create "$db_volume" >/dev/null
-docker rm -f "$postgres" "$web" "$worker" >/dev/null 2>&1 || true
+docker rm -f "$web" "$worker" >/dev/null 2>&1 || true
+remove_postgres
 docker run -d --name "$postgres" --network "$network" --memory 384m \
   --log-opt max-size=10m --log-opt max-file=3 \
   -e POSTGRES_DB=manga_manager -e POSTGRES_USER=manga -e POSTGRES_PASSWORD=manga \

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import hashlib
+
 from sqlalchemy import func, select
 
 from manga_manager.application.cover_evidence import CoverEvidenceService
-from manga_manager.application.job_handlers import JobContext
+from manga_manager.application.job_handlers import JobContext, RetryableJobError
 from manga_manager.domain.jobs import CoverBackfillPayload, JobKind
 from manga_manager.infrastructure.db_models import (
     CatalogCoverSignature,
@@ -34,6 +36,11 @@ class CoverBackfillHandler:
         await self.service.refresh_for_source_series(payload.source_series_id)
         context.ensure_lease()
         with self.service.session_factory() as session, session.begin():
+            if session.get(CatalogCoverSignature, payload.source_series_id) is None:
+                raise RetryableJobError(
+                    "cover_fetch_failed",
+                    "provider cover could not be downloaded or decoded",
+                )
             JobQueue().progress(
                 session,
                 job_id=context.lease.id,
@@ -70,18 +77,33 @@ class CoverBackfillPlanner:
                 .exists()
             )
             .order_by(CatalogSourceSeries.last_checked_at.desc(), CatalogSourceSeries.id)
-            .limit(limit)
+            .limit(max(limit * 20, 100))
         ).all()
         created = 0
         for row in rows:
+            revision = hashlib.sha1(row.cover_url.encode("utf-8")).hexdigest()[:12]
+            dedupe_key = f"cover:{row.id}:{revision}"
+            exhausted = session.scalar(
+                select(WorkJob.id)
+                .where(
+                    WorkJob.kind == JobKind.COVER_BACKFILL.value,
+                    WorkJob.dedupe_key == dedupe_key,
+                    WorkJob.status == "failed",
+                )
+                .limit(1)
+            )
+            if exhausted is not None:
+                continue
             _job, was_created = self.queue.enqueue(
                 session,
                 kind=JobKind.COVER_BACKFILL,
-                dedupe_key=f"cover:{row.id}",
+                dedupe_key=dedupe_key,
                 payload=CoverBackfillPayload(source_series_id=row.id),
                 priority=300,
                 source=row.source,
                 group_key="cover-backfill",
             )
             created += int(was_created)
+            if created >= limit:
+                break
         return created

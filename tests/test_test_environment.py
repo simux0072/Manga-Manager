@@ -21,6 +21,15 @@ def load_seed_module():
     return module
 
 
+def load_kavita_setup_module():
+    path = ROOT / "scripts" / "kavita-e2e-setup.py"
+    spec = importlib.util.spec_from_file_location("manga_manager_kavita_setup", path)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
 def test_generated_cbz_is_small_valid_and_has_canonical_metadata(tmp_path: Path) -> None:
     seed = load_seed_module()
     archive = tmp_path / "fixture.cbz"
@@ -67,9 +76,15 @@ def test_runtime_entrypoints_do_not_reinvoke_uv() -> None:
     assert "uv run --frozen" not in stage
     assert "max-size=10m" in stage
     assert "max-size: 10m" in compose
+    assert 'docker stop --time "${STAGE_POSTGRES_STOP_SECONDS:-300}"' in stage
+    assert 'docker rm -f "$postgres"' not in stage
     kavita = (ROOT / "scripts" / "kavita-local.sh").read_text()
-    assert "jvmilazz0/kavita:0.9.0.2" in kavita
+    assert "jvmilazz0/kavita:0.8.9" in kavita
+    assert "jvmilazz0/kavita:0.9.0.2" not in kavita
     assert "jvmilazz0/kavita:latest" not in kavita
+    assert 'current_image=$(docker inspect' in kavita
+    assert '[ "$current_image" != "$image" ]' in kavita
+    assert kavita.index('docker build -t "$app_image" .') < kavita.index("expected_mount=")
     docker_ignore = (ROOT / ".dockerignore").read_text().splitlines()
     assert "local-archives" in docker_ignore
     assert ".uv-cache" in docker_ignore
@@ -115,3 +130,31 @@ def test_test_environment_refuses_reset_root_outside_repository() -> None:
 
     assert result.returncode == 1
     assert "refusing test path outside repository" in result.stderr
+
+
+def test_kavita_setup_refetches_library_after_empty_create_response() -> None:
+    setup = load_kavita_setup_module()
+    libraries: list[dict] = []
+
+    def fake_request(path: str, *, method: str = "GET", payload=None, token: str = ""):
+        assert token == "token"
+        if path == "/api/Library/libraries":
+            return list(libraries)
+        if path == "/api/Library/create":
+            assert method == "POST"
+            libraries.append({"id": 7, "name": payload["name"]})
+            return None
+        raise AssertionError(path)
+
+    setup.request = fake_request
+
+    assert setup.ensure_library("token") == {"id": 7, "name": "Manga Manager E2E"}
+
+
+def test_kavita_launcher_preserves_pending_password() -> None:
+    launcher = (ROOT / "scripts" / "kavita-local.sh").read_text()
+
+    assert "$project-kavita-pending.env" in launcher
+    assert "umask 077" in launcher
+    assert 'rm -f "$pending_env"' in launcher
+    assert "KAVITA_WAIT_SECONDS:-900" in launcher
