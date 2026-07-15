@@ -62,6 +62,7 @@ class FakeKavitaClient:
         self.wanted: list[int] = []
         self.series_covers: list[tuple[int, str]] = []
         self.chapter_covers: list[tuple[int, str]] = []
+        self.pages_read: int | None = None
 
     async def scan_folder_or_all(self, folder_path: Path) -> None:
         assert self.sessions.active == 0
@@ -74,7 +75,7 @@ class FakeKavitaClient:
     async def series_detail(self, series_id: int) -> list[KavitaChapter]:
         assert self.sessions.active == 0
         assert series_id == 20
-        return [KavitaChapter(id=30, number="1", volume_id=4, pages_total=1)]
+        return [KavitaChapter(id=30, number="1", volume_id=4, pages_total=10)]
 
     async def chapter_progress(
         self, chapter_id: int, pages_total: int = 0
@@ -82,7 +83,7 @@ class FakeKavitaClient:
         assert self.sessions.active == 0
         return KavitaReadProgress(
             chapter_id=chapter_id,
-            pages_read=pages_total,
+            pages_read=pages_total if self.pages_read is None else self.pages_read,
             pages_total=pages_total,
         )
 
@@ -210,6 +211,38 @@ async def test_kavita_sync_maps_series_and_chapters_without_open_database_sessio
         reading = session.get(CatalogChapterReadingState, chapter.id)
         assert reading is not None and reading.status == "read"
         assert series.status == "caught_up"
+
+    client.pages_read = 5
+    await KavitaSyncHandler(
+        session_factory=sessions,
+        library_root=storage.kavita_root,
+        client_factory=lambda: client,
+        cover_fetcher=fetch_cover,
+    )(JobContext(lease=lease, lease_lost=asyncio.Event()))
+    with sessions() as session:
+        series = session.get(CatalogSeries, series_id)
+        chapter = session.scalar(select(CatalogChapter))
+        assert series is not None and chapter is not None
+        reading = session.get(CatalogChapterReadingState, chapter.id)
+        assert reading is not None and reading.status == "reading"
+        assert reading.read_at is None
+        assert series.status == "reading"
+
+    client.pages_read = 0
+    await KavitaSyncHandler(
+        session_factory=sessions,
+        library_root=storage.kavita_root,
+        client_factory=lambda: client,
+        cover_fetcher=fetch_cover,
+    )(JobContext(lease=lease, lease_lost=asyncio.Event()))
+    with sessions() as session:
+        series = session.get(CatalogSeries, series_id)
+        chapter = session.scalar(select(CatalogChapter))
+        assert series is not None and chapter is not None
+        reading = session.get(CatalogChapterReadingState, chapter.id)
+        assert reading is not None and reading.status == "unread"
+        assert reading.read_at is None
+        assert series.status == "interested"
 
 
 @pytest.mark.asyncio

@@ -244,16 +244,19 @@ class KavitaSyncHandler:
             series = session.get(CatalogSeries, snapshot.series_id)
             if series is None:
                 raise RetryableJobError("series_missing", "series disappeared during sync")
+            synchronized_at = datetime.now(timezone.utc)
             series.kavita_series_id = match.id
             series.kavita_library_id = match.library_id
-            series.kavita_synced_at = datetime.now(timezone.utc)
+            series.kavita_synced_at = synchronized_at
             if cover is not None:
                 series.cover_checksum = checksum
                 series.cover_relative_path = relative_path
                 series.kavita_cover_checksum = checksum
+            catalog_chapter_ids: list[int] = []
             for chapter in session.scalars(
                 select(CatalogChapter).where(CatalogChapter.series_id == series.id)
             ):
+                catalog_chapter_ids.append(chapter.id)
                 mapped = by_number.get(chapter.canonical_number)
                 if mapped is None:
                     chapter.kavita_chapter_id = None
@@ -262,11 +265,11 @@ class KavitaSyncHandler:
                     continue
                 chapter.kavita_chapter_id = mapped.id
                 chapter.kavita_volume_id = mapped.volume_id
-                chapter.kavita_mapped_at = datetime.now(timezone.utc)
+                chapter.kavita_mapped_at = synchronized_at
                 if cover is not None:
                     chapter.kavita_cover_checksum = checksum
                 progress = reading_progress.get(mapped.id)
-                if progress is None or progress.pages_read <= 0:
+                if progress is None:
                     continue
                 reading = session.get(CatalogChapterReadingState, chapter.id)
                 if reading is None:
@@ -278,24 +281,37 @@ class KavitaSyncHandler:
                 )
                 if complete:
                     reading.status = "read"
-                    reading.read_at = datetime.now(timezone.utc)
-                elif reading.status != "read":
+                    reading.read_at = reading.read_at or synchronized_at
+                elif progress.pages_read > 0:
                     reading.status = "reading"
-                reading.updated_at = datetime.now(timezone.utc)
+                    reading.read_at = None
+                else:
+                    reading.status = "unread"
+                    reading.read_at = None
+                reading.updated_at = synchronized_at
             # Runtime sessions disable autoflush. Persist newly imported progress before the
             # aggregate query that promotes the series reading state.
             session.flush()
-            reading_rows = session.scalars(
-                select(CatalogChapterReadingState)
-                .join(CatalogChapter, CatalogChapter.id == CatalogChapterReadingState.chapter_id)
-                .where(CatalogChapter.series_id == series.id)
-            ).all()
-            read_count = sum(row.status == "read" for row in reading_rows)
-            if read_count and read_count == len(by_number):
-                if series.status not in {"paused", "untracked"}:
-                    series.status = "caught_up"
-            elif reading_rows and series.status == "interested":
-                series.status = "reading"
+            reading_rows = (
+                session.scalars(
+                    select(CatalogChapterReadingState).where(
+                        CatalogChapterReadingState.chapter_id.in_(catalog_chapter_ids)
+                    )
+                ).all()
+                if catalog_chapter_ids
+                else []
+            )
+            if reading_progress and series.status not in {"paused", "untracked"}:
+                read_count = sum(row.status == "read" for row in reading_rows)
+                if read_count == len(catalog_chapter_ids) and catalog_chapter_ids:
+                    next_status = "caught_up"
+                elif any(row.status in {"read", "reading"} for row in reading_rows):
+                    next_status = "reading"
+                else:
+                    next_status = "interested"
+                if series.status != next_status:
+                    series.status = next_status
+                    series.updated_at = synchronized_at
         self._progress(
             context,
             4,

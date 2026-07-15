@@ -32,3 +32,4 @@ html{scrollbar-gutter:stable}html.drawer-open{overflow:hidden}
 .job-drawer{inset:8px 8px 8px auto;width:min(560px,calc(100vw - 16px));overflow:hidden;border:1px solid #344258;border-radius:18px}
 .drawer-body{overscroll-behavior:contain;scrollbar-gutter:stable;scrollbar-color:#50627d transparent;scrollbar-width:thin}
 .cycle-legend{display:flex;flex-wrap:wrap;gap:.35rem .8rem;margin-top:.6rem;color:var(--muted);font-size:.72rem}.cycle-legend span:first-child{color:var(--text);font-weight:700}.danger-text{color:var(--red)!important}
+@media(min-width:641px){.discovery-grid .discovery-card{display:flex;flex-direction:column}.discovery-card .card-content{flex:1;grid-template-rows:auto 1fr auto auto auto}}
