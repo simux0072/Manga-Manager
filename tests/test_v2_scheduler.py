@@ -80,6 +80,40 @@ def test_scheduler_respects_source_circuit_breaker() -> None:
     assert scheduler.enqueue_due(now=NOW) == 0
 
 
+def test_scheduler_respects_learned_poll_interval() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    JobBase.metadata.create_all(engine)
+    sessions = sessionmaker(engine, expire_on_commit=False)
+    with Session(engine) as session:
+        session.add_all(
+            [
+                CatalogSourceState(
+                    source="asura",
+                    last_poll_at=NOW - timedelta(minutes=31),
+                ),
+                ProviderPolicy(
+                    source="asura",
+                    metadata_json={
+                        "base_poll_seconds": 1800,
+                        "adaptive_poll_seconds": 3600,
+                    },
+                ),
+            ]
+        )
+        session.commit()
+    scheduler = SourcePollScheduler(
+        engine=engine,
+        session_factory=sessions,
+        settings=V2Settings(
+            database_url="postgresql+psycopg://unused",
+            enable_mangafire=False,
+            enable_kingofshojo=False,
+        ),
+    )
+
+    assert scheduler.enqueue_due(now=NOW) == 0
+
+
 def test_provider_recovery_probe_uses_its_provider_pull_pool() -> None:
     engine = create_engine("sqlite:///:memory:")
     JobBase.metadata.create_all(engine)

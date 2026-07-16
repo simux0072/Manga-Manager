@@ -6,7 +6,11 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import Session, sessionmaker
 
 from manga_manager.infrastructure.db_models import JobBase, ProviderPolicy
-from manga_manager.infrastructure.provider_telemetry import ProviderTelemetry
+from manga_manager.infrastructure.catalog_repository import update_poll_cadence
+from manga_manager.infrastructure.provider_telemetry import (
+    ProviderTelemetry,
+    effective_poll_interval,
+)
 
 
 NOW = datetime(2026, 7, 12, tzinfo=timezone.utc)
@@ -83,3 +87,23 @@ def test_existing_zero_interval_policy_receives_conservative_pacing() -> None:
     with sessions() as session:
         policy = session.get(ProviderPolicy, "asura")
         assert policy is not None and policy.request_interval_seconds == 2.0
+
+
+def test_poll_cadence_adapts_to_changes_idle_polls_and_errors() -> None:
+    policy = ProviderPolicy(
+        source="mangafire",
+        metadata_json={
+            "base_poll_seconds": 3600,
+            "adaptive_poll_seconds": 3600,
+            "unchanged_poll_streak": 0,
+        },
+    )
+
+    update_poll_cadence(policy, successful=True, changed=True)
+    assert effective_poll_interval(policy, timedelta(hours=1)) == timedelta(minutes=45)
+
+    update_poll_cadence(policy, successful=True, changed=False)
+    assert effective_poll_interval(policy, timedelta(hours=1)) > timedelta(minutes=45)
+
+    update_poll_cadence(policy, successful=False, changed=False)
+    assert effective_poll_interval(policy, timedelta(hours=1)) >= timedelta(hours=1)

@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
+import httpx
 from PIL import Image
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -16,7 +17,12 @@ from sqlalchemy.pool import StaticPool
 from app.adapters.base import SourceAdapter, SourceRateLimited
 from app.domain import ChapterItem, SeriesItem
 from manga_manager.application.chapter_download import ChapterDownloadHandler
-from manga_manager.application.job_handlers import JobContext, ReroutedJobError, RetryableJobError
+from manga_manager.application.job_handlers import (
+    DeferredJobError,
+    JobContext,
+    ReroutedJobError,
+    RetryableJobError,
+)
 from manga_manager.domain.jobs import ChapterDownloadPayload, JobKind
 from manga_manager.infrastructure.catalog_repository import CatalogRepository
 from manga_manager.infrastructure.db_models import (
@@ -205,7 +211,7 @@ async def test_rate_limit_sets_shared_source_cooldown(
         adapter_factory=lambda _source: adapter,
         cooldowns={"default": timedelta(minutes=7)},
     )
-    with pytest.raises(RetryableJobError) as error:
+    with pytest.raises(DeferredJobError) as error:
         await handler(context)
     assert error.value.code == "rate_limited"
     with sessions() as session:
@@ -213,6 +219,39 @@ async def test_rate_limit_sets_shared_source_cooldown(
         assert state is not None
         assert state.health_status == "cooldown"
         assert state.cooldown_until is not None
+
+
+@pytest.mark.asyncio
+async def test_cloudflare_origin_outage_defers_download_without_spending_attempts(
+    sessions: TrackingSessions,
+    tmp_path: Path,
+) -> None:
+    _release_id, context = setup_release_and_context(sessions)
+
+    class OriginUnavailableAdapter(PageAdapter):
+        async def iter_chapter_pages(self, chapter: ChapterItem) -> AsyncIterator[bytes]:
+            request = httpx.Request("GET", chapter.url)
+            response = httpx.Response(521, request=request)
+            raise httpx.HTTPStatusError(
+                "origin unavailable", request=request, response=response
+            )
+            yield b""  # pragma: no cover
+
+    handler = ChapterDownloadHandler(
+        session_factory=sessions,
+        storage=storage(tmp_path),
+        adapter_factory=lambda _source: OriginUnavailableAdapter(sessions, []),
+    )
+
+    with pytest.raises(DeferredJobError) as error:
+        await handler(context)
+
+    assert error.value.code == "provider_origin_unavailable"
+    assert error.value.retry_after >= timedelta(minutes=4)
+    with sessions() as session:
+        state = session.get(CatalogSourceState, "fake")
+        assert state is not None
+        assert state.health_status == "cooldown"
 
 
 @pytest.mark.asyncio

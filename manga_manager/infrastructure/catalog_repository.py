@@ -30,6 +30,36 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def update_poll_cadence(
+    policy: ProviderPolicy,
+    *,
+    successful: bool,
+    changed: bool,
+) -> None:
+    metadata = dict(policy.metadata_json or {})
+    try:
+        base = int(metadata.get("base_poll_seconds") or 0)
+        current = int(metadata.get("adaptive_poll_seconds") or base)
+        streak = int(metadata.get("unchanged_poll_streak") or 0)
+    except (TypeError, ValueError):
+        return
+    if base <= 0:
+        return
+    if not successful:
+        current = min(base * 4, round(max(current, base) * 1.5))
+        streak = 0
+    elif changed:
+        current = max(base // 2, round(current * 0.75))
+        streak = 0
+    else:
+        streak += 1
+        current = min(base * 4, round(current * (1.1 + min(streak, 5) * 0.02)))
+    metadata["adaptive_poll_seconds"] = max(60, current)
+    metadata["unchanged_poll_streak"] = streak
+    metadata["last_poll_had_changes"] = changed
+    policy.metadata_json = metadata
+
+
 class CatalogRepository:
     def source_frontier(self, session: Session, source: str) -> list[dict[str, str]]:
         state = session.get(CatalogSourceState, source)
@@ -140,8 +170,14 @@ class CatalogRepository:
         state.last_poll_at = utcnow()
         state.updated_at = utcnow()
         policy = session.get(ProviderPolicy, source)
-        if policy is not None and policy.clean_since is None:
-            policy.clean_since = utcnow()
+        if policy is not None:
+            if policy.clean_since is None:
+                policy.clean_since = utcnow()
+            update_poll_cadence(
+                policy,
+                successful=partial_failures == 0,
+                changed=bool((metrics or {}).get("candidates")),
+            )
         session.flush()
 
     def record_poll_failure(
@@ -166,6 +202,7 @@ class CatalogRepository:
         policy = session.get(ProviderPolicy, source)
         if policy is not None:
             policy.clean_since = None
+            update_poll_cadence(policy, successful=False, changed=False)
             if cooldown_until is not None:
                 seconds = max(60, int((cooldown_until - utcnow()).total_seconds()))
                 policy.cooldown_seconds = max(policy.cooldown_seconds, seconds)

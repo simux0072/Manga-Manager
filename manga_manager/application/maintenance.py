@@ -102,6 +102,8 @@ class MaintenanceHandler:
                 if state is not None:
                     state.cooldown_until = None
                     state.health_status = "healthy"
+                    # Let the scheduler perform a full poll immediately after recovery.
+                    state.last_poll_at = None
                 session.execute(
                     update(ProviderEndpointState)
                     .where(ProviderEndpointState.source == source)

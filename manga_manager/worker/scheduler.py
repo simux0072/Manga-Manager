@@ -18,7 +18,10 @@ from manga_manager.application.job_retention import JobRetention
 from manga_manager.domain.jobs import JobKind, MaintenancePayload, SourcePullPayload
 from manga_manager.infrastructure.db_models import CatalogSourceState, ProviderPolicy, WorkJob
 from manga_manager.infrastructure.job_queue import JobQueue
-from manga_manager.infrastructure.provider_telemetry import ProviderTelemetry
+from manga_manager.infrastructure.provider_telemetry import (
+    ProviderTelemetry,
+    effective_poll_interval,
+)
 from manga_manager.infrastructure.storage_capacity import StorageCapacityCoordinator
 from manga_manager.infrastructure.scheduler_leadership import (
     SchedulerLeadership,
@@ -99,12 +102,16 @@ class SourcePollScheduler:
             ),
         }
         for source, (jobs, pages, ceiling, interval) in defaults.items():
+            poll_interval = self.settings.source_intervals().get(source)
             self.telemetry.ensure_policy(
                 source,
                 job_limit=jobs,
                 page_limit=pages,
                 cooldown_seconds=int(self.settings.source_cooldown(source).total_seconds()),
                 request_interval_seconds=interval,
+                poll_interval_seconds=(
+                    int(poll_interval.total_seconds()) if poll_interval is not None else 0
+                ),
             )
             self.telemetry.start_due_exploration(source, ceiling=ceiling, now=current)
         self.telemetry.finalize_due(now=current)
@@ -158,6 +165,7 @@ class SourcePollScheduler:
                         count += int(created)
             for source, interval in self.settings.source_intervals().items():
                 state = session.get(CatalogSourceState, source)
+                interval = effective_poll_interval(session.get(ProviderPolicy, source), interval)
                 if state is not None and not state.manual_enabled:
                     continue
                 cooldown_until = aware_datetime(state.cooldown_until) if state is not None else None

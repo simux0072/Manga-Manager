@@ -1356,6 +1356,9 @@ def create_api_router(
                     "page_limit": row.learned_page_limit,
                     "request_interval_seconds": row.request_interval_seconds,
                     "cooldown_seconds": row.cooldown_seconds,
+                    "poll_interval_seconds": int(
+                        (row.metadata_json or {}).get("adaptive_poll_seconds") or 0
+                    ),
                     "clean_since": row.clean_since.isoformat() if row.clean_since else None,
                     "last_limited_at": row.last_limited_at.isoformat()
                     if row.last_limited_at

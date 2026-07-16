@@ -125,6 +125,7 @@ class ProviderTelemetry:
         page_limit: int,
         cooldown_seconds: int,
         request_interval_seconds: float = 0.0,
+        poll_interval_seconds: int = 0,
     ) -> None:
         now = utcnow()
         with self.session_factory() as session, session.begin():
@@ -140,14 +141,24 @@ class ProviderTelemetry:
                         clean_since=now,
                         next_exploration_at=now + timedelta(days=7),
                         expires_at=now + timedelta(days=30),
-                        metadata_json={},
+                        metadata_json=poll_cadence_metadata({}, poll_interval_seconds),
                     )
                 )
-            elif policy.request_interval_seconds <= 0 < request_interval_seconds:
-                # Backfill the conservative pace for policies created before request pacing
-                # became durable. Learned non-zero values are never overwritten here.
-                policy.request_interval_seconds = request_interval_seconds
-                policy.updated_at = now
+            else:
+                changed = False
+                if policy.request_interval_seconds <= 0 < request_interval_seconds:
+                    # Backfill the conservative pace for policies created before request pacing
+                    # became durable. Learned non-zero values are never overwritten here.
+                    policy.request_interval_seconds = request_interval_seconds
+                    changed = True
+                metadata = poll_cadence_metadata(
+                    policy.metadata_json, poll_interval_seconds
+                )
+                if metadata != (policy.metadata_json or {}):
+                    policy.metadata_json = metadata
+                    changed = True
+                if changed:
+                    policy.updated_at = now
 
     def start_due_exploration(
         self,
@@ -292,3 +303,24 @@ class ProviderTelemetry:
             policy.updated_at = now
             session.flush()
             return policy
+
+
+def poll_cadence_metadata(metadata: dict | None, base_seconds: int) -> dict:
+    result = dict(metadata or {})
+    if base_seconds > 0:
+        result["base_poll_seconds"] = int(base_seconds)
+        result.setdefault("adaptive_poll_seconds", int(base_seconds))
+        result.setdefault("unchanged_poll_streak", 0)
+    return result
+
+
+def effective_poll_interval(policy: ProviderPolicy | None, fallback: timedelta) -> timedelta:
+    fallback_seconds = max(int(fallback.total_seconds()), 60)
+    if policy is None:
+        return fallback
+    metadata = policy.metadata_json or {}
+    try:
+        seconds = int(metadata.get("adaptive_poll_seconds") or fallback_seconds)
+    except (TypeError, ValueError):
+        seconds = fallback_seconds
+    return timedelta(seconds=max(60, min(seconds, fallback_seconds * 4)))

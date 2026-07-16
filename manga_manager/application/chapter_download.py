@@ -27,6 +27,11 @@ from manga_manager.application.job_handlers import (
     exception_message,
 )
 from manga_manager.application.library_repair import enqueue_library_repair
+from manga_manager.application.provider_health import (
+    is_cloudflare_origin_error,
+    is_transient_provider_status,
+    provider_cooldown_until,
+)
 from manga_manager.domain.jobs import ChapterDownloadPayload
 from manga_manager.infrastructure.artifact_repository import ArtifactRepository
 from manga_manager.infrastructure.db_models import (
@@ -191,7 +196,7 @@ class ChapterDownloadHandler:
                     f"chapter rerouted after {snapshot.source} rate limit"
                 ) from exc
             delay = max(retry_at - utcnow(), timedelta(seconds=1)) if retry_at else None
-            raise RetryableJobError(
+            raise DeferredJobError(
                 "rate_limited", exception_message(exc), retry_after=delay
             ) from exc
         except ChapterTemporarilyUnavailable as exc:
@@ -212,19 +217,27 @@ class ChapterDownloadHandler:
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             code = f"http_{status}"
-            retry_at = utcnow() + (
-                timedelta(hours=24) if status == 404 else self._cooldown(snapshot.source)
+            origin_outage = is_cloudflare_origin_error(status)
+            transient = is_transient_provider_status(status)
+            retry_at = (
+                utcnow() + timedelta(hours=24)
+                if status == 404
+                else provider_cooldown_until(self.session_factory, snapshot.source)
+                if origin_outage
+                else utcnow() + self._cooldown(snapshot.source)
             )
-            if status in {403, 429, 503}:
-                self._record_source_failure(
+            effective_cooldown = None
+            if status in {403, 429} or transient:
+                effective_cooldown = self._record_source_failure(
                     snapshot.source,
                     exception_message(exc),
-                    retry_at,
+                    retry_at if status in {403, 429, 503} or origin_outage else None,
                     traffic_class=traffic_class_for_url(
                         adapter.base_url, str(exc.response.request.url)
                     ),
                 )
-            if status in {403, 404, 429, 503} and self._reroute(
+                retry_at = effective_cooldown or retry_at
+            if (status in {403, 404, 429} or transient) and self._reroute(
                 context,
                 snapshot,
                 code=code,
@@ -232,14 +245,21 @@ class ChapterDownloadHandler:
                 retry_at=retry_at,
             ):
                 raise ReroutedJobError(f"chapter rerouted after HTTP {status}") from exc
+            if origin_outage or effective_cooldown is not None:
+                raise DeferredJobError(
+                    "provider_origin_unavailable" if origin_outage else code,
+                    exception_message(exc),
+                    retry_after=max(retry_at - utcnow(), timedelta(seconds=1)),
+                ) from exc
             raise RetryableJobError(
                 code, exception_message(exc), retry_after=retry_at - utcnow()
             ) from exc
         except httpx.TransportError as exc:
             retry_at = utcnow() + self._cooldown(snapshot.source)
-            self._record_source_failure(
+            effective_cooldown = self._record_source_failure(
                 snapshot.source, exception_message(exc), None, traffic_class="cdn"
             )
+            retry_at = effective_cooldown or retry_at
             if context.lease.attempt >= 2 and self._reroute(
                 context,
                 snapshot,
@@ -248,6 +268,12 @@ class ChapterDownloadHandler:
                 retry_at=retry_at,
             ):
                 raise ReroutedJobError("chapter rerouted after repeated network errors") from exc
+            if effective_cooldown is not None:
+                raise DeferredJobError(
+                    "source_network_error",
+                    exception_message(exc),
+                    retry_after=max(retry_at - utcnow(), timedelta(seconds=1)),
+                ) from exc
             delay = retry_at - utcnow() if context.lease.attempt >= 2 else None
             raise RetryableJobError(
                 "source_network_error", exception_message(exc), retry_after=delay
@@ -385,6 +411,10 @@ class ChapterDownloadHandler:
             return True
 
     def _cooldown(self, source: str) -> timedelta:
+        with self.session_factory() as session:
+            policy = session.get(ProviderPolicy, source)
+            if policy is not None and policy.cooldown_seconds > 0:
+                return timedelta(seconds=policy.cooldown_seconds)
         return self.cooldowns.get(source, self.cooldowns["default"])
 
     def _record_source_failure(
@@ -394,7 +424,7 @@ class ChapterDownloadHandler:
         cooldown_until: datetime | None,
         *,
         traffic_class: str = "origin",
-    ) -> None:
+    ) -> datetime | None:
         with self.session_factory() as session, session.begin():
             state = session.get(CatalogSourceState, source)
             if state is None:
@@ -438,6 +468,9 @@ class ChapterDownloadHandler:
                 DownloadPlanCoordinator(self.queue).bypass_cooling_source(
                     session, source=source, retry_after=cooldown_until
                 )
+                if cooldown_until.tzinfo is None:
+                    cooldown_until = cooldown_until.replace(tzinfo=timezone.utc)
+            return cooldown_until
 
 
 def load_snapshot(session: Session, release_id: int) -> DownloadSnapshot | None:
