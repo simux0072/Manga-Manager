@@ -748,9 +748,13 @@ def main(argv: Sequence[str] | None = None) -> int:
 
 
 async def run_worker(settings: V2Settings, engine) -> int:
+    from app.adapters import SourceAdapterPool
     from app.adapters.http import configure_provider_waiter, configure_request_observer
     from manga_manager.infrastructure.provider_scheduler import ProviderRequestScheduler
-    from manga_manager.infrastructure.provider_telemetry import ProviderTelemetry
+    from manga_manager.infrastructure.provider_telemetry import (
+        BufferedTelemetryObserver,
+        ProviderTelemetry,
+    )
     from manga_manager.application.cover_backfill import CoverBackfillHandler
 
     stop = asyncio.Event()
@@ -761,27 +765,43 @@ async def run_worker(settings: V2Settings, engine) -> int:
     sessions = create_session_factory(engine)
     request_scheduler = ProviderRequestScheduler(sessions)
     telemetry = ProviderTelemetry(sessions)
+    telemetry_buffer = BufferedTelemetryObserver(telemetry)
+    adapters = SourceAdapterPool()
     configure_provider_waiter(request_scheduler.wait)
-    configure_request_observer(telemetry.active_observer)
-    source_pull = SourcePullHandler(session_factory=sessions)
-    source_refresh = SourceRefreshHandler(session_factory=sessions)
+    configure_request_observer(telemetry_buffer.observe)
+    source_pull = SourcePullHandler(
+        session_factory=sessions,
+        adapter_factory=adapters.get,
+        close_adapter=False,
+    )
+    source_refresh = SourceRefreshHandler(
+        session_factory=sessions,
+        adapter_factory=adapters.get,
+        close_adapter=False,
+    )
     storage = create_storage(settings)
     chapter_download = ChapterDownloadHandler(
         session_factory=sessions,
         storage=storage,
+        adapter_factory=adapters.get,
         cooldowns={
             source: settings.source_cooldown(source)
             for source in ("asura", "mangafire", "kingofshojo")
         }
         | {"default": settings.source_cooldown("default")},
         circuit_breaker_failures=settings.circuit_breaker_failures,
+        close_adapter=False,
     )
     kavita_sync = KavitaSyncHandler(
         session_factory=sessions,
         library_root=storage.kavita_root,
     )
     library_repair = LibraryRepairHandler(session_factory=sessions, storage=storage)
-    maintenance = MaintenanceHandler(session_factory=sessions)
+    maintenance = MaintenanceHandler(
+        session_factory=sessions,
+        adapter_factory=adapters.get,
+        close_adapter=False,
+    )
     cover_backfill = CoverBackfillHandler(session_factory=sessions)
     service = WorkerService(
         session_factory=sessions,
@@ -802,10 +822,17 @@ async def run_worker(settings: V2Settings, engine) -> int:
         settings=settings,
     )
     try:
-        await asyncio.gather(service.run(stop), scheduler.run(stop))
+        await asyncio.gather(
+            service.run(stop),
+            scheduler.run(stop),
+            telemetry_buffer.run(stop),
+        )
     finally:
         configure_provider_waiter(None)
         configure_request_observer(None)
+        while await asyncio.to_thread(telemetry_buffer.flush):
+            pass
+        await adapters.aclose()
     return 0
 
 

@@ -24,7 +24,7 @@ from manga_manager.application.download_plans import DownloadPlanCoordinator
 from manga_manager.application.kavita_sync import KavitaSyncPlanner
 from manga_manager.application.library_repair import enqueue_library_repair
 from manga_manager.application.match_training import record_training_label
-from manga_manager.application.matching_score import strongest_candidate_score
+from manga_manager.application.matching_score import score_candidate_set
 
 from manga_manager.infrastructure.db_models import (
     CatalogChapter,
@@ -170,6 +170,8 @@ def pending_match_proposals(session: Session) -> list[dict[str, Any]]:
     grouped: dict[tuple[int, int], dict[str, Any]] = {}
     for decision, left, right in rows:
         if left.series_id == right.series_id:
+            # Canonical merges can make queued source-level decisions obsolete.
+            # Close them atomically so they do not reappear in later reviews.
             decision.decision = "accepted"
             decision.decided_by = "canonicalized"
             decision.decided_at = utcnow()
@@ -207,21 +209,6 @@ def proposal_blockers(session: Session, series_ids: list[int]) -> list[str]:
     if active is not None:
         blockers.append("active jobs")
     return blockers
-
-
-def provider_latest_chapter(session: Session, source_series_id: int) -> str:
-    row = session.execute(
-        select(CatalogChapter.display_number)
-        .join(CatalogChapterRelease)
-        .where(CatalogChapterRelease.source_series_id == source_series_id)
-        .order_by(
-            CatalogChapter.sort_number.desc().nullslast(),
-            CatalogChapterRelease.published_at.desc().nullslast(),
-            CatalogChapterRelease.id.desc(),
-        )
-        .limit(1)
-    ).first()
-    return str(row[0]) if row else ""
 
 
 def connected_proposal_components(proposals: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -262,8 +249,16 @@ def create_api_router(
         chapter_ids = session.scalars(
             select(CatalogChapter.id).where(CatalogChapter.series_id == series.id)
         ).all()
+        readings = {
+            row.chapter_id: row
+            for row in session.scalars(
+                select(CatalogChapterReadingState).where(
+                    CatalogChapterReadingState.chapter_id.in_(chapter_ids or [-1])
+                )
+            )
+        }
         for chapter_id in chapter_ids:
-            reading = session.get(CatalogChapterReadingState, chapter_id)
+            reading = readings.get(chapter_id)
             if reading is None:
                 reading = CatalogChapterReadingState(chapter_id=chapter_id)
                 session.add(reading)
@@ -593,6 +588,54 @@ def create_api_router(
                 ).all(),
             )
         }
+        source_identity_ids = {
+            source.id for row in rows for source in (row["left"], row["right"])
+        }
+        latest_by_identity: dict[int, str] = {}
+        for source_series_id, display_number in session.execute(
+            select(
+                CatalogChapterRelease.source_series_id,
+                CatalogChapter.display_number,
+            )
+            .join(CatalogChapter, CatalogChapter.id == CatalogChapterRelease.chapter_id)
+            .where(
+                CatalogChapterRelease.source_series_id.in_(source_identity_ids or {-1})
+            )
+            .order_by(
+                CatalogChapterRelease.source_series_id,
+                CatalogChapter.sort_number.desc().nullslast(),
+                CatalogChapterRelease.published_at.desc().nullslast(),
+                CatalogChapterRelease.id.desc(),
+            )
+        ):
+            latest_by_identity.setdefault(source_series_id, str(display_number))
+        sources_by_series: dict[int, set[str]] = defaultdict(set)
+        for series_id, source_name in session.execute(
+            select(CatalogSourceSeries.series_id, CatalogSourceSeries.source).where(
+                CatalogSourceSeries.series_id.in_(canonical_ids or {-1})
+            )
+        ):
+            sources_by_series[series_id].add(source_name)
+        active_series_keys = set(
+            session.scalars(
+                select(WorkJob.series_key).where(
+                    WorkJob.series_key.in_([str(value) for value in canonical_ids] or ["-"]),
+                    WorkJob.status.in_(ACTIVE_JOB_STATES),
+                )
+            )
+        )
+        blockers_by_proposal: dict[int, list[str]] = {}
+        for row in rows:
+            blockers = []
+            if any(str(value) in active_series_keys for value in row["series_ids"]):
+                blockers.append("active jobs")
+            left_id, right_id = row["series_ids"]
+            if sources_by_series[left_id] & sources_by_series[right_id]:
+                blockers.extend(
+                    f"provider conflict: {value}"
+                    for value in provider_merge_conflicts(session, row["series_ids"])
+                )
+            blockers_by_proposal[row["id"]] = blockers
         return {
             "items": [
                 {
@@ -600,20 +643,20 @@ def create_api_router(
                     "decision_ids": row["decision_ids"],
                     "confidence": row["decision"].confidence,
                     "evidence": human_evidence(row["decision"].evidence_json),
-                    "blocked_reasons": proposal_blockers(session, row["series_ids"]),
+                    "blocked_reasons": blockers_by_proposal[row["id"]],
                     "left": {
                         **canonical[row["left"].series_id],
                         "source_title": row["left"].title,
                         "source": row["left"].source,
                         "url": row["left"].url,
-                        "latest_chapter": provider_latest_chapter(session, row["left"].id),
+                        "latest_chapter": latest_by_identity.get(row["left"].id, ""),
                     },
                     "right": {
                         **canonical[row["right"].series_id],
                         "source_title": row["right"].title,
                         "source": row["right"].source,
                         "url": row["right"].url,
-                        "latest_chapter": provider_latest_chapter(session, row["right"].id),
+                        "latest_chapter": latest_by_identity.get(row["right"].id, ""),
                     },
                 }
                 for row in rows
@@ -683,17 +726,6 @@ def create_api_router(
         for identity in identity_rows:
             identities_by_series[identity.series_id].append(identity)
         identity_ids = set(identity_to_series)
-        chapter_numbers: dict[int, set[str]] = defaultdict(set)
-        if identity_ids:
-            for identity_id, number in session.execute(
-                select(
-                    CatalogChapterRelease.source_series_id,
-                    CatalogChapter.canonical_number,
-                )
-                .join(CatalogChapter, CatalogChapter.id == CatalogChapterRelease.chapter_id)
-                .where(CatalogChapterRelease.source_series_id.in_(identity_ids))
-            ):
-                chapter_numbers[identity_id].add(number)
 
         occupied = {
             identity.source
@@ -725,9 +757,7 @@ def create_api_router(
                 candidate_id = right_series if left_series in selected_ids else left_series
                 if candidate_id:
                     scores[candidate_id] = max(scores.get(candidate_id, 0), decision.confidence)
-        evidence = {
-            row.id: strongest_candidate_score(session, selected_ids, row.id) for row in rows
-        }
+        evidence = score_candidate_set(session, selected_ids, [row.id for row in rows])
         eligible = [row for row in rows if not candidate_conflicts(row.id)]
         ranked = sorted(
             eligible,
@@ -1063,22 +1093,57 @@ def create_api_router(
         rows = session.execute(
             query.order_by(running.desc(), priority, available_at, last_id.desc()).limit(limit)
         ).all()
+        group_keys = [row.group_key for row in rows]
+        group_expression = func.coalesce(
+            func.nullif(WorkJob.group_key, ""),
+            WorkJob.kind + ":" + func.cast(WorkJob.id, String),
+        )
+        child_query = select(WorkJob).where(group_expression.in_(group_keys or ["-"]))
+        if state:
+            child_query = child_query.where(job_state_predicate(state))
+        representatives: dict[str, WorkJob] = {}
+        for child in session.scalars(
+            child_query.order_by(
+                (WorkJob.status == "leased").desc(),
+                WorkJob.priority,
+                WorkJob.available_at,
+                WorkJob.id,
+            )
+        ):
+            child_key = child.group_key or f"{child.kind}:{child.id}"
+            representatives.setdefault(child_key, child)
+        serialized_representatives = {
+            item["id"]: item
+            for item in serialize_jobs(session, list(representatives.values()))
+        }
+        all_status_counts: dict[str, dict[str, int]] = defaultdict(dict)
+        for child_key, status, count in session.execute(
+            select(group_expression, WorkJob.status, func.count())
+            .where(group_expression.in_(group_keys or ["-"]))
+            .group_by(group_expression, WorkJob.status)
+        ):
+            all_status_counts[str(child_key)][str(status)] = int(count)
+        active_view = not state or bool(set(state).intersection(ACTIVE_JOB_STATES))
+        plan_ids: set[int] = set()
+        if active_view:
+            for group_key in group_keys:
+                if ":download:" not in group_key and not group_key.startswith("download:"):
+                    continue
+                try:
+                    plan_ids.add(int(group_key.rsplit(":", 1)[1]))
+                except ValueError:
+                    continue
+        plans = {
+            plan.series_id: plan
+            for plan in session.scalars(
+                select(SeriesDownloadPlan).where(
+                    SeriesDownloadPlan.series_id.in_(plan_ids or {-1})
+                )
+            )
+        }
         items = []
         for row in rows:
-            child_query = select(WorkJob).where(
-                func.coalesce(
-                    func.nullif(WorkJob.group_key, ""),
-                    WorkJob.kind + ":" + func.cast(WorkJob.id, String),
-                ) == row.group_key
-            )
-            if state:
-                child_query = child_query.where(job_state_predicate(state))
-            representative = session.scalar(
-                child_query.order_by(
-                    (WorkJob.status == "leased").desc(),
-                    WorkJob.priority, WorkJob.available_at, WorkJob.id,
-                ).limit(1)
-            )
+            representative = representatives.get(row.group_key)
             if representative is None:
                 continue
             status_counts = {
@@ -1093,32 +1158,22 @@ def create_api_router(
                 }.items()
                 if value
             }
-            serialized = serialize_jobs(session, [representative])[0]
+            serialized = serialized_representatives[representative.id]
             is_pull_group = representative.kind in {"source_pull", "source_refresh"}
-            count_query = select(WorkJob.status, func.count()).where(
-                        func.coalesce(
-                            func.nullif(WorkJob.group_key, ""),
-                            WorkJob.kind + ":" + func.cast(WorkJob.id, String),
-                        )
-                        == row.group_key
-                    )
-            all_status_counts = dict(
-                session.execute(count_query.group_by(WorkJob.status)).all()
-            )
-            total = sum(int(value) for value in all_status_counts.values())
+            group_status_counts = all_status_counts[row.group_key]
+            total = sum(group_status_counts.values())
             done = sum(
-                int(all_status_counts.get(value, 0))
+                group_status_counts.get(value, 0)
                 for value in ("succeeded", "failed", "cancelled")
             )
-            successful = int(all_status_counts.get("succeeded", 0))
-            failed_count = int(all_status_counts.get("failed", 0))
-            cancelled_count = int(all_status_counts.get("cancelled", 0))
-            active_view = not state or bool(set(state).intersection(ACTIVE_JOB_STATES))
+            successful = group_status_counts.get("succeeded", 0)
+            failed_count = group_status_counts.get("failed", 0)
+            cancelled_count = group_status_counts.get("cancelled", 0)
             if active_view and (
                 ":download:" in row.group_key or row.group_key.startswith("download:")
             ):
                 try:
-                    plan = session.get(SeriesDownloadPlan, int(row.group_key.rsplit(":", 1)[1]))
+                    plan = plans.get(int(row.group_key.rsplit(":", 1)[1]))
                 except ValueError:
                     plan = None
                 if plan is not None:
@@ -1458,44 +1513,50 @@ def create_api_router(
 
     @router.get("/events")
     async def events(request: Request, after: int = Query(default=0, ge=0)):
+        def load_event_batch(cursor: int) -> tuple[list[dict[str, Any]], dict[str, int]]:
+            with factory_provider()() as session:
+                rows = session.execute(
+                    select(JobEvent, WorkJob.kind)
+                    .outerjoin(WorkJob, WorkJob.id == JobEvent.job_id)
+                    .where(JobEvent.id > cursor)
+                    .order_by(JobEvent.id)
+                    .limit(100)
+                ).all()
+                payloads = [
+                    {
+                        "event_id": event.id,
+                        "job_id": event.job_id,
+                        "kind": kind or "",
+                        "state": event.status,
+                        "type": event.event_type,
+                        "message": event.message,
+                        "timestamp": event.created_at.isoformat(),
+                    }
+                    for event, kind in rows
+                ]
+                counts = (
+                    {
+                        str(status): int(count)
+                        for status, count in session.execute(
+                            select(WorkJob.status, func.count()).group_by(WorkJob.status)
+                        )
+                    }
+                    if rows
+                    else {}
+                )
+                return payloads, counts
+
         async def stream():
             cursor = after
             while not await request.is_disconnected():
-                with factory_provider()() as session:
-                    rows = session.scalars(
-                        select(JobEvent)
-                        .where(JobEvent.id > cursor)
-                        .order_by(JobEvent.id)
-                        .limit(100)
-                    ).all()
-                    job_kinds = dict(
-                        session.execute(
-                            select(WorkJob.id, WorkJob.kind).where(
-                                WorkJob.id.in_([event.job_id for event in rows] or [-1])
-                            )
-                        ).all()
-                    )
-                    for event in rows:
-                        cursor = event.id
-                        payload = {
-                            "event_id": event.id,
-                            "job_id": event.job_id,
-                            "kind": job_kinds.get(event.job_id, ""),
-                            "state": event.status,
-                            "type": event.event_type,
-                            "message": event.message,
-                            "timestamp": event.created_at.isoformat(),
-                        }
-                        yield f"id: {event.id}\nevent: job\ndata: {json.dumps(payload)}\n\n"
-                    if rows:
-                        counts = dict(
-                            session.execute(
-                                select(WorkJob.status, func.count()).group_by(WorkJob.status)
-                            ).all()
-                        )
-                        yield f"event: counts\ndata: {json.dumps(counts)}\n\n"
-                    else:
-                        yield ": heartbeat\n\n"
+                rows, counts = load_event_batch(cursor)
+                for payload in rows:
+                    cursor = int(payload["event_id"])
+                    yield f"id: {cursor}\nevent: job\ndata: {json.dumps(payload)}\n\n"
+                if rows:
+                    yield f"event: counts\ndata: {json.dumps(counts)}\n\n"
+                else:
+                    yield ": heartbeat\n\n"
                 await asyncio.sleep(2)
 
         return StreamingResponse(
@@ -1572,6 +1633,30 @@ def serialize_series(
 
 
 def serialize_jobs(session: Session, rows: list[WorkJob]) -> list[dict[str, Any]]:
+    queued_ids = [row.id for row in rows if row.status in {"queued", "retry_wait"}]
+    queue_positions: dict[int, int] = {}
+    if queued_ids:
+        ranked = (
+            select(
+                WorkJob.id.label("job_id"),
+                func.row_number()
+                .over(
+                    partition_by=WorkJob.pool,
+                    order_by=(WorkJob.priority, WorkJob.available_at, WorkJob.id),
+                )
+                .label("queue_position"),
+            )
+            .where(WorkJob.status.in_(("queued", "retry_wait")))
+            .subquery()
+        )
+        queue_positions = {
+            int(job_id): int(position)
+            for job_id, position in session.execute(
+                select(ranked.c.job_id, ranked.c.queue_position).where(
+                    ranked.c.job_id.in_(queued_ids)
+                )
+            )
+        }
     release_ids = [
         int(row.payload.get("chapter_release_id"))
         for row in rows
@@ -1609,29 +1694,7 @@ def serialize_jobs(session: Session, rows: list[WorkJob]) -> list[dict[str, Any]
     result = []
     for row in rows:
         context: dict[str, Any] = {}
-        queue_position = None
-        if row.status in {"queued", "retry_wait"}:
-            queue_position = 1 + int(
-                session.scalar(
-                    select(func.count()).select_from(WorkJob).where(
-                        WorkJob.pool == row.pool,
-                        WorkJob.status.in_(("queued", "retry_wait")),
-                        or_(
-                            WorkJob.priority < row.priority,
-                            and_(
-                                WorkJob.priority == row.priority,
-                                WorkJob.available_at < row.available_at,
-                            ),
-                            and_(
-                                WorkJob.priority == row.priority,
-                                WorkJob.available_at == row.available_at,
-                                WorkJob.id < row.id,
-                            ),
-                        ),
-                    )
-                )
-                or 0
-            )
+        queue_position = queue_positions.get(row.id)
         if row.kind == "chapter_download":
             context = chapter_context.get(int(row.payload.get("chapter_release_id", 0)), {})
             description = f"Download {context.get('title', 'chapter')} · Chapter {context.get('chapter', '?')}"

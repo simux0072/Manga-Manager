@@ -159,7 +159,8 @@ class ContentAddressedStorage:
         image_count = 0
         total_bytes = 0
         try:
-            with zipfile.ZipFile(staging, "w", compression=zipfile.ZIP_STORED) as archive:
+            archive = zipfile.ZipFile(staging, "w", compression=zipfile.ZIP_STORED)
+            try:
                 archive.writestr("ComicInfo.xml", comic_info_xml)
                 async for page in pages:
                     image_count += 1
@@ -174,13 +175,41 @@ class ContentAddressedStorage:
                     archive.writestr(f"{image_count:04d}.{extension}", page)
                     if progress is not None:
                         progress(image_count)
+            finally:
+                archive.close()
             if image_count < self.min_download_pages:
                 raise ValueError(
                     f"chapter contains {image_count} images; minimum is {self.min_download_pages}"
                 )
-            return self.store_existing(staging)
+            return self._store_fresh_archive(staging, image_count)
         finally:
             staging.unlink(missing_ok=True)
+
+    def _store_fresh_archive(self, staging: Path, image_count: int) -> StoredBlob:
+        """Finalize an archive whose members were validated while streaming.
+
+        Imported archives still use ``store_existing`` and receive a full CRC/member
+        audit. A freshly written archive does not need to be read once for validation,
+        again for copying, and a third time for checksum verification.
+        """
+        byte_count = staging.stat().st_size
+        if byte_count > self.max_chapter_bytes:
+            raise ValueError(f"archive exceeds max chapter bytes: {byte_count}")
+        checksum = file_checksum(staging)
+        relative = Path("blobs") / checksum[:2] / f"{checksum}.cbz"
+        destination = self.root / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.exists():
+            if file_checksum(destination) != checksum:
+                raise ValueError(f"existing blob checksum mismatch: {destination}")
+        else:
+            os.replace(staging, destination)
+        return StoredBlob(
+            checksum=checksum,
+            relative_path=relative.as_posix(),
+            byte_count=byte_count,
+            image_count=image_count,
+        )
 
     def projection_path(self, storage_key: str, chapter_id: int, display_number: str) -> Path:
         filename = f"ch-{chapter_id}-{safe_component(display_number)}.cbz"

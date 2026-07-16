@@ -564,6 +564,9 @@ class JobQueue:
         if job is None:
             return False
         payload = dict(details or {})
+        previous_phase = job.progress_phase
+        previous_current = job.progress_current
+        previous_total = job.progress_total
         job.progress_phase = str(payload.get("phase") or job.progress_phase or "working")[:50]
         job.progress_current = max(int(payload.get("processed") or payload.get("current") or 0), 0)
         job.progress_total = max(int(payload.get("total") or 0), 0)
@@ -572,14 +575,34 @@ class JobQueue:
         job.progress_message = message[:4000]
         job.progress_updated_at = current
         job.updated_at = current
-        self._record_event(
-            session,
-            job,
-            "progress",
-            owner=owner,
-            message=message,
-            details=payload,
+        previous_bucket = (
+            min(20, previous_current * 20 // previous_total) if previous_total else -1
         )
+        current_bucket = (
+            min(20, job.progress_current * 20 // job.progress_total)
+            if job.progress_total
+            else -1
+        )
+        # JobEvent drives SSE refreshes and is durable history. Emitting one for
+        # every downloaded page made both tables and browsers do unnecessary work.
+        if (
+            previous_phase != job.progress_phase
+            or previous_total != job.progress_total
+            or previous_bucket != current_bucket
+            or (
+                job.progress_total
+                and job.progress_current >= job.progress_total
+                and (not previous_total or previous_current < previous_total)
+            )
+        ):
+            self._record_event(
+                session,
+                job,
+                "progress",
+                owner=owner,
+                message=message,
+                details=payload,
+            )
         session.flush()
         return True
 

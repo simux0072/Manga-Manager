@@ -28,8 +28,16 @@ from manga_manager.worker.runtime import SessionFactory
 
 
 class MaintenanceHandler:
-    def __init__(self, *, session_factory: SessionFactory) -> None:
+    def __init__(
+        self,
+        *,
+        session_factory: SessionFactory,
+        adapter_factory=adapter_for_source,
+        close_adapter: bool = True,
+    ) -> None:
         self.session_factory = session_factory
+        self.adapter_factory = adapter_factory
+        self.close_adapter = close_adapter
 
     async def __call__(self, context: JobContext) -> None:
         payload = context.lease.payload
@@ -46,7 +54,7 @@ class MaintenanceHandler:
         context.ensure_lease()
 
     async def _provider_probe(self, source: str, context: JobContext) -> None:
-        adapter = adapter_for_source(source)
+        adapter = self.adapter_factory(source)
         if adapter is None:
             raise DeferredJobError("provider_unavailable", source, retry_after=timedelta(minutes=5))
         try:
@@ -73,7 +81,8 @@ class MaintenanceHandler:
                 retry_after=max(retry_at - datetime.now(timezone.utc), timedelta(seconds=1)),
             ) from exc
         finally:
-            await adapter.aclose()
+            if self.close_adapter:
+                await adapter.aclose()
         context.ensure_lease()
         now = datetime.now(timezone.utc)
         with self.session_factory() as session, session.begin():

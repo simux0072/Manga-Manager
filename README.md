@@ -93,7 +93,8 @@ remain available for one-time recovery.
 
 See [local staging](docs/local-staging.md), [catalog repair](docs/catalog-repair.md),
 [concurrency tuning](docs/concurrency-tuning.md), [backup/restore](docs/postgresql-backup-restore.md),
-and [Pi deployment/rollback](docs/pi-deployment-and-rollback.md).
+[Pi deployment/rollback](docs/pi-deployment-and-rollback.md), and the
+[architecture and optimization audit](docs/codebase-architecture-and-optimization-audit.md).
 
 ### Provider identity and grouped queue rollout
 

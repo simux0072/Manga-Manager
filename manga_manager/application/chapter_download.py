@@ -4,6 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from html import escape
+from time import monotonic
 
 import httpx
 from sqlalchemy import select
@@ -86,6 +87,7 @@ class ChapterDownloadHandler:
         queue: JobQueue | None = None,
         cooldowns: dict[str, timedelta] | None = None,
         circuit_breaker_failures: int = 3,
+        close_adapter: bool = True,
     ) -> None:
         self.session_factory = session_factory
         self.storage = storage
@@ -97,6 +99,7 @@ class ChapterDownloadHandler:
             "default": timedelta(minutes=5),
         }
         self.circuit_breaker_failures = circuit_breaker_failures
+        self.close_adapter = close_adapter
         self.capacity = StorageCapacityCoordinator(storage.root, storage.min_free_bytes)
 
     async def __call__(self, context: JobContext) -> None:
@@ -145,8 +148,21 @@ class ChapterDownloadHandler:
                 details={"phase": "download", "processed": 0, "total": 0, "unit": "pages"},
             )
 
+        last_report_at = monotonic()
+        last_reported_page = 0
+
         def report_page(processed: int, total: int, byte_count: int) -> None:
+            nonlocal last_report_at, last_reported_page
             context.ensure_lease()
+            now = monotonic()
+            if (
+                processed < total
+                and processed - last_reported_page < 5
+                and now - last_report_at < 2.0
+            ):
+                return
+            last_report_at = now
+            last_reported_page = processed
             with self.session_factory() as progress_session, progress_session.begin():
                 if not self.queue.progress(
                     progress_session,
@@ -298,7 +314,8 @@ class ChapterDownloadHandler:
                 "invalid_content", str(exc), retry_after=retry_at - utcnow()
             ) from exc
         finally:
-            await adapter.aclose()
+            if self.close_adapter:
+                await adapter.aclose()
 
         context.ensure_lease()
         projection_relative = self.storage.projection_path(

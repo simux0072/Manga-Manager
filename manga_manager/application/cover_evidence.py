@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 import cv2
 import numpy as np
 from PIL import Image, ImageOps
-from sqlalchemy import select
+from sqlalchemy import select, tuple_
 
 from app.adapters.http import HttpSourceClient
 from app.domain import title_similarity
@@ -168,19 +168,6 @@ class CoverEvidenceService:
 
     async def refresh_for_source_series(self, source_series_id: int) -> None:
         await self._ensure_signature(source_series_id)
-        with self.session_factory() as session:
-            source = session.get(CatalogSourceSeries, source_series_id)
-            signature = session.get(CatalogCoverSignature, source_series_id)
-            if source is None:
-                return
-            candidates = session.scalars(
-                select(CatalogSourceSeries).where(
-                    CatalogSourceSeries.id != source.id,
-                    CatalogSourceSeries.source != source.source,
-                    CatalogSourceSeries.series_id != source.series_id,
-                )
-            ).all()
-            candidate_ids = [candidate.id for candidate in candidates]
         # Fetches happen through each provider scheduler as its series is refreshed. Do not fan out
         # arbitrary network traffic here; compare current series with already cached signatures.
         with self.session_factory() as session, session.begin():
@@ -188,10 +175,19 @@ class CoverEvidenceService:
             signature = session.get(CatalogCoverSignature, source_series_id)
             if source is None:
                 return
-            for candidate in session.scalars(
-                select(CatalogSourceSeries).where(CatalogSourceSeries.id.in_(candidate_ids))
+            candidates: list[CatalogSourceSeries] = []
+            for candidate, other in session.execute(
+                select(CatalogSourceSeries, CatalogCoverSignature)
+                .outerjoin(
+                    CatalogCoverSignature,
+                    CatalogCoverSignature.source_series_id == CatalogSourceSeries.id,
+                )
+                .where(
+                    CatalogSourceSeries.id != source.id,
+                    CatalogSourceSeries.source != source.source,
+                    CatalogSourceSeries.series_id != source.series_id,
+                )
             ):
-                other = session.get(CatalogCoverSignature, candidate.id)
                 title_score = title_similarity(source.title, candidate.title)
                 quick_distance = (
                     signature_hash_distance(signature, other) if signature and other else 64
@@ -205,16 +201,33 @@ class CoverEvidenceService:
                 )
                 if title_score < 0.65 and visual.get("cover_hash_distance", 64) > 14:
                     continue
-                left_id, right_id = sorted((source.id, candidate.id))
-                decision = session.scalar(
+                candidates.append(candidate)
+
+            pairs = {
+                tuple(sorted((source.id, candidate.id))) for candidate in candidates
+            }
+            existing = {
+                (decision.left_source_series_id, decision.right_source_series_id): decision
+                for decision in session.scalars(
                     select(CatalogMatchDecision).where(
-                        CatalogMatchDecision.left_source_series_id == left_id,
-                        CatalogMatchDecision.right_source_series_id == right_id,
+                        tuple_(
+                            CatalogMatchDecision.left_source_series_id,
+                            CatalogMatchDecision.right_source_series_id,
+                        ).in_(pairs or {(-1, -1)})
                     )
                 )
-                from manga_manager.application.matching_score import score_series_pair
+            }
+            from manga_manager.application.matching_score import score_candidate_set
 
-                features = score_series_pair(session, source.series_id, candidate.series_id)
+            features_by_series = score_candidate_set(
+                session,
+                [source.series_id],
+                sorted({candidate.series_id for candidate in candidates}),
+            )
+            for candidate in candidates:
+                left_id, right_id = sorted((source.id, candidate.id))
+                decision = existing.get((left_id, right_id))
+                features = features_by_series[candidate.series_id]
                 confidence = float(features["score"])
                 evidence = {
                     **features,

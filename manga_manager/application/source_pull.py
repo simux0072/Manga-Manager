@@ -48,12 +48,14 @@ class SourcePullHandler:
         catalog: CatalogRepository | None = None,
         queue: JobQueue | None = None,
         frontier_limit: int = 5,
+        close_adapter: bool = True,
     ) -> None:
         self.session_factory = session_factory
         self.adapter_factory = adapter_factory
         self.catalog = catalog or CatalogRepository()
         self.queue = queue or JobQueue()
         self.frontier_limit = frontier_limit
+        self.close_adapter = close_adapter
 
     async def __call__(self, context: JobContext) -> None:
         payload = context.lease.payload
@@ -136,7 +138,8 @@ class SourcePullHandler:
             self._record_failure(source, exception_message(exc), None)
             raise PermanentJobError("source_processing_error", exception_message(exc)) from exc
         finally:
-            await adapter.aclose()
+            if self.close_adapter:
+                await adapter.aclose()
 
         with self.session_factory() as progress_session, progress_session.begin():
             self.queue.progress(
@@ -268,10 +271,12 @@ class SourceRefreshHandler:
         session_factory: SessionFactory,
         adapter_factory: AdapterFactory = adapter_for_source,
         catalog: CatalogRepository | None = None,
+        close_adapter: bool = True,
     ) -> None:
         self.session_factory = session_factory
         self.adapter_factory = adapter_factory
         self.catalog = catalog or CatalogRepository()
+        self.close_adapter = close_adapter
 
     async def __call__(self, context: JobContext) -> None:
         payload = context.lease.payload
@@ -364,7 +369,8 @@ class SourceRefreshHandler:
             self._quarantine(payload, exception_message(exc))
             raise PermanentJobError("source_item_invalid", exception_message(exc)) from exc
         finally:
-            await adapter.aclose()
+            if self.close_adapter:
+                await adapter.aclose()
         context.ensure_lease()
         with self.session_factory() as progress_session, progress_session.begin():
             JobQueue().progress(

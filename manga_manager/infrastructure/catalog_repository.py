@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Iterable
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, select, text, tuple_
 from sqlalchemy.orm import Session
 
 from app.domain import ChapterItem, SeriesItem
@@ -71,7 +71,8 @@ class CatalogRepository:
         item: SeriesItem,
         chapters: Iterable[ChapterItem],
     ) -> CatalogSourceSeries:
-        normalized_source_id, observed_revision = self._normalized_identity(item)
+        chapter_items = list(chapters)
+        normalized_source_id = self._normalized_identity(item)
         source_series = session.scalar(
             select(CatalogSourceSeries).where(
                 CatalogSourceSeries.source == item.source,
@@ -139,17 +140,17 @@ class CatalogRepository:
             source_series.id,
             item.external_ids,
         )
-        for chapter_item in chapters:
-            self._upsert_chapter(session, series.id, source_series.id, chapter_item)
+        self._upsert_chapters(session, series.id, source_series.id, chapter_items)
+        self._recompute_latest(session, series.id)
         self._refresh_match_scores(session, source_series)
         session.flush()
         return source_series
 
     @staticmethod
-    def _normalized_identity(item: SeriesItem) -> tuple[str, str]:
+    def _normalized_identity(item: SeriesItem) -> str:
         if item.source == "asura":
-            return split_asura_source_id(item.source_id)
-        return item.source_id.strip(), ""
+            return split_asura_source_id(item.source_id)[0]
+        return item.source_id.strip()
 
     def record_poll_success(
         self,
@@ -251,19 +252,34 @@ class CatalogRepository:
             .where(CatalogSourceSeries.normalized_title.in_(normalized_values))
             .order_by(CatalogSourceSeries.id)
         ).all()
+        candidate_pairs = {
+            tuple(sorted((candidate.id, source_series.id))) for candidate in candidates
+        }
+        existing_pairs = set(
+            session.execute(
+                select(
+                    CatalogMatchDecision.left_source_series_id,
+                    CatalogMatchDecision.right_source_series_id,
+                ).where(
+                    tuple_(
+                        CatalogMatchDecision.left_source_series_id,
+                        CatalogMatchDecision.right_source_series_id,
+                    ).in_(candidate_pairs or {(-1, -1)})
+                )
+            ).all()
+        )
+        from manga_manager.application.matching_score import score_candidate_set
+
+        evidence_by_series = score_candidate_set(
+            session,
+            [source_series.series_id],
+            sorted({candidate.series_id for candidate in candidates}),
+        )
         for candidate in candidates:
             left_id, right_id = sorted((candidate.id, source_series.id))
-            existing = session.scalar(
-                select(CatalogMatchDecision.id).where(
-                    CatalogMatchDecision.left_source_series_id == left_id,
-                    CatalogMatchDecision.right_source_series_id == right_id,
-                )
-            )
-            if existing is not None:
+            if (left_id, right_id) in existing_pairs:
                 continue
-            from manga_manager.application.matching_score import score_series_pair
-
-            evidence = score_series_pair(session, candidate.series_id, source_series.series_id)
+            evidence = evidence_by_series[candidate.series_id]
             session.add(
                 CatalogMatchDecision(
                     left_source_series_id=left_id,
@@ -281,7 +297,7 @@ class CatalogRepository:
 
     @staticmethod
     def _refresh_match_scores(session: Session, source_series: CatalogSourceSeries) -> None:
-        from manga_manager.application.matching_score import score_series_pair
+        from manga_manager.application.matching_score import score_candidate_set
 
         decisions = session.scalars(
             select(CatalogMatchDecision).where(
@@ -290,12 +306,45 @@ class CatalogRepository:
                 | (CatalogMatchDecision.right_source_series_id == source_series.id),
             )
         ).all()
+        identity_ids = {
+            identity_id
+            for decision in decisions
+            for identity_id in (
+                decision.left_source_series_id,
+                decision.right_source_series_id,
+            )
+        }
+        identities = {
+            identity.id: identity
+            for identity in session.scalars(
+                select(CatalogSourceSeries).where(
+                    CatalogSourceSeries.id.in_(identity_ids or {-1})
+                )
+            )
+        }
+        candidate_ids = {
+            identity.series_id
+            for identity in identities.values()
+            if identity.series_id != source_series.series_id
+        }
+        evidence_by_series = score_candidate_set(
+            session,
+            [source_series.series_id],
+            sorted(candidate_ids),
+        )
         for decision in decisions:
-            left = session.get(CatalogSourceSeries, decision.left_source_series_id)
-            right = session.get(CatalogSourceSeries, decision.right_source_series_id)
+            left = identities.get(decision.left_source_series_id)
+            right = identities.get(decision.right_source_series_id)
             if left is None or right is None:
                 continue
-            evidence = score_series_pair(session, left.series_id, right.series_id)
+            candidate_id = (
+                right.series_id
+                if left.series_id == source_series.series_id
+                else left.series_id
+            )
+            evidence = evidence_by_series.get(candidate_id)
+            if evidence is None:
+                continue
             decision.confidence = float(evidence["score"])
             decision.evidence_json = {
                 **evidence,
@@ -328,20 +377,19 @@ class CatalogRepository:
                 ),
             )
         )
+        # Alias synchronization can race across provider refresh workers for the
+        # same canonical series. Lock once for the complete set, not once per alias.
+        if session.bind is not None and session.bind.dialect.name == "postgresql":
+            session.execute(
+                text("SELECT pg_advisory_xact_lock(:namespace, :series_id)"),
+                {"namespace": 0x4D414C49, "series_id": series_id},
+            )
         seen: set[str] = set()
         for display_value in values:
             normalized = normalize_title(display_value)
             if not normalized or normalized in seen:
                 continue
             seen.add(normalized)
-            # Alias synchronization can race across provider refresh workers for
-            # the same canonical series.  The transaction-scoped advisory lock
-            # makes the read-before-insert safe without weakening the unique key.
-            if session.bind is not None and session.bind.dialect.name == "postgresql":
-                session.execute(
-                    text("SELECT pg_advisory_xact_lock(:namespace, :series_id)"),
-                    {"namespace": 0x4D414C49, "series_id": series_id},
-                )
             existing = session.scalar(
                 select(CatalogSeriesAlias).where(
                     CatalogSeriesAlias.series_id == series_id,
@@ -394,54 +442,71 @@ class CatalogRepository:
                     )
                 )
 
-    def _upsert_chapter(
+    def _upsert_chapters(
         self,
         session: Session,
         series_id: int,
         source_series_id: int,
-        item: ChapterItem,
+        items: list[ChapterItem],
     ) -> None:
-        canonical = canonical_chapter_number(item.number)
-        chapter = session.scalar(
-            select(CatalogChapter).where(
-                CatalogChapter.series_id == series_id,
-                CatalogChapter.canonical_number == canonical,
+        by_number: dict[str, ChapterItem] = {}
+        for item in items:
+            canonical = canonical_chapter_number(item.number)
+            if canonical:
+                by_number[canonical] = item
+        if not by_number:
+            return
+        chapters = {
+            chapter.canonical_number: chapter
+            for chapter in session.scalars(
+                select(CatalogChapter).where(
+                    CatalogChapter.series_id == series_id,
+                    CatalogChapter.canonical_number.in_(by_number),
+                )
             )
-        )
-        if chapter is None:
-            chapter = CatalogChapter(
-                series_id=series_id,
-                canonical_number=canonical,
-                display_number=item.number,
-                sort_number=chapter_sort_number(item.number),
-                title=item.title,
-            )
-            session.add(chapter)
-            session.flush()
-        elif not chapter.title and item.title:
-            chapter.title = item.title
-            chapter.updated_at = utcnow()
+        }
+        now = utcnow()
+        for canonical, item in by_number.items():
+            chapter = chapters.get(canonical)
+            if chapter is None:
+                chapter = CatalogChapter(
+                    series_id=series_id,
+                    canonical_number=canonical,
+                    display_number=item.number,
+                    sort_number=chapter_sort_number(item.number),
+                    title=item.title,
+                )
+                session.add(chapter)
+                chapters[canonical] = chapter
+            elif not chapter.title and item.title:
+                chapter.title = item.title
+                chapter.updated_at = now
+        session.flush()
 
-        release = session.scalar(
-            select(CatalogChapterRelease).where(
-                CatalogChapterRelease.source_series_id == source_series_id,
-                CatalogChapterRelease.source_release_id == canonical,
+        releases = {
+            release.source_release_id: release
+            for release in session.scalars(
+                select(CatalogChapterRelease).where(
+                    CatalogChapterRelease.source_series_id == source_series_id,
+                    CatalogChapterRelease.source_release_id.in_(by_number),
+                )
             )
-        )
-        if release is None:
-            release = CatalogChapterRelease(
-                chapter_id=chapter.id,
-                source_series_id=source_series_id,
-                source=item.source,
-                source_release_id=canonical,
-                title=item.title,
-                url=item.url,
-            )
-            session.add(release)
-        release.title = item.title
-        release.url = item.url
-        release.published_at = item.published_at
-        self._recompute_latest(session, series_id)
+        }
+        for canonical, item in by_number.items():
+            release = releases.get(canonical)
+            if release is None:
+                release = CatalogChapterRelease(
+                    chapter_id=chapters[canonical].id,
+                    source_series_id=source_series_id,
+                    source=item.source,
+                    source_release_id=canonical,
+                    title=item.title,
+                    url=item.url,
+                )
+                session.add(release)
+            release.title = item.title
+            release.url = item.url
+            release.published_at = item.published_at
 
     @staticmethod
     def _recompute_latest(session: Session, series_id: int) -> None:

@@ -2,12 +2,18 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, func, select
 from sqlalchemy.orm import Session, sessionmaker
 
-from manga_manager.infrastructure.db_models import JobBase, ProviderPolicy
+from manga_manager.infrastructure.db_models import (
+    JobBase,
+    ProviderBenchmarkRun,
+    ProviderPolicy,
+    ProviderRequestSample,
+)
 from manga_manager.infrastructure.catalog_repository import update_poll_cadence
 from manga_manager.infrastructure.provider_telemetry import (
+    BufferedTelemetryObserver,
     ProviderTelemetry,
     effective_poll_interval,
 )
@@ -87,6 +93,29 @@ def test_existing_zero_interval_policy_receives_conservative_pacing() -> None:
     with sessions() as session:
         policy = session.get(ProviderPolicy, "asura")
         assert policy is not None and policy.request_interval_seconds == 2.0
+
+
+def test_runtime_telemetry_buffer_flushes_samples_in_one_batch() -> None:
+    service, sessions = telemetry()
+    run_id = service.begin("mangafire", 2)
+    observer = BufferedTelemetryObserver(service, batch_size=100)
+    for status in (200, 200, 521):
+        observer.observe(
+            {
+                "source": "mangafire",
+                "host": "mangafire.to",
+                "status_code": status,
+                "error_code": "HTTPStatusError" if status == 521 else "",
+            }
+        )
+
+    assert observer.flush() == 3
+    assert observer.flush() == 0
+    with sessions() as session:
+        run = session.get(ProviderBenchmarkRun, run_id)
+        assert run is not None
+        assert (run.request_count, run.success_count, run.failure_count) == (3, 2, 1)
+        assert session.scalar(select(func.count()).select_from(ProviderRequestSample)) == 3
 
 
 def test_poll_cadence_adapts_to_changes_idle_polls_and_errors() -> None:

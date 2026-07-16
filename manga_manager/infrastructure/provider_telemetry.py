@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import asyncio
+from collections import deque
 from datetime import datetime, timedelta, timezone
+from threading import Lock
+from typing import Any
 
 from sqlalchemy import delete, select
 
+from manga_manager.domain.providers import KNOWN_SOURCES
 from manga_manager.infrastructure.db_models import (
     ProviderBenchmarkRun,
     ProviderPolicy,
     ProviderRequestSample,
 )
 from manga_manager.worker.runtime import SessionFactory
-from manga_manager.domain.providers import KNOWN_SOURCES
 
 
 def utcnow() -> datetime:
@@ -81,41 +85,61 @@ class ProviderTelemetry:
 
         return observe
 
-    def active_observer(self, sample: dict) -> None:
-        source = str(sample.get("source") or "")
-        if source not in KNOWN_SOURCES:
-            return
-        with self.session_factory() as session:
-            run_id = session.scalar(
-                select(ProviderBenchmarkRun.id)
+    def record_samples(self, samples: list[dict[str, Any]]) -> int:
+        """Persist request observations in one transaction.
+
+        Runtime traffic can produce hundreds of observations per minute. Keeping the
+        batching boundary here prevents request instrumentation from becoming a
+        database transaction for every image and catalog request.
+        """
+        rows = [row for row in samples if str(row.get("source") or "") in KNOWN_SOURCES]
+        if not rows:
+            return 0
+        sources = {str(row["source"]) for row in rows}
+        with self.session_factory() as session, session.begin():
+            active_runs: dict[str, ProviderBenchmarkRun] = {}
+            for run in session.scalars(
+                select(ProviderBenchmarkRun)
                 .where(
-                    ProviderBenchmarkRun.source == source,
+                    ProviderBenchmarkRun.source.in_(sources),
                     ProviderBenchmarkRun.state == "running",
                 )
-                .order_by(ProviderBenchmarkRun.id.desc())
-                .limit(1)
-            )
-        if run_id is not None:
-            self.observer(run_id)(sample)
-            return
-        with self.session_factory() as session, session.begin():
-            failed = bool(
-                sample.get("error_code") or int(sample.get("status_code") or 0) in {403, 429, 503}
-            )
-            session.add(
-                ProviderRequestSample(
-                    run_id=None,
-                    source=source,
-                    host=str(sample.get("host") or ""),
-                    status_code=int(sample.get("status_code") or 0),
-                    latency_ms=int(sample.get("latency_ms") or 0),
-                    byte_count=int(sample.get("byte_count") or 0),
-                    error_code=str(sample.get("error_code") or "") if failed else "",
-                    retry_after_seconds=sample.get("retry_after_seconds"),
-                    headers_json=dict(sample.get("headers") or {})
-                    | {"traffic_class": str(sample.get("traffic_class") or "origin")},
+                .order_by(ProviderBenchmarkRun.id)
+            ):
+                active_runs[run.source] = run
+
+            for sample in rows:
+                source = str(sample["source"])
+                status_code = int(sample.get("status_code") or 0)
+                failed = bool(sample.get("error_code") or status_code in {403, 429, 503})
+                run = active_runs.get(source)
+                if run is not None:
+                    run.request_count += 1
+                    run.failure_count += int(failed)
+                    run.success_count += int(not failed)
+                    if failed and not run.limiting_signal:
+                        run.limiting_signal = (
+                            f"HTTP {status_code} {sample.get('error_code') or ''}"
+                        ).strip()
+                session.add(
+                    ProviderRequestSample(
+                        run_id=run.id if run is not None else None,
+                        source=source,
+                        host=str(sample.get("host") or ""),
+                        status_code=status_code,
+                        latency_ms=int(sample.get("latency_ms") or 0),
+                        byte_count=int(sample.get("byte_count") or 0),
+                        error_code=str(sample.get("error_code") or "") if failed else "",
+                        retry_after_seconds=sample.get("retry_after_seconds"),
+                        headers_json=dict(sample.get("headers") or {})
+                        | {"traffic_class": str(sample.get("traffic_class") or "origin")},
+                    )
                 )
-            )
+        return len(rows)
+
+    def active_observer(self, sample: dict) -> None:
+        self.record_samples([sample])
+
 
     def ensure_policy(
         self,
@@ -303,6 +327,46 @@ class ProviderTelemetry:
             policy.updated_at = now
             session.flush()
             return policy
+
+
+class BufferedTelemetryObserver:
+    """Thread-safe, bounded request telemetry buffer for worker runtime traffic."""
+
+    def __init__(
+        self,
+        telemetry: ProviderTelemetry,
+        *,
+        flush_interval_seconds: float = 1.0,
+        max_samples: int = 5_000,
+        batch_size: int = 1_000,
+    ) -> None:
+        self.telemetry = telemetry
+        self.flush_interval_seconds = max(0.1, flush_interval_seconds)
+        self.batch_size = max(1, batch_size)
+        self._samples: deque[dict[str, Any]] = deque(maxlen=max(1, max_samples))
+        self._lock = Lock()
+
+    def observe(self, sample: dict[str, Any]) -> None:
+        # Copy mutable callback data before returning control to the HTTP client.
+        with self._lock:
+            self._samples.append(dict(sample))
+
+    def flush(self) -> int:
+        with self._lock:
+            count = min(len(self._samples), self.batch_size)
+            batch = [self._samples.popleft() for _ in range(count)]
+        if not batch:
+            return 0
+        return self.telemetry.record_samples(batch)
+
+    async def run(self, stop: asyncio.Event) -> None:
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=self.flush_interval_seconds)
+            except TimeoutError:
+                await asyncio.to_thread(self.flush)
+        while await asyncio.to_thread(self.flush):
+            pass
 
 
 def poll_cadence_metadata(metadata: dict | None, base_seconds: int) -> dict:

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import shutil
 import zipfile
 from dataclasses import dataclass
 from datetime import timedelta
 from pathlib import Path
+from typing import Any
 from xml.etree import ElementTree
 
 from sqlalchemy import delete, func, or_, select
@@ -333,12 +335,21 @@ class LibraryRepairHandler:
         self.storage = storage
         self.queue = queue or JobQueue()
         self.capacity = StorageCapacityCoordinator(storage.root, storage.min_free_bytes)
+        bind = getattr(session_factory, "kw", {}).get("bind")
+        # SQLite's StaticPool test setup owns one connection and cannot safely
+        # move its session work between threads. Production PostgreSQL workers can.
+        self._offload_blocking = bind is None or bind.dialect.name != "sqlite"
+
+    async def _blocking(self, function, *args, **kwargs) -> Any:
+        if self._offload_blocking:
+            return await asyncio.to_thread(function, *args, **kwargs)
+        return function(*args, **kwargs)
 
     async def __call__(self, context: JobContext) -> None:
         payload = context.lease.payload
         if not isinstance(payload, LibraryRepairPayload):
             raise RuntimeError("library repair handler received the wrong payload")
-        rows = self._snapshot(payload.series_id)
+        rows = await self._blocking(self._snapshot, payload.series_id)
         if rows:
             with self.session_factory() as session, session.begin():
                 reserved = self.capacity.reserve(
@@ -356,21 +367,22 @@ class LibraryRepairHandler:
                 )
         for index, row in enumerate(rows, 1):
             context.ensure_lease()
-            self._repair_one(row, payload.reason)
-            with self.session_factory() as session, session.begin():
-                self.queue.progress(
-                    session,
-                    job_id=context.lease.id,
-                    owner=context.lease.owner,
-                    details={
-                        "phase": "metadata",
-                        "current": index,
-                        "total": len(rows),
-                        "unit": "archives",
-                    },
-                    message=f"Normalized {index} of {len(rows)} archives",
-                )
-        if self._reconcile_kavita(payload.series_id):
+            await self._blocking(self._repair_one, row, payload.reason)
+            if index == len(rows) or index % 5 == 0:
+                with self.session_factory() as session, session.begin():
+                    self.queue.progress(
+                        session,
+                        job_id=context.lease.id,
+                        owner=context.lease.owner,
+                        details={
+                            "phase": "metadata",
+                            "current": index,
+                            "total": len(rows),
+                            "unit": "archives",
+                        },
+                        message=f"Normalized {index} of {len(rows)} archives",
+                    )
+        if await self._blocking(self._reconcile_kavita, payload.series_id):
             with self.session_factory() as session, session.begin():
                 self.queue.enqueue(
                     session,
@@ -384,7 +396,11 @@ class LibraryRepairHandler:
             if not storage_key or "/" in storage_key or storage_key in {".", ".."}:
                 continue
             for root in (self.storage.library_root, self.storage.kavita_root):
-                shutil.rmtree(root / "Manga" / storage_key, ignore_errors=True)
+                await self._blocking(
+                    shutil.rmtree,
+                    root / "Manga" / storage_key,
+                    ignore_errors=True,
+                )
 
     def _snapshot(self, series_id: int) -> list[RepairChapter]:
         with self.session_factory() as session:

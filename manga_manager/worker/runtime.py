@@ -164,15 +164,20 @@ class JobWorker:
         return WorkerRunResult.SUCCEEDED if succeeded else WorkerRunResult.LEASE_LOST
 
     async def run_forever(self, stop: asyncio.Event) -> None:
+        base_delay = self.settings.poll_interval.total_seconds()
+        idle_delay = base_delay
         while not stop.is_set():
             result = await self.run_once()
             if result is not WorkerRunResult.IDLE:
+                idle_delay = base_delay
                 continue
             try:
-                await asyncio.wait_for(
-                    stop.wait(), timeout=self.settings.poll_interval.total_seconds()
-                )
+                await asyncio.wait_for(stop.wait(), timeout=idle_delay)
             except TimeoutError:
+                # A dozen empty worker slots polling every second creates more DB
+                # traffic than useful work. Back off gently while a pool is idle,
+                # then reset immediately after any claim.
+                idle_delay = min(base_delay * 4, idle_delay * 1.5)
                 continue
 
     def _claim(self) -> JobLease | None:

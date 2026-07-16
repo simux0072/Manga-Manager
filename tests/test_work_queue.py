@@ -337,6 +337,38 @@ def test_cancel_and_release_record_events(session: Session) -> None:
     ]
 
 
+def test_progress_events_are_coalesced_into_meaningful_milestones(session: Session) -> None:
+    queue = JobQueue()
+    job, _ = queue.enqueue(
+        session,
+        kind=JobKind.MAINTENANCE,
+        dedupe_key="maintenance:progress",
+        payload=MaintenancePayload(action="stage_probe"),
+        available_at=NOW,
+    )
+    lease = queue.claim(session, owner="worker-a", lease_for=timedelta(minutes=1), now=NOW)
+    assert lease is not None
+    for current in (1, 2, 5):
+        assert queue.progress(
+            session,
+            job_id=job.id,
+            owner=lease.owner,
+            message=f"processed {current}",
+            details={"phase": "work", "current": current, "total": 100},
+            now=NOW,
+        )
+
+    events = session.scalars(
+        select(JobEvent).where(
+            JobEvent.job_id == job.id,
+            JobEvent.event_type == "progress",
+        )
+    ).all()
+    assert len(events) == 2
+    session.refresh(job)
+    assert job.progress_current == 5
+
+
 def test_claim_can_be_limited_to_registered_kinds(session: Session) -> None:
     queue = JobQueue()
     queue.enqueue(
