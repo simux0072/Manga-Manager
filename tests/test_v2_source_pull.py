@@ -13,17 +13,18 @@ from sqlalchemy.pool import StaticPool
 
 from app.adapters.base import FrontierSentinel, SourceAdapter
 from app.domain import ChapterItem, SeriesItem
-from manga_manager.application.job_handlers import JobContext, RetryableJobError
+from manga_manager.application.job_handlers import DeferredJobError, JobContext, RetryableJobError
 from manga_manager.application.source_pull import (
     SourcePullHandler,
     SourceRefreshHandler,
     build_listing_frontier,
     changed_before_stable_frontier,
 )
-from manga_manager.domain.jobs import JobKind, SourcePullPayload
+from manga_manager.domain.jobs import JobKind, SourcePullPayload, SourceRefreshPayload
 from manga_manager.infrastructure.db_models import (
     CatalogChapter,
     CatalogChapterRelease,
+    CatalogObservation,
     CatalogMatchDecision,
     CatalogSeries,
     CatalogSourceSeries,
@@ -112,6 +113,13 @@ class DisconnectedAdapter(FakeAdapter):
         raise httpx.RemoteProtocolError("")
 
 
+class OriginUnavailableAdapter(FakeAdapter):
+    async def get_series_detail(self, item: SeriesItem) -> SeriesItem:
+        request = httpx.Request("GET", item.url)
+        response = httpx.Response(521, request=request)
+        raise httpx.HTTPStatusError("origin unavailable", request=request, response=response)
+
+
 @pytest.fixture
 def sessions() -> TrackingSessionFactory:
     engine = create_engine(
@@ -138,6 +146,32 @@ def claimed_context(sessions: TrackingSessionFactory) -> JobContext:
             owner="worker-a",
             lease_for=timedelta(minutes=5),
             now=now,
+        )
+        assert lease is not None
+    return JobContext(lease=lease, lease_lost=asyncio.Event())
+
+
+def claimed_refresh_context(sessions: TrackingSessionFactory) -> JobContext:
+    now = datetime.now(timezone.utc)
+    with sessions() as session, session.begin():
+        JobQueue().enqueue(
+            session,
+            kind=JobKind.SOURCE_REFRESH,
+            dedupe_key="refresh:fake:series-1",
+            payload=SourceRefreshPayload(
+                source="fake",
+                source_id="series-1",
+                title="The Example Hero",
+                url="https://example.test/series-1",
+            ),
+            available_at=now,
+        )
+        lease = JobQueue().claim(
+            session,
+            owner="worker-refresh",
+            lease_for=timedelta(minutes=5),
+            now=now,
+            kinds={JobKind.SOURCE_REFRESH},
         )
         assert lease is not None
     return JobContext(lease=lease, lease_lost=asyncio.Event())
@@ -227,6 +261,30 @@ async def test_source_pull_classifies_empty_protocol_error_as_network_failure(
     assert raised.value.code == "source_network_error"
     assert raised.value.message == "RemoteProtocolError"
     assert adapter.closed is True
+
+
+@pytest.mark.asyncio
+async def test_source_refresh_defers_cloudflare_origin_outage_without_quarantine(
+    sessions: TrackingSessionFactory,
+) -> None:
+    adapter = OriginUnavailableAdapter(sessions)
+    handler = SourceRefreshHandler(
+        session_factory=sessions,
+        adapter_factory=lambda _source: adapter,
+    )
+
+    with pytest.raises(DeferredJobError) as raised:
+        await handler(claimed_refresh_context(sessions))
+
+    assert raised.value.code == "provider_origin_unavailable"
+    assert raised.value.retry_after >= timedelta(minutes=4)
+    assert adapter.closed is True
+    with sessions() as session:
+        state = session.get(CatalogSourceState, "fake")
+        assert state is not None
+        assert state.health_status == "cooldown"
+        assert state.cooldown_until is not None
+        assert session.scalar(select(func.count()).select_from(CatalogObservation)) == 0
 
 
 def test_exact_title_without_external_id_creates_pending_match(

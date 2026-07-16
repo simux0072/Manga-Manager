@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+import httpx
 from sqlalchemy import select, update
 
 from app.adapters import adapter_for_source
@@ -11,6 +12,11 @@ from manga_manager.application.job_handlers import (
     JobContext,
     PermanentJobError,
     exception_message,
+)
+from manga_manager.application.provider_health import (
+    is_cloudflare_origin_error,
+    provider_cooldown_until,
+    record_provider_failure,
 )
 from manga_manager.domain.jobs import MaintenancePayload
 from manga_manager.infrastructure.db_models import (
@@ -49,6 +55,22 @@ class MaintenanceHandler:
             delay = timedelta(minutes=self._record_probe_failure(source))
             raise DeferredJobError(
                 "rate_limited", exception_message(exc), retry_after=delay
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            if not is_cloudflare_origin_error(exc.response.status_code):
+                raise
+            cooldown = provider_cooldown_until(self.session_factory, source)
+            effective = record_provider_failure(
+                self.session_factory,
+                source=source,
+                error=exception_message(exc),
+                cooldown_until=cooldown,
+            )
+            retry_at = effective or cooldown
+            raise DeferredJobError(
+                "provider_origin_unavailable",
+                exception_message(exc),
+                retry_after=max(retry_at - datetime.now(timezone.utc), timedelta(seconds=1)),
             ) from exc
         finally:
             await adapter.aclose()

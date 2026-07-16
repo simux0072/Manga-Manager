@@ -6,24 +6,29 @@ from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 
 import httpx
-from sqlalchemy import select
 
 from app.adapters import adapter_for_source
 from app.adapters.asura import asura_series_url, split_asura_source_id
 from app.adapters.base import FrontierSentinel, SourceAdapter, SourceRateLimited
 from app.domain import SeriesItem
 from manga_manager.application.job_handlers import (
+    DeferredJobError,
     JobContext,
     PermanentJobError,
     RetryableJobError,
     exception_message,
 )
 from manga_manager.application.cover_evidence import CoverEvidenceService
-from manga_manager.application.download_plans import DownloadPlanCoordinator
+from manga_manager.application.provider_health import (
+    is_cloudflare_origin_error,
+    is_transient_provider_status,
+    provider_cooldown_until,
+    record_provider_failure,
+)
 from manga_manager.domain.jobs import JobKind, SourcePullPayload, SourceRefreshPayload
 from manga_manager.infrastructure.catalog_repository import CatalogRepository
 from manga_manager.infrastructure.job_queue import JobQueue
-from manga_manager.infrastructure.db_models import CatalogSourceState, ProviderEndpointState, WorkJob
+from manga_manager.infrastructure.db_models import CatalogSourceState, WorkJob
 from manga_manager.worker.runtime import SessionFactory
 
 
@@ -73,25 +78,59 @@ class SourcePullHandler:
             observed_frontier = build_listing_frontier(listed_items, self.frontier_limit)
             candidates = changed_before_stable_frontier(listed_items, frontier, required_hits=3)
         except SourceRateLimited as exc:
-            retry_at = aware_datetime(exc.retry_after)
-            self._record_failure(
+            retry_at = aware_datetime(exc.retry_after) or provider_cooldown_until(
+                self.session_factory, source
+            )
+            effective_cooldown = self._record_failure(
                 source,
                 exception_message(exc),
                 retry_at,
                 traffic_class=exc.traffic_class or "origin",
             )
-            delay = max(retry_at - utcnow(), timedelta(seconds=1)) if retry_at else None
-            raise RetryableJobError(
+            retry_at = effective_cooldown or retry_at
+            delay = max(retry_at - utcnow(), timedelta(seconds=1))
+            raise DeferredJobError(
                 "rate_limited", exception_message(exc), retry_after=delay
             ) from exc
         except httpx.TransportError as exc:
-            self._record_failure(source, exception_message(exc), None)
+            effective_cooldown = self._record_failure(source, exception_message(exc), None)
+            if effective_cooldown is not None:
+                raise DeferredJobError(
+                    "source_network_error",
+                    exception_message(exc),
+                    retry_after=max(
+                        effective_cooldown - utcnow(), timedelta(seconds=1)
+                    ),
+                ) from exc
             raise RetryableJobError("source_network_error", exception_message(exc)) from exc
         except httpx.HTTPStatusError as exc:
-            self._record_failure(source, exception_message(exc), None)
             status = exc.response.status_code
+            cooldown = (
+                provider_cooldown_until(self.session_factory, source)
+                if is_cloudflare_origin_error(status)
+                else None
+            )
+            effective_cooldown = self._record_failure(
+                source, exception_message(exc), cooldown
+            )
             if 400 <= status < 500 and status not in {408, 429}:
                 raise PermanentJobError("source_http_error", exception_message(exc)) from exc
+            if is_cloudflare_origin_error(status):
+                retry_at = effective_cooldown or cooldown
+                delay = max(retry_at - utcnow(), timedelta(seconds=1))
+                raise DeferredJobError(
+                    "provider_origin_unavailable",
+                    exception_message(exc),
+                    retry_after=delay,
+                ) from exc
+            if effective_cooldown is not None:
+                raise DeferredJobError(
+                    "source_http_error",
+                    exception_message(exc),
+                    retry_after=max(
+                        effective_cooldown - utcnow(), timedelta(seconds=1)
+                    ),
+                ) from exc
             raise RetryableJobError("source_http_error", exception_message(exc)) from exc
         except Exception as exc:
             self._record_failure(source, exception_message(exc), None)
@@ -210,30 +249,16 @@ class SourcePullHandler:
         cooldown_until: datetime | None,
         *,
         traffic_class: str = "origin",
-    ) -> None:
-        with self.session_factory() as session, session.begin():
-            self.catalog.record_poll_failure(
-                session, source=source, error=error, cooldown_until=cooldown_until
-            )
-            state = session.get(CatalogSourceState, source)
-            effective_cooldown = state.cooldown_until if state is not None else cooldown_until
-            endpoint = session.scalar(
-                select(ProviderEndpointState).where(
-                    ProviderEndpointState.source == source,
-                    ProviderEndpointState.traffic_class == traffic_class,
-                )
-            )
-            if endpoint is None:
-                endpoint = ProviderEndpointState(source=source, traffic_class=traffic_class)
-                session.add(endpoint)
-            endpoint.consecutive_failures = (endpoint.consecutive_failures or 0) + 1
-            endpoint.last_error = error[:4000]
-            endpoint.cooldown_until = effective_cooldown
-            endpoint.updated_at = utcnow()
-            if effective_cooldown is not None:
-                DownloadPlanCoordinator(self.queue).bypass_cooling_source(
-                    session, source=source, retry_after=effective_cooldown
-                )
+    ) -> datetime | None:
+        return record_provider_failure(
+            self.session_factory,
+            source=source,
+            error=error,
+            cooldown_until=cooldown_until,
+            traffic_class=traffic_class,
+            catalog=self.catalog,
+            queue=self.queue,
+        )
 
 
 class SourceRefreshHandler:
@@ -269,15 +294,69 @@ class SourceRefreshHandler:
             enriched = await detail(item) if detail is not None else item
             chapters = await adapter.get_chapters(enriched)
         except SourceRateLimited as exc:
-            retry_at = aware_datetime(exc.retry_after)
-            delay = max(retry_at - utcnow(), timedelta(seconds=1)) if retry_at else None
-            raise RetryableJobError(
+            retry_at = aware_datetime(exc.retry_after) or provider_cooldown_until(
+                self.session_factory, payload.source
+            )
+            effective_cooldown = record_provider_failure(
+                self.session_factory,
+                source=payload.source,
+                error=exception_message(exc),
+                cooldown_until=retry_at,
+                catalog=self.catalog,
+            )
+            retry_at = effective_cooldown or retry_at
+            delay = max(retry_at - utcnow(), timedelta(seconds=1))
+            raise DeferredJobError(
                 "rate_limited", exception_message(exc), retry_after=delay
             ) from exc
         except httpx.TransportError as exc:
+            effective_cooldown = record_provider_failure(
+                self.session_factory,
+                source=payload.source,
+                error=exception_message(exc),
+                cooldown_until=None,
+                catalog=self.catalog,
+            )
+            if effective_cooldown is not None:
+                raise DeferredJobError(
+                    "source_network_error",
+                    exception_message(exc),
+                    retry_after=max(
+                        effective_cooldown - utcnow(), timedelta(seconds=1)
+                    ),
+                ) from exc
             raise RetryableJobError("source_network_error", exception_message(exc)) from exc
         except httpx.HTTPStatusError as exc:
-            if exc.response.status_code in {408, 429, 500, 502, 503, 504}:
+            status = exc.response.status_code
+            if is_transient_provider_status(status):
+                cooldown = (
+                    provider_cooldown_until(self.session_factory, payload.source)
+                    if is_cloudflare_origin_error(status)
+                    else None
+                )
+                effective_cooldown = record_provider_failure(
+                    self.session_factory,
+                    source=payload.source,
+                    error=exception_message(exc),
+                    cooldown_until=cooldown,
+                    catalog=self.catalog,
+                )
+                if is_cloudflare_origin_error(status):
+                    retry_at = effective_cooldown or cooldown
+                    delay = max(retry_at - utcnow(), timedelta(seconds=1))
+                    raise DeferredJobError(
+                        "provider_origin_unavailable",
+                        exception_message(exc),
+                        retry_after=delay,
+                    ) from exc
+                if effective_cooldown is not None:
+                    raise DeferredJobError(
+                        "source_http_error",
+                        exception_message(exc),
+                        retry_after=max(
+                            effective_cooldown - utcnow(), timedelta(seconds=1)
+                        ),
+                    ) from exc
                 raise RetryableJobError("source_http_error", exception_message(exc)) from exc
             self._quarantine(payload, exception_message(exc))
             raise PermanentJobError("source_item_invalid", exception_message(exc)) from exc

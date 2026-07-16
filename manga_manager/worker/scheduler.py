@@ -5,6 +5,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 
 from sqlalchemy import Engine, select, text
+from sqlalchemy.orm import Session, aliased
 
 from app.settings import settings as adapter_settings
 from app.kavita import configured_kavita_client
@@ -12,9 +13,10 @@ from manga_manager.application.download_plans import DownloadPlanCoordinator
 from manga_manager.application.cover_backfill import CoverBackfillPlanner
 from manga_manager.application.kavita_sync import KavitaSyncPlanner
 from manga_manager.application.library_repair import LibraryRepairPlanner
+from manga_manager.application.provider_health import contains_cloudflare_origin_error
 from manga_manager.application.job_retention import JobRetention
 from manga_manager.domain.jobs import JobKind, MaintenancePayload, SourcePullPayload
-from manga_manager.infrastructure.db_models import CatalogSourceState, ProviderPolicy
+from manga_manager.infrastructure.db_models import CatalogSourceState, ProviderPolicy, WorkJob
 from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.infrastructure.provider_telemetry import ProviderTelemetry
 from manga_manager.infrastructure.storage_capacity import StorageCapacityCoordinator
@@ -114,6 +116,7 @@ class SourcePollScheduler:
                     setattr(adapter_settings, field, policy.learned_page_limit)
         with self.session_factory() as session, session.begin():
             self.storage_capacity.refresh(session)
+            count += self._recover_misclassified_provider_outages(session, current)
             DownloadPlanCoordinator(self.queue).bootstrap(session)
             repair_planner = LibraryRepairPlanner(self.queue)
             canonicalized, cancelled = repair_planner.reconcile_active_jobs(session)
@@ -174,6 +177,64 @@ class SourcePollScheduler:
                 )
                 count += int(created)
         return count
+
+    def _recover_misclassified_provider_outages(
+        self,
+        session: Session,
+        current: datetime,
+        *,
+        limit: int = 25,
+    ) -> int:
+        """Requeue refreshes that older releases incorrectly made terminal on HTTP 52x."""
+        later = aliased(WorkJob)
+        rows = session.scalars(
+            select(WorkJob)
+            .where(
+                WorkJob.kind == JobKind.SOURCE_REFRESH.value,
+                WorkJob.status == "failed",
+                WorkJob.error_code == "source_item_invalid",
+                ~select(later.id)
+                .where(
+                    later.kind == WorkJob.kind,
+                    later.dedupe_key == WorkJob.dedupe_key,
+                    later.id > WorkJob.id,
+                    later.status == "succeeded",
+                )
+                .exists(),
+            )
+            .order_by(WorkJob.id)
+            .limit(limit)
+        ).all()
+        recovered = 0
+        for failed in rows:
+            if not contains_cloudflare_origin_error(failed.error_message):
+                continue
+            state = session.get(CatalogSourceState, failed.source)
+            available_at = aware_datetime(state.cooldown_until) if state is not None else None
+            replacement, created = self.queue.enqueue(
+                session,
+                kind=JobKind.SOURCE_REFRESH,
+                dedupe_key=failed.dedupe_key,
+                payload=failed.payload,
+                priority=failed.priority,
+                max_attempts=max(failed.max_attempts, 4),
+                available_at=max(available_at or current, current),
+                source=failed.source,
+                series_key=failed.series_key,
+                pool=failed.pool,
+                workflow_key=failed.workflow_key,
+                group_key=failed.group_key,
+            )
+            if not created:
+                continue
+            failed.error_code = "provider_outage_requeued"
+            failed.error_message = (
+                f"Automatically requeued as job #{replacement.id} after a temporary "
+                "provider-origin outage."
+            )
+            failed.updated_at = current
+            recovered += 1
+        return recovered
 
     async def _wait(self, stop: asyncio.Event) -> None:
         try:
