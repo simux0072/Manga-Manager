@@ -54,11 +54,14 @@ The first code pass completed the following high-return items from this audit:
   polling;
 - frontend SSE invalidation is narrower, fallback polling is less aggressive, and the matching
   workspace is route-split from the initial bundle.
+- HTTP responses expose request/SQL timings and query counts, `/metrics` retains bounded route
+  counters, and the scale environment enforces latency and query-count ceilings across all primary
+  read workspaces.
 
 Targeted Python tests, Ruff, Vitest, and the production frontend build pass. PostgreSQL concurrency,
 browser, staging, and ARM64 checks remain deployment validation because they require the container
 environment. The next measured priorities are SQL-shortlisted proposal read models, LISTEN/NOTIFY
-worker wakeups, thumbnail generation, Kavita batch/list caching, and route/query timing budgets.
+worker wakeups, thumbnail generation, and Kavita batch/list caching.
 
 ## Repository and runtime shape
 

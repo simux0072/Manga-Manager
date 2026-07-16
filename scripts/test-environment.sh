@@ -96,6 +96,17 @@ case "$command" in
     ;;
   check)
     curl -fsS "http://127.0.0.1:$port/healthz" >/dev/null
+    headers=$(curl -fsS -D - -o /dev/null "http://127.0.0.1:$port/api/v2/library?limit=3")
+    printf '%s\n' "$headers" | tr -d '\r' | grep -qi '^X-SQL-Query-Count: [0-9][0-9]*$' || {
+      echo "API SQL measurement header is missing" >&2
+      exit 1
+    }
+    curl -fsS "http://127.0.0.1:$port/metrics" | \
+      grep -q 'route="/api/v2/library"' || {
+      echo "API route metrics are missing" >&2
+      exit 1
+    }
+    echo "api_metrics=ok"
     wait_for_mutations
     wait_for_stage_check
     probe=$(run_cli manga-manager enqueue-probe)
@@ -153,14 +164,40 @@ case "$command" in
       echo "unexpected scale worker memory limit: $worker_limit" >&2
       exit 1
     }
+    scale_series_count="${TEST_SCALE_SERIES_COUNT:-2000}"
+    scale_chapter_count="${TEST_SCALE_CHAPTER_COUNT:-0}"
+    scale_job_count="${TEST_SCALE_JOB_COUNT:-25000}"
+    expected_discovery=$((scale_series_count - (scale_series_count + 4) / 5))
     docker run --rm --network "$scale_project-net" \
       -e V2_DATABASE_URL="postgresql+psycopg://manga:manga@$scale_project-postgres:5432/manga_manager" \
       -e V2_STORAGE_ROOT=/data -e MANGA_MANAGER_ALLOW_TEST_SEED=1 \
       -v "$scale_root/storage:/data" "$scale_project:local" \
-      python scripts/seed-test-data.py --profile scale
-    python scripts/verify-scale-api.py --base-url "http://127.0.0.1:${TEST_SCALE_PORT:-18002}"
+      python scripts/seed-test-data.py --profile scale --series-count "$scale_series_count" \
+      --chapter-count "$scale_chapter_count" --job-count "$scale_job_count"
+    python scripts/verify-scale-api.py --base-url "http://127.0.0.1:${TEST_SCALE_PORT:-18002}" \
+      --expected-series "$expected_discovery"
     cleanup_scale
     trap - EXIT INT TERM
+    ;;
+  performance-check)
+    TEST_SCALE_SERIES_COUNT="${TEST_SCALE_SERIES_COUNT:-2000}" \
+      TEST_SCALE_CHAPTER_COUNT="${TEST_SCALE_CHAPTER_COUNT:-100000}" \
+      TEST_SCALE_JOB_COUNT="${TEST_SCALE_JOB_COUNT:-100000}" \
+      "$0" scale-check
+    ;;
+  validate)
+    self=$(realpath "$0")
+    cleanup_validation() {
+      "$self" down >/dev/null 2>&1 || true
+    }
+    trap cleanup_validation EXIT INT TERM
+    "$self" reset --yes
+    "$self" up
+    "$self" check
+    "$self" scale-check
+    "$self" down
+    trap - EXIT INT TERM
+    echo "small_validation=passed"
     ;;
   down)
     scripts/kavita-local.sh down
@@ -182,7 +219,7 @@ case "$command" in
       --format '{{.Names}} {{.Status}} {{.Ports}}'
     ;;
   *)
-    echo "usage: scripts/test-environment.sh up|check|scale-check|down|reset --yes|status" >&2
+    echo "usage: scripts/test-environment.sh up|check|scale-check|performance-check|validate|down|reset --yes|status" >&2
     exit 2
     ;;
 esac

@@ -26,10 +26,22 @@ scripts/test-environment.sh down       # preserve its small database
 scripts/test-environment.sh reset --yes
 ```
 
+Run the entire fresh small-stack, Kavita/browser, backup/restore, and disposable scale acceptance
+sequence unattended with `scripts/test-environment.sh validate`. It always stops its isolated
+services afterward, including when a check fails.
+
+On the Raspberry Pi, run `scripts/test-environment.sh performance-check` once before production
+rollout. It uses the same disposable scale project but expands it to 2,000 series, 100,000 synthetic
+chapters, and 100,000 jobs. The regular `scale-check` intentionally stays at 25,000 jobs and zero
+chapters for quicker development feedback on the slower staging PC. Staging builds use the host's
+native architecture unless `STAGE_PLATFORM` is explicitly set for a cross-platform rehearsal.
+
 It uses project `manga-manager-test`, ports 18001/15001, an isolated Kavita configuration, disabled
 live sources, two generated manga, and four tiny generated CBZs. `scale-check` uses a separate
 temporary project on port 18002, stops its worker before inserting 2,000 series and 25,000 jobs,
-checks cursor completeness/grouping/latency, and always tears itself down.
+checks cursor completeness/grouping/latency and per-route SQL-query ceilings, and always tears
+itself down. Every HTTP response includes `Server-Timing` and `X-SQL-Query-Count`; `/metrics`
+provides bounded Prometheus-compatible request, duration, SQL, and response-size counters.
 Kavita is temporarily pinned to `jvmilazz0/kavita:0.8.9` because `0.9.0.2` cannot initialize an
 empty local-test database reliably. This isolated instance is not public-facing. Set `KAVITA_IMAGE`
 explicitly to retest a future fixed release before updating the pin.

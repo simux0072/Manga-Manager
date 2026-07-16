@@ -75,6 +75,8 @@ def test_runtime_entrypoints_do_not_reinvoke_uv() -> None:
     assert '["uv", "run", "--frozen"' not in compose
     assert "uv run --frozen" not in stage
     assert "max-size=10m" in stage
+    assert 'docker build --platform "$STAGE_PLATFORM"' in stage
+    assert 'STAGE_PLATFORM:-linux/amd64' not in stage
     assert "max-size: 10m" in compose
     assert 'docker stop --time "${STAGE_POSTGRES_STOP_SECONDS:-300}"' in stage
     assert 'docker rm -f "$postgres"' not in stage
@@ -94,6 +96,26 @@ def test_runtime_entrypoints_do_not_reinvoke_uv() -> None:
     assert "1073741824" in environment
     assert "wait_for_stage_check" in environment
     assert '\"busy\": true' in environment
+    assert "small_validation=passed" in environment
+    assert '"$self" scale-check' in environment
+    assert "TEST_SCALE_CHAPTER_COUNT:-100000" in environment
+    assert "TEST_SCALE_JOB_COUNT:-100000" in environment
+    assert '"$0" scale-check' in environment
+    scale_verifier = (ROOT / "scripts" / "verify-scale-api.py").read_text()
+    assert "X-SQL-Query-Count" in scale_verifier
+    assert "max-route-queries" in scale_verifier
+    assert '\"operations\": \"/api/v2/operations\"' in scale_verifier
+
+
+def test_scale_parser_accepts_database_only_chapter_fixture_size() -> None:
+    seed = load_seed_module()
+
+    parsed = seed.parser().parse_args(
+        ["--profile", "scale", "--chapter-count", "100000", "--job-count", "100000"]
+    )
+
+    assert parsed.chapter_count == 100_000
+    assert parsed.job_count == 100_000
 
 
 def test_reset_preview_names_legacy_kavita_resources() -> None:

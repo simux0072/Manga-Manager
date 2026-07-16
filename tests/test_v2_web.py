@@ -107,6 +107,54 @@ async def test_health_and_legacy_bookmarks() -> None:
     assert redirect.headers["location"] == "/operations"
 
 
+async def test_request_metrics_report_route_latency_and_sql_count() -> None:
+    app, _ = app_with_catalog()
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        health = await client.get("/healthz")
+        metrics = await client.get("/metrics")
+
+    assert health.headers["X-SQL-Query-Count"] == "1"
+    assert "app;dur=" in health.headers["Server-Timing"]
+    assert "db;dur=" in health.headers["Server-Timing"]
+    assert (
+        'manga_manager_http_requests_total{method="GET",route="/healthz",status="200"} 1'
+        in metrics.text
+    )
+    assert (
+        'manga_manager_http_sql_queries_total{method="GET",route="/healthz",status="200"} 1'
+        in metrics.text
+    )
+
+
+async def test_primary_read_routes_stay_inside_scale_query_budget() -> None:
+    app, _ = app_with_catalog()
+    paths = (
+        "/api/v2/discovery?limit=25",
+        "/api/v2/library?limit=30",
+        "/api/v2/updates?limit=20",
+        "/api/v2/matches?limit=24",
+        "/api/v2/job-groups?state=queued",
+        "/api/v2/activity?limit=100",
+        "/api/v2/operations",
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        responses = {path: await client.get(path) for path in paths}
+
+    failures = {
+        path: response.text for path, response in responses.items() if response.status_code != 200
+    }
+    assert failures == {}
+    query_counts = {
+        path: int(response.headers["X-SQL-Query-Count"])
+        for path, response in responses.items()
+    }
+    assert max(query_counts.values()) <= 25, query_counts
+
+
 async def test_discovery_searches_description_and_uses_multi_source_or() -> None:
     app, sessions = app_with_catalog()
     with sessions() as session, session.begin():

@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse, RedirectResponse
+import time
+
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, PlainTextResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session, sessionmaker
@@ -33,6 +35,12 @@ from manga_manager.domain.jobs import JobKind
 from manga_manager.domain.providers import SOURCE_PRIORITY, provider_names
 from manga_manager.domain.matching import provider_identities_equivalent
 from manga_manager.web.api import create_api_router
+from manga_manager.web.metrics import (
+    RequestMetrics,
+    begin_request_measurement,
+    end_request_measurement,
+    install_sql_timing,
+)
 
 
 ROOT = Path(__file__).parents[2]
@@ -42,17 +50,68 @@ PAGE_PATHS = ("/", "/discovery", "/library", "/updates", "/matches", "/activity"
 def create_app(session_factory: sessionmaker[Session] | None = None) -> FastAPI:
     application = FastAPI(title="Manga Manager", version="2")
     resolved_factory = session_factory
+    request_metrics = RequestMetrics()
+
+    def instrument_factory(factory: sessionmaker[Session]) -> sessionmaker[Session]:
+        bind = factory.kw.get("bind")
+        if bind is not None:
+            install_sql_timing(bind)
+        return factory
+
+    if resolved_factory is not None:
+        instrument_factory(resolved_factory)
 
     def get_session_factory() -> sessionmaker[Session]:
         nonlocal resolved_factory
         if resolved_factory is None:
             settings = V2Settings()
-            resolved_factory = create_session_factory(
-                create_database_engine(settings.require_database_url())
+            resolved_factory = instrument_factory(
+                create_session_factory(create_database_engine(settings.require_database_url()))
             )
         return resolved_factory
 
+    @application.middleware("http")
+    async def measure_request(request: Request, call_next):
+        started = time.perf_counter()
+        measurement, token = begin_request_measurement()
+        status = 500
+        response_bytes = 0
+        try:
+            response = await call_next(request)
+            status = response.status_code
+            try:
+                response_bytes = int(response.headers.get("content-length", "0"))
+            except ValueError:
+                response_bytes = 0
+            response.headers["Server-Timing"] = (
+                f"app;dur={(time.perf_counter() - started) * 1000:.2f}, "
+                f'db;dur={measurement.sql_seconds * 1000:.2f};desc="'
+                f"{measurement.sql_queries} queries\""
+            )
+            response.headers["X-SQL-Query-Count"] = str(measurement.sql_queries)
+            return response
+        finally:
+            route = request.scope.get("route")
+            route_label = getattr(route, "path", "unmatched")
+            end_request_measurement(token)
+            request_metrics.observe(
+                method=request.method,
+                route=route_label,
+                status=status,
+                duration_seconds=time.perf_counter() - started,
+                sql_queries=measurement.sql_queries,
+                sql_seconds=measurement.sql_seconds,
+                response_bytes=response_bytes,
+            )
+
     application.include_router(create_api_router(get_session_factory))
+
+    @application.get("/metrics", include_in_schema=False)
+    async def metrics() -> PlainTextResponse:
+        return PlainTextResponse(
+            request_metrics.render_prometheus(),
+            media_type="text/plain; version=0.0.4",
+        )
     frontend = ROOT / "frontend" / "dist"
     if (frontend / "assets").exists():
         application.mount(

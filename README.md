@@ -36,6 +36,11 @@ scripts/test-environment.sh scale-check
 scripts/test-environment.sh reset --yes
 ```
 
+`scripts/test-environment.sh validate` runs the complete sequence from a fresh isolated database
+and tears it down when finished.
+Run `scripts/test-environment.sh performance-check` on the target Pi to exercise 100,000 synthetic
+chapters and 100,000 jobs without provider traffic or committed media.
+
 This isolated stack generates two synthetic manga and tiny valid CBZs at runtime. The scale check
 uses 2,000 database-only series and 25,000 jobs, then removes its disposable volume. No fixture media
 or databases are stored in Git.

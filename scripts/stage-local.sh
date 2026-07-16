@@ -117,7 +117,11 @@ if [ -n "${STAGE_LEGACY_DATABASE:-}" ]; then
   }
 fi
 if [ "$build_requested" = true ] || ! docker image inspect "$image" >/dev/null 2>&1; then
-  docker build --platform "${STAGE_PLATFORM:-linux/amd64}" -t "$image" .
+  if [ -n "${STAGE_PLATFORM:-}" ]; then
+    docker build --platform "$STAGE_PLATFORM" -t "$image" .
+  else
+    docker build -t "$image" .
+  fi
 fi
 docker network inspect "$network" >/dev/null 2>&1 || docker network create "$network" >/dev/null
 docker volume inspect "$db_volume" >/dev/null 2>&1 || docker volume create "$db_volume" >/dev/null

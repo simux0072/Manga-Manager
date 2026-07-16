@@ -51,6 +51,7 @@ def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description="Seed an isolated Manga Manager test database")
     value.add_argument("--profile", choices=("small", "scale"), default="small")
     value.add_argument("--series-count", type=int, default=2_000)
+    value.add_argument("--chapter-count", type=int, default=0)
     value.add_argument("--job-count", type=int, default=25_000)
     return value
 
@@ -327,7 +328,14 @@ def seed_small(settings: V2Settings, sessions) -> dict[str, int | str]:
     return {"profile": "small", "status": "seeded", "series": len(SMALL_SERIES), "jobs": 4}
 
 
-def seed_scale(settings: V2Settings, sessions, *, series_count: int, job_count: int) -> dict[str, int | str]:
+def seed_scale(
+    settings: V2Settings,
+    sessions,
+    *,
+    series_count: int,
+    job_count: int,
+    chapter_count: int = 0,
+) -> dict[str, int | str]:
     if series_count < 2_000 or job_count < 25_000:
         raise ValueError("scale profile requires at least 2000 series and 25000 jobs")
     with sessions() as session, session.begin():
@@ -342,7 +350,18 @@ def seed_scale(settings: V2Settings, sessions, *, series_count: int, job_count: 
             )
             if seeded_jobs != job_count:
                 raise RuntimeError("scale test fixture is incomplete; reset its isolated database")
-            return {"profile": "scale", "status": "already_seeded", "series": series_count, "jobs": job_count}
+            seeded_chapters = int(
+                session.scalar(select(func.count()).select_from(CatalogChapter)) or 0
+            )
+            if seeded_chapters != chapter_count:
+                raise RuntimeError("scale chapter fixture is incomplete; reset its isolated database")
+            return {
+                "profile": "scale",
+                "status": "already_seeded",
+                "series": series_count,
+                "chapters": chapter_count,
+                "jobs": job_count,
+            }
         rows = [
             CatalogSeries(
                 title=f"Synthetic Scale Series {index:05d}",
@@ -368,6 +387,23 @@ def seed_scale(settings: V2Settings, sessions, *, series_count: int, job_count: 
             )
             for index, row in enumerate(rows)
         )
+        chapters: list[CatalogChapter] = []
+        for index in range(chapter_count):
+            chapter_number = index // series_count + 1
+            chapters.append(
+                CatalogChapter(
+                    series_id=rows[index % series_count].id,
+                    canonical_number=str(chapter_number),
+                    display_number=str(chapter_number),
+                    sort_number=chapter_number,
+                    title=f"Synthetic chapter {chapter_number}",
+                )
+            )
+            if len(chapters) == 2_000:
+                session.bulk_save_objects(chapters)
+                chapters.clear()
+        if chapters:
+            session.bulk_save_objects(chapters)
         queued = job_count // 4
         failed = job_count // 10
         cancelled = job_count // 10
@@ -426,7 +462,13 @@ def seed_scale(settings: V2Settings, sessions, *, series_count: int, job_count: 
                 jobs.clear()
         if jobs:
             session.bulk_save_objects(jobs)
-    return {"profile": "scale", "status": "seeded", "series": series_count, "jobs": job_count}
+    return {
+        "profile": "scale",
+        "status": "seeded",
+        "series": series_count,
+        "chapters": chapter_count,
+        "jobs": job_count,
+    }
 
 
 def main() -> int:
@@ -443,6 +485,7 @@ def main() -> int:
             settings,
             sessions,
             series_count=args.series_count,
+            chapter_count=args.chapter_count,
             job_count=args.job_count,
         )
     print(json.dumps(result, sort_keys=True))
