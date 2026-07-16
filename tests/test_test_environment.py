@@ -98,6 +98,8 @@ def test_runtime_entrypoints_do_not_reinvoke_uv() -> None:
     assert '\"busy\": true' in environment
     assert "small_validation=passed" in environment
     assert '"$self" scale-check' in environment
+    assert "scripts/kavita-cover-check.py" in environment
+    assert 'kavita_covers=ok pairs=$checked_covers' in environment
     assert "TEST_SCALE_CHAPTER_COUNT:-100000" in environment
     assert "TEST_SCALE_JOB_COUNT:-100000" in environment
     assert '"$0" scale-check' in environment

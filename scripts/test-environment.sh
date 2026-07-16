@@ -126,7 +126,36 @@ case "$command" in
       echo "Kavita cover verification failed for $cover_issues chapters" >&2
       exit 1
     }
-    echo "kavita_covers=ok"
+    api_key=$(sed -n 's/^KAVITA_API_KEY=//p' "$KAVITA_ENV_FILE")
+    [ -n "$api_key" ] || {
+      echo "Kavita API key is missing from $KAVITA_ENV_FILE" >&2
+      exit 1
+    }
+    cover_pairs=$(docker exec "$postgres" psql -U manga -d manga_manager -AtF '|' -c \
+      "SELECT DISTINCT ON (s.id) s.kavita_series_id,c.kavita_chapter_id
+       FROM series_v2 s JOIN chapter_v2 c ON c.series_id=s.id
+       WHERE s.status IN ('interested','reading','caught_up','paused')
+         AND s.kavita_series_id IS NOT NULL AND c.kavita_chapter_id IS NOT NULL
+       ORDER BY s.id,c.id")
+    [ -n "$cover_pairs" ] || {
+      echo "Kavita did not expose any tracked series/chapter mapping" >&2
+      exit 1
+    }
+    checked_covers=0
+    while IFS='|' read -r kavita_series_id kavita_chapter_id; do
+      [ -n "$kavita_series_id" ] && [ -n "$kavita_chapter_id" ] || continue
+      run_cli python scripts/kavita-cover-check.py \
+        --url "http://$kavita_container:5000" --api-key "$api_key" \
+        --series-id "$kavita_series_id" --chapter-id "$kavita_chapter_id"
+      checked_covers=$((checked_covers + 1))
+    done <<EOF
+$cover_pairs
+EOF
+    [ "$checked_covers" -gt 0 ] || {
+      echo "Kavita cover endpoint verification did not inspect any mapping" >&2
+      exit 1
+    }
+    echo "kavita_covers=ok pairs=$checked_covers"
     docker exec "$postgres" pg_dump -U manga -d manga_manager -Fc -f /tmp/test-environment.dump
     docker exec "$postgres" dropdb -U manga --if-exists manga_manager_test_restore
     docker exec "$postgres" createdb -U manga manga_manager_test_restore

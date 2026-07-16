@@ -42,6 +42,8 @@ temporary project on port 18002, stops its worker before inserting 2,000 series 
 checks cursor completeness/grouping/latency and per-route SQL-query ceilings, and always tears
 itself down. Every HTTP response includes `Server-Timing` and `X-SQL-Query-Count`; `/metrics`
 provides bounded Prometheus-compatible request, duration, SQL, and response-size counters.
+The small check also downloads each tracked fixture's series and chapter covers from Kavita and
+requires their response bytes to match, rather than trusting only Manga Manager's stored checksums.
 Kavita is temporarily pinned to `jvmilazz0/kavita:0.8.9` because `0.9.0.2` cannot initialize an
 empty local-test database reliably. This isolated instance is not public-facing. Set `KAVITA_IMAGE`
 explicitly to retest a future fixed release before updating the pin.
