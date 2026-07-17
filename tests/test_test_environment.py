@@ -4,7 +4,9 @@ import importlib.util
 import os
 import subprocess
 import urllib.error
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -56,6 +58,23 @@ def test_generated_cbz_is_small_valid_and_has_canonical_metadata(tmp_path: Path)
     assert validated.image_count == 3
     assert validated.byte_count < 100_000
     assert read_comic_info(archive) == ("Synthetic Test Series", "2")
+
+
+def test_generated_chapterless_series_has_empty_latest_aggregate() -> None:
+    seed = load_seed_module()
+    series = SimpleNamespace()
+    observed_at = datetime(2026, 7, 17, tzinfo=UTC)
+
+    seed.set_fixture_latest(
+        series,
+        source="mangafire",
+        number="",
+        observed_at=observed_at,
+    )
+
+    assert series.latest_release_number == ""
+    assert series.latest_release_source == ""
+    assert series.latest_release_at is None
 
 
 def test_scale_profile_enforces_acceptance_floor() -> None:
@@ -196,6 +215,8 @@ def test_isolated_environment_rebuilds_the_test_image_by_default() -> None:
     launcher = (ROOT / "scripts" / "test-environment.sh").read_text()
 
     assert 'KAVITA_BUILD="${TEST_ENV_BUILD:-true}" scripts/kavita-local.sh up' in launcher
+    assert "remove_test_root" in launcher
+    assert 'docker run --rm -v "$root:/cleanup" "$image"' in launcher
 
 
 def test_kavita_setup_classifies_persistent_admin_mismatch(monkeypatch) -> None:

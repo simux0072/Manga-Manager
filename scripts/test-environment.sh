@@ -28,6 +28,16 @@ safe_test_path() {
 
 root=$(safe_test_path "$root")
 
+remove_test_root() {
+  # Worker and seed containers deliberately run as root, so generated bind-mounted files can be
+  # root-owned. Use the already-built test image to clear only the path guarded by safe_test_path.
+  if [ -d "$root" ] && docker image inspect "$image" >/dev/null 2>&1; then
+    docker run --rm -v "$root:/cleanup" "$image" sh -c \
+      'rm -rf /cleanup/* /cleanup/.[!.]* /cleanup/..?*'
+  fi
+  rm -rf -- "$root"
+}
+
 export STAGE_PROJECT="$project"
 export STAGE_STORAGE_ROOT="$storage"
 export STAGE_STATE_DIR="$state"
@@ -240,7 +250,7 @@ EOF
     scripts/kavita-local.sh down
     scripts/stage-local.sh down --volumes
     docker volume rm "$kavita_volume" >/dev/null 2>&1 || true
-    rm -rf -- "$root"
+    remove_test_root
     ;;
   status)
     docker ps -a --filter "name=^/$postgres$" --filter "name=^/$web$" \

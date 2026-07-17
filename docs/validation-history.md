@@ -57,7 +57,7 @@ I/O-bound. Subsequent acceptance uses generated small and database-only scale pr
 ## 2026-07-17 runtime repair implementation
 
 - Full non-container Python suite (excluding the host-only FastAPI thread-bridge limitation):
-  199 passed and 10 skipped; the targeted executor/provider/queue group passed 71 tests with one
+  200 passed and 10 skipped; the targeted executor/provider/queue group passed 71 tests with one
   optional PostgreSQL case skipped. Ruff and `git diff --check` passed.
 - Focused catalog/database/audit/source/cover tests passed (26 tests); queue, lease, worker, and
   Kavita compatibility tests passed (39 tests).
@@ -73,3 +73,15 @@ I/O-bound. Subsequent acceptance uses generated small and database-only scale pr
   command after rebuilding migration `0019`.
 - Frontend Vitest passed all four interaction tests. TypeScript and the production Vite build passed
   with a 309.42 KiB main JavaScript bundle, a 12.33 KiB lazy Matches workspace, and 28.65 KiB CSS.
+
+## 2026-07-17 post-deployment characterization
+
+- The persistent staging database is on `0019_latest_release_integrity`; all twelve relational
+  audit checks passed. It contains 1,727 series, 155,531 chapters, 161,223 releases, and 106 artifact
+  blobs in a 227 MiB PostgreSQL database.
+- The isolated migration/staging/backup/restart/memory rehearsal and ARM64 image/runtime check both
+  passed. Peak synthetic download memory was 281 MiB under the 1 GiB worker limit.
+- The small generated fixture correctly exposed an inconsistent latest-source value on its
+  deliberately chapterless series, and reset exposed root-owned bind-mount files. The generator now
+  derives all three latest fields together, and reset clears the guarded isolated path through the
+  test image before removing it on the host.

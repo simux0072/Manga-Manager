@@ -47,6 +47,19 @@ SMALL_SERIES = (
 )
 
 
+def set_fixture_latest(
+    series: CatalogSeries,
+    *,
+    source: str,
+    number: str,
+    observed_at: datetime,
+) -> None:
+    """Keep generated denormalized fields consistent with fixture releases."""
+    series.latest_release_number = number
+    series.latest_release_source = source if number else ""
+    series.latest_release_at = observed_at if number else None
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(description="Seed an isolated Manga Manager test database")
     value.add_argument("--profile", choices=("small", "scale"), default="small")
@@ -214,9 +227,12 @@ def seed_small(settings: V2Settings, sessions) -> dict[str, int | str]:
             series.cover_checksum = checksum
             series.cover_relative_path = relative.as_posix()
             series.metadata_json = {"test_profile": "small", "synthetic": True}
-            series.latest_release_number = "2" if index in {0, 2} else ""
-            series.latest_release_source = source
-            series.latest_release_at = now if index in {0, 2} else None
+            set_fixture_latest(
+                series,
+                source=source,
+                number="2" if index in {0, 2} else "",
+                observed_at=now,
+            )
             source_row = CatalogSourceSeries(
                 series_id=series.id,
                 source=source,
