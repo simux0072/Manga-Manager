@@ -1,9 +1,10 @@
 import {useEffect, useMemo, useRef, useState} from 'react'
 import {useInfiniteQuery, useMutation, useQuery, useQueryClient} from '@tanstack/react-query'
+import type {InfiniteData} from '@tanstack/react-query'
 import {AlertTriangle, BookOpen, Check, ExternalLink, Merge, Search, Split, X} from 'lucide-react'
 
 import {api} from './api'
-import type {MatchSide, MergeCandidate, MergePreview, Series} from './types'
+import type {Match, MatchSide, MergeCandidate, MergePreview, Page, Series} from './types'
 
 const fallbackProviders = ['asura', 'mangafire', 'kingofshojo']
 
@@ -47,20 +48,42 @@ function SuggestedMatches() {
   const decision = useMutation({
     mutationFn: ({id, value}: {id: number; value: 'accepted' | 'rejected'}) =>
       api.decideMatch(id, value, value === 'accepted' ? 'MERGE' : ''),
-    onSuccess: () => {
+    onMutate: async ({id}) => {
+      await client.cancelQueries({queryKey: ['matches'], exact: true})
+      const previous = client.getQueryData<InfiniteData<Page<Match, number>>>(['matches'])
+      client.setQueryData<InfiniteData<Page<Match, number>>>(['matches'], current => current && ({
+        ...current,
+        pages: current.pages.map(page => ({
+          ...page,
+          items: page.items.filter(match => match.id !== id),
+        })),
+      }))
+      return {previous}
+    },
+    onError: (error, _variables, context) => {
+      if (context?.previous) client.setQueryData(['matches'], context.previous)
+      window.dispatchEvent(new CustomEvent('manga-toast', {detail: {message: error.message, tone: 'error'}}))
+    },
+    onSuccess: async (_result, variables) => {
       setConfirm(null)
-      client.invalidateQueries({queryKey: ['matches']})
+      // A rejection only removes this proposal, so the optimistic cache is authoritative. A
+      // merge can make connected proposals obsolete; reset it to one initial page instead of
+      // refetching every retained infinite-query page concurrently.
+      if (variables.value === 'accepted') {
+        await client.resetQueries({queryKey: ['matches'], exact: true})
+      }
       client.invalidateQueries({queryKey: ['library']})
     },
   })
   const batch = useMutation({
     mutationFn: ({value}:{value:'accepted'|'rejected'}) => api.decideMatches(selected,value,value==='accepted'?'MERGE':'',entireQueue),
-    onSuccess: result => {
+    onSuccess: async result => {
       setSelected([]); setEntireQueue(false); setBatchPreview(null); setConfirmBatch(false)
-      client.invalidateQueries({queryKey:['matches']}); client.invalidateQueries({queryKey:['library']})
+      await client.resetQueries({queryKey:['matches'], exact:true}); client.invalidateQueries({queryKey:['library']})
       if(result.blocked.length) window.dispatchEvent(new CustomEvent('manga-toast',{detail:{message:`${result.blocked.length} blocked proposals remain pending`}}))
     },
   })
+  const reviewBusy = decision.isPending || batch.isPending
   const items = query.data?.pages.flatMap(page => page.items) || []
   if (query.isLoading) return <Loading />
   if (query.isError) return <Message icon={<AlertTriangle />} title="Could not load matches" detail={query.error.message} />
@@ -69,23 +92,23 @@ function SuggestedMatches() {
     <section className="match-batch-bar">
       <label><input type="checkbox" checked={entireQueue} onChange={async event=>{const value=event.target.checked;setEntireQueue(value);setSelected(value?[]:selected);setBatchPreview(await api.previewMatches(value?[]:selected,value))}}/> Select entire queue</label>
       <span>{entireQueue?'Entire queue':`${selected.length} selected`}</span>
-      <button className="secondary" disabled={!entireQueue&&!selected.length} onClick={async()=>setBatchPreview(await api.previewMatches(selected,entireQueue))}>Preview</button>
-      <button className="secondary" disabled={!entireQueue&&!selected.length} onClick={()=>batch.mutate({value:'rejected'})}>Keep separate</button>
-      <button className="primary" disabled={!entireQueue&&!selected.length} onClick={async()=>{setBatchPreview(await api.previewMatches(selected,entireQueue));setConfirmBatch(true)}}>Merge eligible</button>
+      <button className="secondary" disabled={reviewBusy||(!entireQueue&&!selected.length)} onClick={async()=>setBatchPreview(await api.previewMatches(selected,entireQueue))}>Preview</button>
+      <button className="secondary" disabled={reviewBusy||(!entireQueue&&!selected.length)} onClick={()=>batch.mutate({value:'rejected'})}>Keep separate</button>
+      <button className="primary" disabled={reviewBusy||(!entireQueue&&!selected.length)} onClick={async()=>{setBatchPreview(await api.previewMatches(selected,entireQueue));setConfirmBatch(true)}}>Merge eligible</button>
       {batchPreview&&<span>{batchPreview.eligible} eligible · {batchPreview.blocked} blocked</span>}
     </section>
     {batchPreview?.items.some(item=>item.blocked_reasons.length>0)&&<div className="inline-notice" role="status">Blocked proposals remain pending: {batchPreview.items.filter(item=>item.blocked_reasons.length).map(item=>`#${item.id} ${item.blocked_reasons.join(', ')}`).join(' · ')}</div>}
     <div className="match-list">
       {items.map(match => <article className="match-card" key={match.id}>
-        <label className="match-select"><input type="checkbox" checked={selected.includes(match.id)} disabled={entireQueue} onChange={()=>setSelected(current=>current.includes(match.id)?current.filter(id=>id!==match.id):[...current,match.id])}/>Select</label>
+        <label className="match-select"><input type="checkbox" checked={selected.includes(match.id)} disabled={entireQueue||reviewBusy} onChange={()=>setSelected(current=>current.includes(match.id)?current.filter(id=>id!==match.id):[...current,match.id])}/>Select</label>
         <Side side={match.left} />
         <div className="match-evidence">
           <div className="confidence"><b>{Math.round(match.confidence * 100)}%</b><span>confidence</span></div>
           {match.evidence.map(item => <span className={`evidence evidence-${item.tone}`} key={item.label}>{item.label}</span>)}
           {match.blocked_reasons.map(reason=><span className="evidence evidence-warning" key={reason}>{reason}</span>)}
           <div className="match-actions">
-            <button className="secondary" onClick={() => decision.mutate({id: match.id, value: 'rejected'})}><Split />Keep separate</button>
-            <button className="primary" onClick={() => setConfirm(match.id)}><Merge />Merge</button>
+            <button className="secondary" disabled={reviewBusy} onClick={() => decision.mutate({id: match.id, value: 'rejected'})}><Split />Keep separate</button>
+            <button className="primary" disabled={reviewBusy} onClick={() => setConfirm(match.id)}><Merge />Merge</button>
           </div>
         </div>
         <Side side={match.right} />

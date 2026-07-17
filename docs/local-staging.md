@@ -15,6 +15,9 @@ scripts/stage-local.sh serve --build
 scripts/stage-local.sh down
 ```
 
+The persistent web and worker containers use `unless-stopped` restart policies. A transient process
+failure is recovered automatically; `stage-local.sh down` still stops and removes them explicitly.
+
 For normal feature work, prefer the small deterministic environment so provider traffic and a large
 archive tree do not slow builds:
 

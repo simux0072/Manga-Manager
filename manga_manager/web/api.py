@@ -167,37 +167,130 @@ def storage_health(session: Session) -> dict[str, int]:
     }
 
 
-def pending_match_proposals(session: Session) -> list[dict[str, Any]]:
+def pending_match_proposal_index(
+    session: Session,
+    *,
+    series_pair: tuple[int, int] | None = None,
+) -> list[dict[str, Any]]:
+    """Return proposal membership without loading large JSON evidence documents.
+
+    Match decisions are recorded between provider identities, while review happens between
+    canonical manga.  A canonical pair can therefore contain several decisions.  Keep this
+    first pass scalar-only: Suggested Matches is cursor-paginated and must not materialize
+    every decision ORM object (and its evidence/feature JSON) for every visible page.
+    """
     left_alias = aliased(CatalogSourceSeries)
     right_alias = aliased(CatalogSourceSeries)
-    rows = session.execute(
-        select(CatalogMatchDecision, left_alias, right_alias)
+    query = (
+        select(
+            CatalogMatchDecision.id,
+            CatalogMatchDecision.confidence,
+            left_alias.series_id.label("left_series_id"),
+            right_alias.series_id.label("right_series_id"),
+        )
         .join(left_alias, left_alias.id == CatalogMatchDecision.left_source_series_id)
         .join(right_alias, right_alias.id == CatalogMatchDecision.right_source_series_id)
         .where(CatalogMatchDecision.decision == "pending")
-    ).all()
+    )
+    if series_pair is not None:
+        left_series_id, right_series_id = series_pair
+        query = query.where(
+            or_(
+                and_(
+                    left_alias.series_id == left_series_id,
+                    right_alias.series_id == right_series_id,
+                ),
+                and_(
+                    left_alias.series_id == right_series_id,
+                    right_alias.series_id == left_series_id,
+                ),
+            )
+        )
+    rows = session.execute(query).all()
     grouped: dict[tuple[int, int], dict[str, Any]] = {}
-    for decision, left, right in rows:
-        if left.series_id == right.series_id:
+    for decision_id, confidence, left_series_id, right_series_id in rows:
+        if left_series_id == right_series_id:
             # GET requests remain read-only. Maintenance and merge transactions close obsolete
             # source-level decisions; until then they are simply omitted from review.
             continue
-        key = tuple(sorted((left.series_id, right.series_id)))
+        key = tuple(sorted((left_series_id, right_series_id)))
         proposal = grouped.get(key)
         if proposal is None:
             grouped[key] = {
-                "id": decision.id,
-                "decision": decision,
-                "left": left,
-                "right": right,
-                "decision_ids": [decision.id],
+                "id": decision_id,
+                "confidence": confidence,
+                "decision_ids": [decision_id],
                 "series_ids": list(key),
             }
         else:
-            proposal["decision_ids"].append(decision.id)
-            if decision.confidence > proposal["decision"].confidence:
-                proposal.update(id=decision.id, decision=decision, left=left, right=right)
-    return sorted(grouped.values(), key=lambda row: (-row["decision"].confidence, row["id"]))
+            proposal["decision_ids"].append(decision_id)
+            if (confidence, -decision_id) > (proposal["confidence"], -proposal["id"]):
+                proposal.update(id=decision_id, confidence=confidence)
+    for proposal in grouped.values():
+        proposal["decision_ids"].sort()
+    return sorted(grouped.values(), key=lambda row: (-row["confidence"], row["id"]))
+
+
+def hydrate_match_proposals(
+    session: Session,
+    proposals: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Load ORM details only for proposal representatives that will be serialized."""
+    if not proposals:
+        return []
+    representative_ids = [row["id"] for row in proposals]
+    left_alias = aliased(CatalogSourceSeries)
+    right_alias = aliased(CatalogSourceSeries)
+    details = {
+        decision_id: (evidence_json, left, right)
+        for decision_id, evidence_json, left, right in session.execute(
+            select(
+                CatalogMatchDecision.id,
+                CatalogMatchDecision.evidence_json,
+                left_alias,
+                right_alias,
+            )
+            .join(left_alias, left_alias.id == CatalogMatchDecision.left_source_series_id)
+            .join(right_alias, right_alias.id == CatalogMatchDecision.right_source_series_id)
+            .where(CatalogMatchDecision.id.in_(representative_ids))
+        )
+    }
+    result: list[dict[str, Any]] = []
+    for proposal in proposals:
+        detail = details.get(proposal["id"])
+        if detail is None:
+            continue
+        evidence_json, left, right = detail
+        result.append(
+            {**proposal, "evidence_json": evidence_json, "left": left, "right": right}
+        )
+    return result
+
+
+def pending_match_proposal(
+    session: Session,
+    representative_id: int,
+) -> dict[str, Any] | None:
+    """Resolve one review proposal without rebuilding/hydrating the complete queue."""
+    left_alias = aliased(CatalogSourceSeries)
+    right_alias = aliased(CatalogSourceSeries)
+    row = session.execute(
+        select(left_alias.series_id, right_alias.series_id)
+        .select_from(CatalogMatchDecision)
+        .join(left_alias, left_alias.id == CatalogMatchDecision.left_source_series_id)
+        .join(right_alias, right_alias.id == CatalogMatchDecision.right_source_series_id)
+        .where(
+            CatalogMatchDecision.id == representative_id,
+            CatalogMatchDecision.decision == "pending",
+        )
+    ).one_or_none()
+    if row is None or row[0] == row[1]:
+        return None
+    series_pair = tuple(sorted((row[0], row[1])))
+    proposals = pending_match_proposal_index(session, series_pair=series_pair)
+    if len(proposals) != 1 or proposals[0]["id"] != representative_id:
+        return None
+    return proposals[0]
 
 
 def proposal_blockers(session: Session, series_ids: list[int]) -> list[str]:
@@ -618,15 +711,35 @@ def create_api_router(
         cursor: int = Query(default=0, ge=0),
         limit: int = Query(default=24, ge=1, le=100),
     ):
-        proposals = pending_match_proposals(session)
+        proposals = pending_match_proposal_index(session)
         if cursor:
-            start = next(
-                (index + 1 for index, value in enumerate(proposals) if value["id"] == cursor),
-                len(proposals),
+            current_index = next(
+                (index for index, value in enumerate(proposals) if value["id"] == cursor),
+                None,
             )
+            if current_index is not None:
+                start = current_index + 1
+            else:
+                # The preceding proposal may have just been reviewed. Its decision row remains,
+                # so its stable confidence/id position can still advance this cursor correctly.
+                cursor_confidence = session.scalar(
+                    select(CatalogMatchDecision.confidence).where(
+                        CatalogMatchDecision.id == cursor
+                    )
+                )
+                cursor_key = (-cursor_confidence, cursor) if cursor_confidence is not None else None
+                start = next(
+                    (
+                        index
+                        for index, value in enumerate(proposals)
+                        if cursor_key is not None
+                        and (-value["confidence"], value["id"]) > cursor_key
+                    ),
+                    len(proposals),
+                )
         else:
             start = 0
-        rows = proposals[start : start + limit]
+        rows = hydrate_match_proposals(session, proposals[start : start + limit])
         canonical_ids = {source.series_id for row in rows for source in (row["left"], row["right"])}
         canonical = {
             item["id"]: item
@@ -686,8 +799,8 @@ def create_api_router(
                 {
                     "id": row["id"],
                     "decision_ids": row["decision_ids"],
-                    "confidence": row["decision"].confidence,
-                    "evidence": human_evidence(row["decision"].evidence_json),
+                    "confidence": row["confidence"],
+                    "evidence": human_evidence(row["evidence_json"]),
                     "blocked_reasons": blockers_by_proposal[row["id"]],
                     "left": {
                         **canonical[row["left"].series_id],
@@ -988,10 +1101,7 @@ def create_api_router(
         from manga_manager.web.app import merge_canonical_series
 
         with session.begin():
-            proposal = next(
-                (row for row in pending_match_proposals(session) if row["id"] == decision_id),
-                None,
-            )
+            proposal = pending_match_proposal(session, decision_id)
             if proposal is None:
                 raise HTTPException(404, "match not found")
             blockers = proposal_blockers(session, proposal["series_ids"])
@@ -1020,8 +1130,7 @@ def create_api_router(
 
     @router.post("/match-batch/preview")
     def preview_match_batch(change: BatchMatchChange, session: SessionDep):
-        with session.begin():
-            proposals = pending_match_proposals(session)
+        proposals = pending_match_proposal_index(session)
         selected = (
             proposals
             if change.entire_queue
@@ -1053,7 +1162,7 @@ def create_api_router(
         from manga_manager.web.app import merge_canonical_series
 
         with session.begin():
-            proposals = pending_match_proposals(session)
+            proposals = pending_match_proposal_index(session)
             selected = (
                 proposals
                 if change.entire_queue

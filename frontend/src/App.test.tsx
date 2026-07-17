@@ -111,4 +111,31 @@ describe('media library frontend',()=>{
     await userEvent.click(screen.getByRole('button',{name:'Confirm merge'}))
     expect(await screen.findByText(/Merged into series #7/)).toBeInTheDocument()
   })
+
+  it('keeps rejected suggestions out of cache without refetching every loaded page',async()=>{
+    const match={
+      id:41,decision_ids:[41],confidence:.92,evidence:[],blocked_reasons:[],
+      left:{...series,source_title:series.title,source:'asura',url:'https://asura.test/painter'},
+      right:{...matchingSeries,source_title:matchingSeries.title,source:'mangafire',url:'https://mangafire.test/painter'},
+    }
+    vi.stubGlobal('fetch',vi.fn((input:string|URL|Request,init?:RequestInit)=>{
+      const url=String(input)
+      if(url.includes('/api/v2/operations'))return response({job_counts:{},health:{series:2,chapters:1,active_artifacts:0,missing_projections:0},sources:[],workers:[],permits:{}})
+      if(url.includes('/api/v2/providers'))return response({items:['asura','mangafire','kingofshojo']})
+      if(url.includes('/api/v2/matches/41')&&init?.method==='POST')return response({id:41,decision:'rejected'})
+      if(url.includes('/api/v2/matches'))return response({items:[match],next_cursor:null,total:1})
+      return response({items:[],next_cursor:null})
+    }))
+    renderApp('/matches')
+    const keepSeparate=(await screen.findAllByRole('button',{name:'Keep separate'})).find(button=>!button.hasAttribute('disabled'))!
+    const requestsBefore=(fetch as ReturnType<typeof vi.fn>).mock.calls.filter(([input,init])=>
+      String(input).includes('/api/v2/matches?')&&(!init||!(init as RequestInit).method),
+    ).length
+    await userEvent.click(keepSeparate)
+    await waitFor(()=>expect(screen.queryAllByRole('button',{name:'Keep separate'})).toHaveLength(0))
+    const requestsAfter=(fetch as ReturnType<typeof vi.fn>).mock.calls.filter(([input,init])=>
+      String(input).includes('/api/v2/matches?')&&(!init||!(init as RequestInit).method),
+    ).length
+    expect(requestsAfter).toBe(requestsBefore)
+  })
 })

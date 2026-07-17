@@ -383,8 +383,53 @@ async def test_matches_collapse_multiple_identity_decisions_per_canonical_pair()
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
         response = await client.get("/api/v2/matches")
+        rejected = await client.post(
+            f"/api/v2/matches/{response.json()['items'][0]['id']}",
+            json={"decision": "rejected"},
+        )
     assert response.json()["total"] == 1
     assert len(response.json()["items"][0]["decision_ids"]) == 2
+    assert rejected.status_code == 200
+    with sessions() as session:
+        assert {row.decision for row in session.query(CatalogMatchDecision)} == {"rejected"}
+
+
+async def test_match_cursor_survives_reviewing_the_preceding_proposal() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        first_identity = session.query(CatalogSourceSeries).filter_by(source="asura").one()
+        third = CatalogSeries(title="Third", normalized_title="third", status="untracked")
+        session.add(third)
+        session.flush()
+        third_identity = CatalogSourceSeries(
+            series_id=third.id,
+            source="kingofshojo",
+            source_id="third",
+            title="Third",
+            normalized_title="third",
+            url="https://example.test/third",
+        )
+        session.add(third_identity)
+        session.flush()
+        session.add(
+            CatalogMatchDecision(
+                left_source_series_id=min(first_identity.id, third_identity.id),
+                right_source_series_id=max(first_identity.id, third_identity.id),
+                confidence=0.5,
+            )
+        )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        first_page = await client.get("/api/v2/matches?limit=1")
+        cursor = first_page.json()["next_cursor"]
+        reviewed = await client.post(
+            f"/api/v2/matches/{cursor}", json={"decision": "rejected"}
+        )
+        second_page = await client.get(f"/api/v2/matches?limit=1&cursor={cursor}")
+    assert reviewed.status_code == 200
+    assert len(second_page.json()["items"]) == 1
+    assert second_page.json()["items"][0]["confidence"] == 0.5
 
 
 async def test_entire_match_queue_preview_keeps_active_job_blockers_visible() -> None:
