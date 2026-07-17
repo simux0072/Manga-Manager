@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from pathlib import Path
 
 from manga_manager.application.database_audit import audit_database, write_database_audit
+from manga_manager.cli import print_stage_check
 from manga_manager.infrastructure.database import create_database_engine, run_migrations
 
 
@@ -37,3 +39,15 @@ def test_database_audit_writes_markdown(tmp_path: Path) -> None:
     )
     assert "# Database Audit" in report.read_text()
     assert "latest_release_mismatches: 1" in report.read_text()
+
+
+def test_database_audit_stdout_serializes_postgres_stat_timestamps(capsys) -> None:
+    timestamp = datetime(2026, 7, 17, 1, 2, 3, tzinfo=timezone.utc)
+
+    print_stage_check(
+        {"ok": True, "table_stats": [{"last_autoanalyze": timestamp}]},
+        json_output=True,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["table_stats"][0]["last_autoanalyze"] == str(timestamp)

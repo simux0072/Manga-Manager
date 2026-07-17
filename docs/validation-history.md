@@ -57,7 +57,7 @@ I/O-bound. Subsequent acceptance uses generated small and database-only scale pr
 ## 2026-07-17 runtime repair implementation
 
 - Full non-container Python suite (excluding the host-only FastAPI thread-bridge limitation):
-  198 passed and 10 skipped; the targeted executor/provider/queue group passed 71 tests with one
+  199 passed and 10 skipped; the targeted executor/provider/queue group passed 71 tests with one
   optional PostgreSQL case skipped. Ruff and `git diff --check` passed.
 - Focused catalog/database/audit/source/cover tests passed (26 tests); queue, lease, worker, and
   Kavita compatibility tests passed (39 tests).

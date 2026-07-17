@@ -90,7 +90,9 @@ def stage_check_details(values: list[str], *, limit: int, full: bool) -> list[st
 
 def print_stage_check(payload: dict[str, object], *, json_output: bool) -> None:
     if json_output:
-        print(json.dumps(payload, sort_keys=True))
+        # PostgreSQL statistics expose timezone-aware datetime objects. Reports already use
+        # ``default=str``; keep stdout JSON equally robust and machine-readable.
+        print(json.dumps(payload, sort_keys=True, default=str))
     else:
         print(" ".join(f"{key}={value}" for key, value in payload.items()))
 
