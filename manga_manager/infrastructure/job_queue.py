@@ -82,15 +82,48 @@ class JobQueue:
                     if existing.status == JobState.LEASED.value and existing.pending_payload
                     else existing.payload
                 )
+                old_logical_units = existing.logical_units
+                added_units = 0
+                if kind is JobKind.KAVITA_SYNC and replacement.get("series_ids"):
+                    incoming = list(dict.fromkeys(replacement["series_ids"]))
+                    if existing.status == JobState.LEASED.value:
+                        in_flight = set(existing.payload.get("series_ids") or [])
+                        pending = list((existing.pending_payload or {}).get("series_ids") or [])
+                        merged = list(dict.fromkeys([*pending, *incoming]))
+                        merged = [
+                            series_id for series_id in merged if series_id not in in_flight
+                        ][:100]
+                        added_units = len(merged) - len(pending)
+                        if added_units <= 0:
+                            return existing, False
+                        replacement["series_ids"] = merged
+                    else:
+                        current = list(current_payload.get("series_ids") or [])
+                        merged = list(dict.fromkeys([*current, *incoming]))[:100]
+                        if merged == current:
+                            return existing, False
+                        replacement["series_ids"] = merged
                 if not self._should_coalesce(kind, current_payload, replacement):
                     return existing, False
                 if existing.status == JobState.LEASED.value:
                     existing.pending_payload = replacement
+                    if kind is not JobKind.KAVITA_SYNC:
+                        added_units = max(logical_units, 1)
+                    existing.logical_units += max(added_units, 0)
                 else:
                     existing.payload = replacement
                     existing.error_code = ""
                     existing.error_message = ""
                     existing.updated_at = utcnow()
+                    if kind is JobKind.KAVITA_SYNC:
+                        existing.logical_units = max(len(replacement.get("series_ids") or []), 1)
+                        added_units = max(existing.logical_units - old_logical_units, 0)
+                if added_units > 0 and existing.cycle_id is not None:
+                    cycle = session.get(WorkloadCycle, existing.cycle_id)
+                    if cycle is not None:
+                        cycle.total_units += added_units
+                        cycle.added_units += added_units
+                        cycle.updated_at = utcnow()
             return existing, False
 
         cycle = self._active_cycle(session)
@@ -124,10 +157,21 @@ class JobQueue:
                 raise
             return existing, False
         self._record_event(session, job, "enqueued")
+        self._notify_workers(session, routed_pool)
         cycle.total_units += job.logical_units
         cycle.added_units += job.logical_units
         cycle.updated_at = utcnow()
         return job, True
+
+    @staticmethod
+    def _notify_workers(session: Session, pool: str) -> None:
+        """Wake PostgreSQL workers after commit; polling remains the fallback."""
+        if session.bind is None or session.bind.dialect.name != "postgresql":
+            return
+        session.execute(
+            text("SELECT pg_notify('manga_manager_jobs', :pool)"),
+            {"pool": pool[:200]},
+        )
 
     def reroute(
         self,
@@ -299,8 +343,6 @@ class JobQueue:
         if lease_for <= timedelta(0):
             raise ValueError("lease_for must be positive")
         current = now or utcnow()
-        self.fail_exhausted_leases(session, now=current)
-        self._expire_permits(session, current)
         limits = pool_limits or {}
         job = None
         rejected: set[int] = set()
@@ -314,7 +356,26 @@ class JobQueue:
                 )
             )
             if candidate is None:
+                # Exhausted leases are excluded by claim_query. Preserve crash
+                # recovery semantics with an indexed read and write only when
+                # such a lease actually exists; empty polls no longer issue
+                # unconditional permit DELETE statements.
+                self.fail_exhausted_leases(session, now=current)
                 break
+            if (
+                candidate.status == JobState.LEASED.value
+                and candidate.lease_expires_at is not None
+                and aware_datetime(candidate.lease_expires_at) <= current
+            ):
+                if candidate.attempts >= candidate.max_attempts:
+                    self._fail_expired_job(session, candidate, current)
+                    session.flush()
+                    rejected.add(candidate.id)
+                    continue
+                # Recover only the permits attached to the expired candidate.
+                # Empty worker polls therefore perform no cleanup writes.
+                self._release_permits(session, candidate.id)
+                session.flush()
             if self._acquire_permits(
                 session,
                 candidate,
@@ -366,26 +427,41 @@ class JobQueue:
             .with_for_update(skip_locked=True)
         ).all()
         for job in jobs:
-            prior_owner = job.lease_owner
-            job.status = JobState.FAILED.value
-            job.lease_owner = ""
-            job.lease_expires_at = None
-            job.heartbeat_at = None
-            job.error_code = "lease_expired"
-            job.error_message = "job lease expired after its final attempt"
-            job.updated_at = current
-            job.completed_at = current
-            self._record_event(
-                session,
-                job,
-                "lease_expired",
-                owner=prior_owner,
-                message=job.error_message,
-            )
-            self._release_permits(session, job.id)
-            self._record_terminal_units(session, job, JobState.FAILED, current)
+            self._fail_expired_job(session, job, current)
         session.flush()
         return len(jobs)
+
+    @staticmethod
+    def cleanup_expired_permits(
+        session: Session,
+        *,
+        now: datetime | None = None,
+    ) -> int:
+        """Remove inert permit rows outside the latency-sensitive claim loop."""
+        result = session.execute(
+            delete(JobPermit).where(JobPermit.lease_expires_at <= (now or utcnow()))
+        )
+        return max(int(result.rowcount or 0), 0)
+
+    def _fail_expired_job(self, session: Session, job: WorkJob, current: datetime) -> None:
+        prior_owner = job.lease_owner
+        job.status = JobState.FAILED.value
+        job.lease_owner = ""
+        job.lease_expires_at = None
+        job.heartbeat_at = None
+        job.error_code = "lease_expired"
+        job.error_message = "job lease expired after its final attempt"
+        job.updated_at = current
+        job.completed_at = current
+        self._record_event(
+            session,
+            job,
+            "lease_expired",
+            owner=prior_owner,
+            message=job.error_message,
+        )
+        self._release_permits(session, job.id)
+        self._record_terminal_units(session, job, JobState.FAILED, current)
 
     def heartbeat(
         self,
@@ -842,9 +918,6 @@ class JobQueue:
                 if new == old:
                     return False
         return current != replacement
-
-    def _expire_permits(self, session: Session, now: datetime) -> None:
-        session.execute(delete(JobPermit).where(JobPermit.lease_expires_at <= now))
 
     def _acquire_permits(
         self,

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import shutil
 import zipfile
 from dataclasses import dataclass
@@ -342,7 +341,7 @@ class LibraryRepairHandler:
 
     async def _blocking(self, function, *args, **kwargs) -> Any:
         if self._offload_blocking:
-            return await asyncio.to_thread(function, *args, **kwargs)
+            return await self.storage.run_blocking(function, *args, **kwargs)
         return function(*args, **kwargs)
 
     async def __call__(self, context: JobContext) -> None:

@@ -33,6 +33,11 @@ from manga_manager.application.catalog_recovery import CatalogRecovery, write_re
 from manga_manager.application.match_training import export_training_data
 from manga_manager.application.maintenance import MaintenanceHandler
 from manga_manager.application.diagnostics import build_diagnostic_bundle
+from manga_manager.application.database_audit import (
+    LATEST_MISMATCH_SQL,
+    audit_database,
+    write_database_audit,
+)
 from manga_manager.application.provider_identity_repair import ProviderIdentityRepair
 from manga_manager.application.refresh_queue_reconcile import RefreshQueueReconciler
 from manga_manager.domain.jobs import (
@@ -101,6 +106,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     diagnostics.add_argument("--output", type=Path, required=True)
     diagnostics.add_argument("--recent-failures", type=int, default=200)
+    database_audit = subcommands.add_parser(
+        "database-audit", help="run bounded read-only PostgreSQL integrity and growth checks"
+    )
+    database_audit.add_argument("--json", action="store_true", dest="json_output")
+    database_audit.add_argument("--report", type=Path)
+    database_audit.add_argument("--statement-timeout-ms", type=int, default=5_000)
     stage = subcommands.add_parser("stage-check", help="verify staged database and storage health")
     stage.add_argument("--json", action="store_true", dest="json_output")
     stage.add_argument(
@@ -276,7 +287,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_migrations(database_url)
         return 0
 
-    engine = create_database_engine(database_url)
+    engine = create_database_engine(
+        database_url, role="worker" if args.command == "worker" else "cli"
+    )
     if args.command == "diagnostic-bundle":
         try:
             payload = build_diagnostic_bundle(
@@ -332,6 +345,15 @@ def main(argv: Sequence[str] | None = None) -> int:
             version = connection.scalar(text("SELECT version_num FROM alembic_version"))
         print(f"database=ok migration={version}")
         return 0
+    if args.command == "database-audit":
+        if args.statement_timeout_ms < 100:
+            parser.error("--statement-timeout-ms must be at least 100")
+        with engine.begin() as connection:
+            payload = audit_database(connection, statement_timeout_ms=args.statement_timeout_ms)
+        if args.report:
+            write_database_audit(args.report, payload)
+        print_stage_check(payload, json_output=args.json_output)
+        return 0 if payload["ok"] else 1
     if args.command == "stage-check":
         if args.detail_limit < 0:
             parser.error("--detail-limit must not be negative")
@@ -400,6 +422,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "AND k.artifact_id IS NULL"
                 )
             )
+            latest_mismatches = connection.scalar(text(LATEST_MISMATCH_SQL))
+            expired_leases = connection.scalar(
+                text(
+                    "SELECT count(*) FROM job WHERE status='leased' "
+                    "AND lease_expires_at < CURRENT_TIMESTAMP"
+                )
+            )
             started = time.perf_counter()
             connection.execute(
                 text(
@@ -418,9 +447,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
             flush=True,
         )
-        for archive_index, (relative_path, expected_series, expected_number) in enumerate(
-            blobs, 1
-        ):
+        for archive_index, (relative_path, expected_series, expected_number) in enumerate(blobs, 1):
             path = storage.root / relative_path
             try:
                 storage.validate_cbz(path)
@@ -445,6 +472,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 and missing_projection == 0
                 and duplicate_providers == 0
                 and missing_kavita == 0
+                and latest_mismatches == 0
+                and expired_leases == 0
                 and not invalid_archives
                 and not metadata_mismatches
                 and first_page_ms < 1_000
@@ -480,6 +509,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             },
             "duplicate_provider_identities": duplicate_providers,
             "tracked_artifacts_without_kavita_projection": missing_kavita,
+            "latest_release_mismatches": latest_mismatches,
+            "expired_job_leases": expired_leases,
             "catalog_first_page_ms": first_page_ms,
             "storage_root": str(storage.root.resolve()),
         }
@@ -647,18 +678,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             client = configured_kavita_client(local_library_root=library_root)
             if not client.configured:
                 return {"ok": False, "configured": False, "reason": "Kavita is not configured"}
-            expires = await client.authkey_expires()
-            series = await client.list_series()
-            if args.scan_test:
-                await client.scan_folder_or_all(library_root)
-            return {
-                "ok": True,
-                "configured": True,
-                "authkey_expires": expires,
-                "series_visible": len(series),
-                "mapped_root": str(client.kavita_path_for_local(library_root)),
-                "scan_test": bool(args.scan_test),
-            }
+            try:
+                expires = await client.authkey_expires()
+                series = await client.list_series()
+                if args.scan_test:
+                    await client.scan_folder_or_all(library_root)
+                return {
+                    "ok": True,
+                    "configured": True,
+                    "authkey_expires": expires,
+                    "series_visible": len(series),
+                    "mapped_root": str(client.kavita_path_for_local(library_root)),
+                    "scan_test": bool(args.scan_test),
+                }
+            finally:
+                await client.aclose()
 
         print(json.dumps(asyncio.run(check_kavita()), sort_keys=True))
         return 0
@@ -706,9 +740,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 series_ids = session.scalars(
                     select(CatalogSeries.id)
                     .where(
-                        CatalogSeries.status.in_(
-                            ("interested", "reading", "caught_up", "paused")
-                        )
+                        CatalogSeries.status.in_(("interested", "reading", "caught_up", "paused"))
                     )
                     .where(
                         exists(
@@ -830,9 +862,13 @@ async def run_worker(settings: V2Settings, engine) -> int:
     finally:
         configure_provider_waiter(None)
         configure_request_observer(None)
-        while await asyncio.to_thread(telemetry_buffer.flush):
+        while telemetry_buffer.flush():
             pass
+        telemetry_buffer.close()
+        request_scheduler.close()
+        await kavita_sync.aclose()
         await adapters.aclose()
+        storage.close()
     return 0
 
 

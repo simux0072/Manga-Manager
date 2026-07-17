@@ -5,7 +5,7 @@ import base64
 import hashlib
 import io
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol
@@ -84,11 +84,11 @@ class KavitaSyncPlanner:
         *,
         limit: int = 100,
         reading_refresh_after: timedelta | None = None,
+        batch: bool = False,
     ) -> tuple[int, int]:
         tracked = {"interested", "reading", "caught_up", "paused"}
         stale_reading = (
-            CatalogSeries.kavita_synced_at
-            < datetime.now(timezone.utc) - reading_refresh_after
+            CatalogSeries.kavita_synced_at < datetime.now(timezone.utc) - reading_refresh_after
             if reading_refresh_after is not None
             else False
         )
@@ -113,6 +113,28 @@ class KavitaSyncPlanner:
             .order_by(CatalogSeries.kavita_synced_at.asc().nullsfirst(), CatalogSeries.id)
             .limit(limit)
         ).all()
+        if batch and rows:
+            job, was_created = self.queue.enqueue(
+                session,
+                kind=JobKind.KAVITA_SYNC,
+                dedupe_key="periodic-refresh",
+                payload=KavitaSyncPayload(series_ids=tuple(row.id for row in rows)),
+                priority=70,
+                logical_units=len(rows),
+                coalesce=True,
+            )
+            woke_configured_job = False
+            if (
+                not was_created
+                and job.status == "retry_wait"
+                and job.error_code == "kavita_unconfigured"
+            ):
+                job.available_at = datetime.now(timezone.utc)
+                job.error_code = ""
+                job.error_message = ""
+                job.updated_at = datetime.now(timezone.utc)
+                woke_configured_job = True
+            return len(rows), int(was_created or woke_configured_job)
         created = 0
         for series in rows:
             job, was_created = self.queue.enqueue(
@@ -168,17 +190,53 @@ class KavitaSyncHandler:
         self.client_factory = client_factory or (
             lambda: configured_kavita_client(local_library_root=self.library_root)
         )
+        self._client: KavitaClientProtocol | None = None
         self.cover_fetcher = cover_fetcher or self._fetch_cover
+
+    async def aclose(self) -> None:
+        """Close the handler-owned Kavita connection pool, when supported."""
+        if self._client is None:
+            return
+        close = getattr(self._client, "aclose", None)
+        if close is not None:
+            await close()
+        self._client = None
 
     async def __call__(self, context: JobContext) -> None:
         payload = context.lease.payload
         if not isinstance(payload, KavitaSyncPayload):
             raise RuntimeError("Kavita sync handler received the wrong payload")
+        if payload.series_ids:
+            first_error: RetryableJobError | DeferredJobError | None = None
+            for index, series_id in enumerate(payload.series_ids, start=1):
+                child = JobContext(
+                    lease=replace(
+                        context.lease,
+                        payload=KavitaSyncPayload(series_id=series_id),
+                    ),
+                    lease_lost=context.lease_lost,
+                )
+                try:
+                    await self(child)
+                except (RetryableJobError, DeferredJobError) as exc:
+                    first_error = first_error or exc
+                self._progress(
+                    context,
+                    current=index,
+                    message=f"synchronized {index} of {len(payload.series_ids)} manga with Kavita",
+                    total=len(payload.series_ids),
+                    unit="series",
+                )
+            if first_error is not None:
+                raise first_error
+            return
         with self.session_factory() as session:
             snapshot = self._snapshot(session, payload.series_id, payload.folder_path)
         if snapshot is None:
             raise RetryableJobError("series_missing", "series does not exist")
-        client = self.client_factory()
+        if self._client is None:
+            self._client = self.client_factory()
+        client = self._client
         if not client.configured:
             raise DeferredJobError(
                 "kavita_unconfigured",
@@ -192,9 +250,7 @@ class KavitaSyncHandler:
             await client.scan_folder_or_all(snapshot.folder_path)
             mapper = getattr(client, "kavita_path_for_local", None)
             kavita_folder = mapper(snapshot.folder_path) if mapper else snapshot.folder_path
-            match, chapters = await self._await_scan(
-                client, snapshot, str(kavita_folder), context
-            )
+            match, chapters = await self._await_scan(client, snapshot, str(kavita_folder), context)
             if match is None:
                 self._invalidate_kavita_mapping(
                     snapshot.series_id,
@@ -284,8 +340,7 @@ class KavitaSyncHandler:
                     reading = CatalogChapterReadingState(chapter_id=chapter.id)
                     session.add(reading)
                 complete = bool(
-                    progress.pages_total > 0
-                    and progress.pages_read >= progress.pages_total
+                    progress.pages_total > 0 and progress.pages_read >= progress.pages_total
                 )
                 if complete:
                     reading.status = "read"
@@ -328,7 +383,15 @@ class KavitaSyncHandler:
             else "Kavita synchronized; series cover remains pending",
         )
 
-    def _progress(self, context: JobContext, current: int, message: str) -> None:
+    def _progress(
+        self,
+        context: JobContext,
+        current: int,
+        message: str,
+        *,
+        total: int = 4,
+        unit: str = "phases",
+    ) -> None:
         context.ensure_lease()
         with self.session_factory() as session, session.begin():
             JobQueue().progress(
@@ -339,8 +402,8 @@ class KavitaSyncHandler:
                 details={
                     "phase": "kavita",
                     "processed": current,
-                    "total": 4,
-                    "unit": "phases",
+                    "total": total,
+                    "unit": unit,
                 },
             )
 
@@ -603,8 +666,7 @@ def match_series(
 
     def same_external_id(candidate: KavitaSeries) -> bool:
         return bool(
-            (anilist and candidate.anilist_id == anilist)
-            or (mal and candidate.mal_id == mal)
+            (anilist and candidate.anilist_id == anilist) or (mal and candidate.mal_id == mal)
         )
 
     def same_title(candidate: KavitaSeries) -> bool:
@@ -629,18 +691,10 @@ def match_series(
         for candidate in candidates:
             if candidate.id == snapshot.existing_kavita_id and (
                 not conflicts_with_snapshot(candidate)
-                and (
-                    same_external_id(candidate)
-                    or same_folder(candidate)
-                    or same_title(candidate)
-                )
+                and (same_external_id(candidate) or same_folder(candidate) or same_title(candidate))
             ):
                 return candidate
-    identifier_matches = [
-        candidate
-        for candidate in candidates
-        if same_external_id(candidate)
-    ]
+    identifier_matches = [candidate for candidate in candidates if same_external_id(candidate)]
     if len(identifier_matches) == 1:
         return identifier_matches[0]
     if kavita_folder:

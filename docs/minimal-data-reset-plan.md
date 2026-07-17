@@ -68,6 +68,6 @@ runtime storage.
   Kavita/staging orchestration, scale verification, CI contracts, and documentation are implemented.
 - Local Python, PostgreSQL, frontend, image, idempotency, and scale checks pass; exact outcomes are
   recorded in `docs/validation-history.md`.
-- The real archive/reset and isolated Kavita/browser rehearsal remain deliberately last so they use
-  committed code and a verified image. Any host command blocked by execution permissions is listed
-  at handoff rather than bypassed.
+- The real archive/reset, disposable restore, isolated Kavita/browser rehearsal, and post-reset
+  acceptance were completed. The verified archive remains local and ignored until later Raspberry
+  Pi acceptance; no runtime database or media was committed.

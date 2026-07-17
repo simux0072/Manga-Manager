@@ -38,3 +38,8 @@ manifest, migrate, run provider identity repair and `reconcile-refresh-queue` in
 mode, and wait for downloads, repair, cover backfill, and Kavita synchronization to settle before
 the final stage check. The reconciler upgrades compatible v1 payloads in place and defers a single
 replacement behind any currently leased incompatible refresh rather than terminating live work.
+
+Before migration `0019`, take the same paired PostgreSQL backup and storage manifest. The revision
+recomputes denormalized latest-release fields and adds observation, cover-band, and telemetry
+indexes without rewriting media. After upgrading, run `manga-manager database-audit --json`; do not
+start a rollback from the newer database if that audit fails—restore the paired pre-migration set.

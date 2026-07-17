@@ -40,6 +40,7 @@ from manga_manager.web.metrics import (
     begin_request_measurement,
     end_request_measurement,
     install_sql_timing,
+    render_database_metrics,
 )
 
 
@@ -66,7 +67,9 @@ def create_app(session_factory: sessionmaker[Session] | None = None) -> FastAPI:
         if resolved_factory is None:
             settings = V2Settings()
             resolved_factory = instrument_factory(
-                create_session_factory(create_database_engine(settings.require_database_url()))
+                create_session_factory(
+                    create_database_engine(settings.require_database_url(), role="web")
+                )
             )
         return resolved_factory
 
@@ -86,9 +89,11 @@ def create_app(session_factory: sessionmaker[Session] | None = None) -> FastAPI:
             response.headers["Server-Timing"] = (
                 f"app;dur={(time.perf_counter() - started) * 1000:.2f}, "
                 f'db;dur={measurement.sql_seconds * 1000:.2f};desc="'
-                f"{measurement.sql_queries} queries\""
+                f'{measurement.sql_queries} queries"'
             )
             response.headers["X-SQL-Query-Count"] = str(measurement.sql_queries)
+            if request.url.path.startswith("/assets/"):
+                response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
             return response
         finally:
             route = request.scope.get("route")
@@ -107,11 +112,14 @@ def create_app(session_factory: sessionmaker[Session] | None = None) -> FastAPI:
     application.include_router(create_api_router(get_session_factory))
 
     @application.get("/metrics", include_in_schema=False)
-    async def metrics() -> PlainTextResponse:
+    def metrics() -> PlainTextResponse:
+        with get_session_factory()() as session:
+            database_metrics = render_database_metrics(session)
         return PlainTextResponse(
-            request_metrics.render_prometheus(),
+            request_metrics.render_prometheus() + database_metrics,
             media_type="text/plain; version=0.0.4",
         )
+
     frontend = ROOT / "frontend" / "dist"
     if (frontend / "assets").exists():
         application.mount(
@@ -120,28 +128,36 @@ def create_app(session_factory: sessionmaker[Session] | None = None) -> FastAPI:
 
     if (frontend / "index.html").exists():
 
-        async def react_page() -> FileResponse:
+        def react_page() -> FileResponse:
             return FileResponse(frontend / "index.html")
 
         for path in PAGE_PATHS:
             application.add_api_route(path, react_page, methods=["GET"], include_in_schema=False)
 
-    @application.get("/healthz")
-    async def health() -> dict[str, object]:
+    @application.get("/livez")
+    def live() -> dict[str, object]:
+        return {"ok": True}
+
+    @application.get("/readyz")
+    def ready() -> dict[str, object]:
         with get_session_factory()() as session:
             session.execute(select(1))
         return {"ok": True, "architecture": "postgresql-v2"}
 
-    async def redirect_library() -> RedirectResponse:
+    @application.get("/healthz")
+    def health() -> dict[str, object]:
+        return ready()
+
+    def redirect_library() -> RedirectResponse:
         return RedirectResponse("/library", 308)
 
-    async def redirect_operations() -> RedirectResponse:
+    def redirect_operations() -> RedirectResponse:
         return RedirectResponse("/operations", 308)
 
-    async def redirect_updates() -> RedirectResponse:
+    def redirect_updates() -> RedirectResponse:
         return RedirectResponse("/updates", 308)
 
-    async def redirect_events() -> RedirectResponse:
+    def redirect_events() -> RedirectResponse:
         return RedirectResponse("/api/v2/events", 307)
 
     application.add_api_route("/new", redirect_updates, methods=["GET"])
@@ -324,7 +340,10 @@ def merge_match_groups(session: Session, decision: CatalogMatchDecision) -> None
                 target_series.description = source_series.description
             if not target_series.cover_url and source_series.cover_url:
                 target_series.cover_url = source_series.cover_url
-            if target_series.kavita_series_id is None and source_series.kavita_series_id is not None:
+            if (
+                target_series.kavita_series_id is None
+                and source_series.kavita_series_id is not None
+            ):
                 target_series.kavita_series_id = source_series.kavita_series_id
                 target_series.kavita_library_id = source_series.kavita_library_id
                 target_series.kavita_synced_at = source_series.kavita_synced_at
@@ -392,15 +411,22 @@ def merge_canonical_series(session: Session, series_ids: list[int]) -> int:
                         409,
                         f"duplicate {source} identities lack strong chapter overlap",
                     )
-    priorities = {source: len(SOURCE_PRIORITY) - index for index, source in enumerate(SOURCE_PRIORITY)}
+    priorities = {
+        source: len(SOURCE_PRIORITY) - index for index, source in enumerate(SOURCE_PRIORITY)
+    }
 
     def rank(row: CatalogSeries) -> tuple[int, int, int, int]:
         identities = sources_by_series[row.id]
         provider = max((priorities.get(identity.source, 0) for identity in identities), default=0)
         metadata = int(bool(row.cover_url)) + int(bool(row.description))
-        chapters = session.scalar(
-            select(func.count()).select_from(CatalogChapter).where(CatalogChapter.series_id == row.id)
-        ) or 0
+        chapters = (
+            session.scalar(
+                select(func.count())
+                .select_from(CatalogChapter)
+                .where(CatalogChapter.series_id == row.id)
+            )
+            or 0
+        )
         return provider, metadata, chapters, -row.id
 
     target = max(rows, key=rank)
@@ -428,10 +454,18 @@ def merge_canonical_series(session: Session, series_ids: list[int]) -> int:
             (identity for identity in target_identities if identity.source in shared),
             target_identities[0] if target_identities else None,
         )
-        right_identity = next(
-            (identity for identity in source_identities if identity.source == left_identity.source),
-            source_identities[0] if source_identities else None,
-        ) if left_identity else None
+        right_identity = (
+            next(
+                (
+                    identity
+                    for identity in source_identities
+                    if identity.source == left_identity.source
+                ),
+                source_identities[0] if source_identities else None,
+            )
+            if left_identity
+            else None
+        )
         if left_identity is None or right_identity is None:
             raise HTTPException(409, "each manga must have a provider identity")
         merge_match_groups(
@@ -523,9 +557,7 @@ def _consolidate_overlapping_provider_identities(
             else:
                 # A direct statement keeps ORM state aligned before deleting the duplicate source
                 # identity, whose database cascade would otherwise trigger a second DELETE warning.
-                session.execute(
-                    delete(CatalogSeriesAlias).where(CatalogSeriesAlias.id == alias.id)
-                )
+                session.execute(delete(CatalogSeriesAlias).where(CatalogSeriesAlias.id == alias.id))
         for identifier in session.scalars(
             select(CatalogExternalIdentifier).where(
                 CatalogExternalIdentifier.source_series_id == duplicate.id

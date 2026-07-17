@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -128,7 +129,7 @@ def sessions() -> TrackingSessionFactory:
         poolclass=StaticPool,
     )
     JobBase.metadata.create_all(engine)
-    return TrackingSessionFactory(sessionmaker(engine, expire_on_commit=False))
+    return TrackingSessionFactory(sessionmaker(engine, autoflush=False, expire_on_commit=False))
 
 
 def claimed_context(sessions: TrackingSessionFactory) -> JobContext:
@@ -347,7 +348,9 @@ def test_asura_ingest_uses_global_revision_without_persisting_an_override(
         row = repository.ingest(
             session,
             SeriesItem(
-                "asura", "comics/painter", "Painter",
+                "asura",
+                "comics/painter",
+                "Painter",
                 "https://asurascans.com/comics/painter-1d35e5bd",
                 metadata={"asura_revision": "1d35e5bd"},
             ),
@@ -365,7 +368,9 @@ def test_asura_ingest_retains_only_explicit_per_series_revision_override(
         row = CatalogRepository().ingest(
             session,
             SeriesItem(
-                "asura", "comics/exception", "Exception",
+                "asura",
+                "comics/exception",
+                "Exception",
                 "https://asurascans.com/comics/exception-deadbeef",
                 metadata={
                     "asura_revision": "deadbeef",
@@ -382,7 +387,9 @@ def test_asura_revision_requires_three_distinct_series_for_global_consensus(
 ) -> None:
     items = [
         SeriesItem(
-            "asura", f"comics/title-{index}", f"Title {index}",
+            "asura",
+            f"comics/title-{index}",
+            f"Title {index}",
             f"https://asurascans.com/comics/title-{index}-1d35e5bd",
             metadata={"asura_revision": "1d35e5bd"},
         )
@@ -402,7 +409,10 @@ def test_asura_mixed_revision_without_consensus_uses_observed_per_series_urls(
 ) -> None:
     items = [
         SeriesItem(
-            "asura", f"comics/title-{index}", f"Title {index}", "https://example/old",
+            "asura",
+            f"comics/title-{index}",
+            f"Title {index}",
+            "https://example/old",
             metadata={"asura_revision": revision},
         )
         for index, revision in enumerate(("1d35e5bd", "1d35e5bd", "deadbeef"))
@@ -424,7 +434,10 @@ def test_undated_descending_chapters_recompute_numeric_latest(
             SeriesItem("mangafire", "numeric", "Numeric", "https://example/numeric"),
             [
                 ChapterItem(
-                    "mangafire", "numeric", str(number), f"Chapter {number}",
+                    "mangafire",
+                    "numeric",
+                    str(number),
+                    f"Chapter {number}",
                     f"https://example/numeric/{number}",
                 )
                 for number in range(75, 0, -1)
@@ -522,3 +535,24 @@ def test_frontier_only_enriches_new_or_advanced_rows_before_stable_boundary() ->
         {"source_id": row.source_id, "latest_chapter": row.metadata["recent_chapters"][0]["number"]}
         for row in listed[:5]
     ]
+
+
+def test_catalog_comparison_skips_unchanged_identity_and_refreshes_advanced_one(
+    sessions: TrackingSessionFactory,
+) -> None:
+    repository = CatalogRepository()
+    existing = SeriesItem(
+        "mangafire",
+        "known",
+        "Known",
+        "https://example/known",
+        metadata={"recent_chapters": [{"number": "10"}]},
+    )
+    with sessions() as session, session.begin():
+        repository.ingest(session, existing, [])
+    with sessions() as session:
+        assert SourcePullHandler._changed_catalog_items(session, "mangafire", [existing]) == []
+        advanced = replace(existing, metadata={"recent_chapters": [{"number": "11"}]})
+        assert SourcePullHandler._changed_catalog_items(session, "mangafire", [advanced]) == [
+            advanced
+        ]

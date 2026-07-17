@@ -13,6 +13,8 @@ from uuid import uuid4
 
 from PIL import Image
 
+from manga_manager.infrastructure.bounded_executor import AsyncBoundedExecutor
+
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".webp", ".gif", ".avif"}
 
@@ -53,6 +55,7 @@ class ContentAddressedStorage:
         max_pages: int,
         min_download_pages: int = 1,
         min_free_bytes: int = 0,
+        disk_workers: int = 2,
     ) -> None:
         self.root = root
         self.blob_root = root / "blobs"
@@ -64,6 +67,20 @@ class ContentAddressedStorage:
         self.max_pages = max_pages
         self.min_download_pages = min_download_pages
         self.min_free_bytes = min_free_bytes
+        self._disk_executor = AsyncBoundedExecutor(
+            workers=disk_workers,
+            thread_name_prefix="manga-disk",
+        )
+
+    async def _disk(self, function, /, *args, **kwargs):
+        return await self._disk_executor.run(function, *args, **kwargs)
+
+    async def run_blocking(self, function, /, *args, **kwargs):
+        """Run storage-adjacent repair work in the same bounded HDD lane."""
+        return await self._disk(function, *args, **kwargs)
+
+    def close(self) -> None:
+        self._disk_executor.shutdown(wait=True, cancel_futures=False)
 
     def ensure_directories(self) -> None:
         self.blob_root.mkdir(parents=True, exist_ok=True)
@@ -159,9 +176,14 @@ class ContentAddressedStorage:
         image_count = 0
         total_bytes = 0
         try:
-            archive = zipfile.ZipFile(staging, "w", compression=zipfile.ZIP_STORED)
+            archive = await self._disk(
+                zipfile.ZipFile,
+                staging,
+                "w",
+                compression=zipfile.ZIP_STORED,
+            )
             try:
-                archive.writestr("ComicInfo.xml", comic_info_xml)
+                await self._disk(archive.writestr, "ComicInfo.xml", comic_info_xml)
                 async for page in pages:
                     image_count += 1
                     if image_count > self.max_pages:
@@ -171,17 +193,21 @@ class ContentAddressedStorage:
                     total_bytes += len(page)
                     if total_bytes > self.max_chapter_bytes:
                         raise ValueError("chapter exceeds max chapter bytes")
-                    extension = validated_image_extension(page)
-                    archive.writestr(f"{image_count:04d}.{extension}", page)
+                    extension = await self._disk(validated_image_extension, page)
+                    await self._disk(
+                        archive.writestr,
+                        f"{image_count:04d}.{extension}",
+                        page,
+                    )
                     if progress is not None:
                         progress(image_count)
             finally:
-                archive.close()
+                await self._disk(archive.close)
             if image_count < self.min_download_pages:
                 raise ValueError(
                     f"chapter contains {image_count} images; minimum is {self.min_download_pages}"
                 )
-            return self._store_fresh_archive(staging, image_count)
+            return await self._disk(self._store_fresh_archive, staging, image_count)
         finally:
             staging.unlink(missing_ok=True)
 
@@ -218,9 +244,7 @@ class ContentAddressedStorage:
     def materialize(self, blob_relative_path: str, projection_relative_path: str) -> Path:
         return self._materialize(self.library_root, blob_relative_path, projection_relative_path)
 
-    def materialize_kavita(
-        self, blob_relative_path: str, projection_relative_path: str
-    ) -> Path:
+    def materialize_kavita(self, blob_relative_path: str, projection_relative_path: str) -> Path:
         return self._materialize(self.kavita_root, blob_relative_path, projection_relative_path)
 
     def _materialize(

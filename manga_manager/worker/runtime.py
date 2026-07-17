@@ -163,7 +163,9 @@ class JobWorker:
             )
         return WorkerRunResult.SUCCEEDED if succeeded else WorkerRunResult.LEASE_LOST
 
-    async def run_forever(self, stop: asyncio.Event) -> None:
+    async def run_forever(
+        self, stop: asyncio.Event, wakeup: asyncio.Event | None = None
+    ) -> None:
         base_delay = self.settings.poll_interval.total_seconds()
         idle_delay = base_delay
         while not stop.is_set():
@@ -172,13 +174,31 @@ class JobWorker:
                 idle_delay = base_delay
                 continue
             try:
-                await asyncio.wait_for(stop.wait(), timeout=idle_delay)
+                if wakeup is None:
+                    await asyncio.wait_for(stop.wait(), timeout=idle_delay)
+                else:
+                    stop_wait = asyncio.create_task(stop.wait())
+                    wake_wait = asyncio.create_task(wakeup.wait())
+                    done, pending = await asyncio.wait(
+                        (stop_wait, wake_wait),
+                        timeout=idle_delay,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    for task in pending:
+                        task.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    if wake_wait in done:
+                        wakeup.clear()
+                        idle_delay = base_delay
             except TimeoutError:
                 # A dozen empty worker slots polling every second creates more DB
                 # traffic than useful work. Back off gently while a pool is idle,
                 # then reset immediately after any claim.
                 idle_delay = min(base_delay * 4, idle_delay * 1.5)
                 continue
+            else:
+                if not stop.is_set():
+                    idle_delay = min(base_delay * 4, idle_delay * 1.5)
 
     def _claim(self) -> JobLease | None:
         with self.session_factory() as session, session.begin():

@@ -55,6 +55,14 @@ class SourcePollScheduler:
         self.storage_capacity = StorageCapacityCoordinator(
             settings.storage_root, settings.min_free_bytes
         )
+        self._last_run: dict[str, datetime] = {}
+
+    def _due(self, name: str, now: datetime, interval: timedelta) -> bool:
+        previous = self._last_run.get(name)
+        if previous is not None and previous + interval > now:
+            return False
+        self._last_run[name] = now
+        return True
 
     async def run(self, stop: asyncio.Event) -> None:
         leadership: SchedulerLeadership | None = None
@@ -115,7 +123,8 @@ class SourcePollScheduler:
             )
             self.telemetry.start_due_exploration(source, ceiling=ceiling, now=current)
         self.telemetry.finalize_due(now=current)
-        self.telemetry.cleanup_samples(now=current)
+        if self._due("telemetry_cleanup", current, timedelta(hours=1)):
+            self.telemetry.cleanup_samples(now=current)
         with self.session_factory() as policy_session:
             for policy in policy_session.scalars(select(ProviderPolicy)).all():
                 field = f"{policy.source}_page_concurrency"
@@ -124,26 +133,34 @@ class SourcePollScheduler:
         with self.session_factory() as session, session.begin():
             self.storage_capacity.refresh(session)
             count += self._recover_misclassified_provider_outages(session, current)
-            DownloadPlanCoordinator(self.queue).bootstrap(session)
+            if self._due("download_recovery", current, timedelta(hours=6)):
+                DownloadPlanCoordinator(self.queue).bootstrap(session)
             repair_planner = LibraryRepairPlanner(self.queue)
-            canonicalized, cancelled = repair_planner.reconcile_active_jobs(session)
-            if canonicalized or cancelled:
-                logger.info(
-                    "coalesced library repair backlog: canonicalized=%s cancelled=%s",
-                    canonicalized,
-                    cancelled,
-                )
-            repair_planner.enqueue_pending(session, limit=25)
-            count += CoverBackfillPlanner(self.queue).enqueue_pending(session, limit=10)
-            JobRetention().prune(session, now=current, batch=250)
+            if self._due("library_repair", current, timedelta(minutes=10)):
+                canonicalized, cancelled = repair_planner.reconcile_active_jobs(session)
+                if canonicalized or cancelled:
+                    logger.info(
+                        "coalesced library repair backlog: canonicalized=%s cancelled=%s",
+                        canonicalized,
+                        cancelled,
+                    )
+                repair_planner.enqueue_pending(session, limit=25)
+            if self._due("cover_backfill", current, timedelta(minutes=5)):
+                count += CoverBackfillPlanner(self.queue).enqueue_pending(session, limit=10)
+            if self._due("job_retention", current, timedelta(minutes=10)):
+                JobRetention().prune(session, now=current, batch=250)
+            if self._due("lease_cleanup", current, timedelta(minutes=10)):
+                count += self.queue.fail_exhausted_leases(session, now=current)
+                self.queue.cleanup_expired_permits(session, now=current)
             kavita = configured_kavita_client(
                 local_library_root=self.settings.storage_root / "kavita-library"
             )
-            if kavita.configured:
+            if kavita.configured and self._due("kavita_refresh", current, timedelta(minutes=10)):
                 KavitaSyncPlanner(self.queue).enqueue_pending(
                     session,
                     limit=25,
-                    reading_refresh_after=timedelta(minutes=10),
+                    reading_refresh_after=timedelta(hours=6),
+                    batch=True,
                 )
             for policy in session.scalars(select(ProviderPolicy)).all():
                 next_probe = (policy.metadata_json or {}).get("next_recovery_probe")

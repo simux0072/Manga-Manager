@@ -4,20 +4,28 @@ import hashlib
 import io
 
 import numpy as np
+import pytest
 from PIL import Image, ImageDraw
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
 
 from manga_manager.application.cover_evidence import (
     ALGORITHM,
+    CoverEvidenceService,
     compare_signatures,
     cover_signature,
     fingerprint_cover,
     hamming_distance,
+    process_cover_content,
+    signature_bands,
+    thumbnail_relative_path,
 )
 from manga_manager.application.cover_backfill import CoverBackfillPlanner
 from manga_manager.infrastructure.db_models import (
+    CatalogCoverAsset,
     CatalogCoverSignature,
+    CatalogMatchDecision,
     CatalogSeries,
     CatalogSourceSeries,
     JobBase,
@@ -96,6 +104,21 @@ def test_corrupt_signature_is_treated_as_inconclusive() -> None:
     assert evidence["cover_match"] is False
 
 
+def test_cover_processing_keeps_original_and_creates_bounded_webp(tmp_path) -> None:
+    content = detailed_cover()
+
+    result = process_cover_content(content, tmp_path)
+    checksum, original = result[1], result[-1]
+    thumbnail = tmp_path / thumbnail_relative_path(checksum)
+
+    assert (tmp_path / original).read_bytes() == content
+    assert thumbnail.is_file()
+    with Image.open(thumbnail) as image:
+        assert image.format == "WEBP"
+        assert image.width <= 480
+        assert image.height <= 720
+
+
 def test_cover_backfill_does_not_requeue_an_exhausted_url_forever() -> None:
     engine = create_engine("sqlite://")
     JobBase.metadata.create_all(engine)
@@ -140,3 +163,64 @@ def test_cover_backfill_does_not_requeue_an_exhausted_url_forever() -> None:
 
     assert created == 1
     assert [row.payload["source_series_id"] for row in queued] == [pending.id]
+
+
+@pytest.mark.asyncio
+async def test_cover_refresh_runs_cpu_scoring_outside_the_async_loop(tmp_path) -> None:
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    JobBase.metadata.create_all(engine)
+    sessions = sessionmaker(engine, autoflush=False, expire_on_commit=False)
+    with sessions() as session, session.begin():
+        for source, source_id, content in (
+            ("asura", "example-a", detailed_cover()),
+            ("mangafire", "example-b", detailed_cover(translated_title=True)),
+        ):
+            series = CatalogSeries(title="Example", normalized_title="example")
+            session.add(series)
+            session.flush()
+            identity = CatalogSourceSeries(
+                series_id=series.id,
+                source=source,
+                source_id=source_id,
+                title="Example",
+                normalized_title="example",
+                url=f"https://example.test/{source_id}",
+                cover_url=f"https://covers.test/{source_id}.jpg",
+            )
+            session.add(identity)
+            session.flush()
+            result = process_cover_content(content, tmp_path)
+            cover_signature_row = signature(content, identity.id)
+            (
+                cover_signature_row.hash_band_0,
+                cover_signature_row.hash_band_1,
+                cover_signature_row.hash_band_2,
+                cover_signature_row.hash_band_3,
+            ) = signature_bands(cover_signature_row.feature_json)
+            session.add_all(
+                [
+                    cover_signature_row,
+                    CatalogCoverAsset(
+                        source_series_id=identity.id,
+                        content_checksum=result[1],
+                        relative_path=result[-1].as_posix(),
+                        source_url=identity.cover_url,
+                        width=result[2],
+                        height=result[3],
+                    ),
+                ]
+            )
+        first_identity_id = session.scalar(
+            select(CatalogSourceSeries.id).order_by(CatalogSourceSeries.id)
+        )
+
+    await CoverEvidenceService(sessions, tmp_path).refresh_for_source_series(first_identity_id)
+
+    with sessions() as session:
+        decision = session.scalar(select(CatalogMatchDecision))
+        assert decision is not None
+        assert decision.evidence_json["cover_compared"] is True

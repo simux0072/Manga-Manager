@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+import asyncio
 
 import httpx
 
@@ -48,6 +50,13 @@ class KavitaClient:
         self.kavita_library_root = (
             kavita_library_root if kavita_library_root is not None else settings.kavita_library_root
         )
+        # Constructing a configured client is also used as a cheap feature flag
+        # by the scheduler.  Keep the socket pool lazy so those checks do not
+        # allocate an AsyncClient that nobody will close.
+        self._http: httpx.AsyncClient | None = None
+        self._scan_lock = asyncio.Lock()
+        self._last_scan_at: datetime | None = None
+        self._series_cache: tuple[datetime, list[KavitaSeries]] | None = None
 
     @property
     def configured(self) -> bool:
@@ -56,44 +65,54 @@ class KavitaClient:
     def headers(self) -> dict[str, str]:
         return {"x-api-key": self.api_key}
 
+    def _client(self) -> httpx.AsyncClient:
+        if self._http is None:
+            self._http = httpx.AsyncClient(timeout=30, follow_redirects=True)
+        return self._http
+
     async def authkey_expires(self) -> str | None:
         if not self.configured:
             return None
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.get(
-                f"{self.base_url}/api/Plugin/authkey-expires",
-                headers=self.headers(),
-            )
-            response.raise_for_status()
-            return response.json()
+        response = await self._client().get(
+            f"{self.base_url}/api/Plugin/authkey-expires", headers=self.headers()
+        )
+        response.raise_for_status()
+        return response.json()
 
     async def scan_all(self) -> None:
         if not self.configured:
             return
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.post(
-                f"{self.base_url}/api/Library/scan-all",
-                headers=self.headers(),
-            )
-            response.raise_for_status()
+        response = await self._client().post(
+            f"{self.base_url}/api/Library/scan-all", headers=self.headers()
+        )
+        response.raise_for_status()
+        self._series_cache = None
 
     async def scan_folder(self, folder_path: Path) -> None:
         if not self.configured:
             return
         kavita_folder_path = self.kavita_path_for_local(folder_path)
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.post(
-                f"{self.base_url}/api/Library/scan-folder",
-                headers=self.headers(),
-                json={
-                    "apiKey": self.api_key,
-                    "folderPath": str(kavita_folder_path),
-                    "abortOnNoSeriesMatch": False,
-                },
-            )
-            response.raise_for_status()
+        response = await self._client().post(
+            f"{self.base_url}/api/Library/scan-folder",
+            headers=self.headers(),
+            json={
+                "apiKey": self.api_key,
+                "folderPath": str(kavita_folder_path),
+                "abortOnNoSeriesMatch": False,
+            },
+        )
+        response.raise_for_status()
+        self._series_cache = None
 
     async def scan_folder_or_all(self, folder_path: Path) -> None:
+        async with self._scan_lock:
+            now = datetime.now(timezone.utc)
+            if self._last_scan_at is not None and now - self._last_scan_at < timedelta(seconds=30):
+                return
+            await self._scan_folder_or_all(folder_path)
+            self._last_scan_at = now
+
+    async def _scan_folder_or_all(self, folder_path: Path) -> None:
         kavita_folder_path = self.kavita_path_for_local(folder_path)
         kavita_library_root = self.kavita_path_for_local(self.local_library_root)
         if _same_folder_path(kavita_folder_path, kavita_library_root):
@@ -126,38 +145,40 @@ class KavitaClient:
     async def list_series(self) -> list[KavitaSeries]:
         if not self.configured:
             return []
+        now = datetime.now(timezone.utc)
+        if self._series_cache is not None and now - self._series_cache[0] < timedelta(seconds=2):
+            return list(self._series_cache[1])
         page = 1
         page_size = 100
         result: list[KavitaSeries] = []
-        async with httpx.AsyncClient(timeout=30) as client:
-            while True:
-                response = await client.post(
-                    f"{self.base_url}/api/Series/all-v2",
-                    params={"PageNumber": page, "PageSize": page_size},
-                    headers=self.headers(),
-                    json={},
-                )
-                response.raise_for_status()
-                payload = response.json()
-                items = payload if isinstance(payload, list) else payload.get("items", [])
-                if not items:
-                    break
-                result.extend(parse_series(item) for item in items)
-                if len(items) < page_size:
-                    break
-                page += 1
+        while True:
+            response = await self._client().post(
+                f"{self.base_url}/api/Series/all-v2",
+                params={"PageNumber": page, "PageSize": page_size},
+                headers=self.headers(),
+                json={},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            items = payload if isinstance(payload, list) else payload.get("items", [])
+            if not items:
+                break
+            result.extend(parse_series(item) for item in items)
+            if len(items) < page_size:
+                break
+            page += 1
+        self._series_cache = (now, list(result))
         return result
 
     async def series_detail(self, series_id: int) -> list[KavitaChapter]:
         if not self.configured:
             return []
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.get(
-                f"{self.base_url}/api/Series/series-detail",
-                params={"seriesId": series_id},
-                headers=self.headers(),
-            )
-            response.raise_for_status()
+        response = await self._client().get(
+            f"{self.base_url}/api/Series/series-detail",
+            params={"seriesId": series_id},
+            headers=self.headers(),
+        )
+        response.raise_for_status()
         payload = response.json()
         chapters = list(payload.get("chapters") or [])
         for volume in payload.get("volumes") or []:
@@ -169,13 +190,12 @@ class KavitaClient:
     ) -> KavitaReadProgress | None:
         if not self.configured:
             return None
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.get(
-                f"{self.base_url}/api/Reader/get-progress",
-                params={"chapterId": chapter_id},
-                headers=self.headers(),
-            )
-            response.raise_for_status()
+        response = await self._client().get(
+            f"{self.base_url}/api/Reader/get-progress",
+            params={"chapterId": chapter_id},
+            headers=self.headers(),
+        )
+        response.raise_for_status()
         payload = response.json()
         return parse_read_progress(payload, chapter_id, pages_total)
 
@@ -188,13 +208,12 @@ class KavitaClient:
     async def _mark_series(self, action: str, series_id: int) -> None:
         if not self.configured:
             return
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.post(
-                f"{self.base_url}/api/Reader/{action}",
-                headers=self.headers(),
-                json={"seriesId": series_id},
-            )
-            response.raise_for_status()
+        response = await self._client().post(
+            f"{self.base_url}/api/Reader/{action}",
+            headers=self.headers(),
+            json={"seriesId": series_id},
+        )
+        response.raise_for_status()
 
     async def want_to_read(self) -> list[KavitaSeries]:
         if not self.configured:
@@ -202,23 +221,22 @@ class KavitaClient:
         page = 1
         page_size = 100
         result: list[KavitaSeries] = []
-        async with httpx.AsyncClient(timeout=30) as client:
-            while True:
-                response = await client.post(
-                    f"{self.base_url}/api/want-to-read/v2",
-                    params={"PageNumber": page, "PageSize": page_size},
-                    headers=self.headers(),
-                    json={},
-                )
-                response.raise_for_status()
-                payload = response.json()
-                items = payload if isinstance(payload, list) else payload.get("items", [])
-                if not items:
-                    break
-                result.extend(parse_series(item) for item in items)
-                if len(items) < page_size:
-                    break
-                page += 1
+        while True:
+            response = await self._client().post(
+                f"{self.base_url}/api/want-to-read/v2",
+                params={"PageNumber": page, "PageSize": page_size},
+                headers=self.headers(),
+                json={},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            items = payload if isinstance(payload, list) else payload.get("items", [])
+            if not items:
+                break
+            result.extend(parse_series(item) for item in items)
+            if len(items) < page_size:
+                break
+            page += 1
         return result
 
     async def add_want_to_read(self, series_ids: list[int]) -> None:
@@ -237,24 +255,27 @@ class KavitaClient:
         if not self.configured or not data_url:
             return
         encoded = data_url.split(",", 1)[1] if data_url.startswith("data:") else data_url
-        async with httpx.AsyncClient(timeout=30) as client:
-            response = await client.post(
-                f"{self.base_url}/api/Upload/{entity}",
-                headers=self.headers(),
-                json={"id": entity_id, "url": encoded},
-            )
-            response.raise_for_status()
+        response = await self._client().post(
+            f"{self.base_url}/api/Upload/{entity}",
+            headers=self.headers(),
+            json={"id": entity_id, "url": encoded},
+        )
+        response.raise_for_status()
 
     async def update_want_to_read(self, action: str, series_ids: list[int]) -> None:
         if not self.configured or not series_ids:
             return
-        async with httpx.AsyncClient(timeout=20) as client:
-            response = await client.post(
-                f"{self.base_url}/api/want-to-read/{action}",
-                headers=self.headers(),
-                json={"seriesIds": series_ids},
-            )
-            response.raise_for_status()
+        response = await self._client().post(
+            f"{self.base_url}/api/want-to-read/{action}",
+            headers=self.headers(),
+            json={"seriesIds": series_ids},
+        )
+        response.raise_for_status()
+
+    async def aclose(self) -> None:
+        if self._http is not None:
+            await self._http.aclose()
+            self._http = None
 
     def kavita_path_for_local(self, local_path: Path) -> Path:
         if self.kavita_library_root is None:

@@ -7,7 +7,16 @@ network="${STAGE_NETWORK:-$project-net}"
 container="${KAVITA_CONTAINER:-$project-kavita}"
 volume="${KAVITA_CONFIG_VOLUME:-$project-kavita-config}"
 state_dir="${STAGE_STATE_DIR:-$PWD/.local}"
-env_file="${KAVITA_ENV_FILE:-$state_dir/kavita.env}"
+legacy_env_file="$state_dir/kavita.env"
+if [ -n "${KAVITA_ENV_FILE:-}" ]; then
+  env_file="$KAVITA_ENV_FILE"
+elif [ -f "$legacy_env_file" ]; then
+  # Preserve credentials created by older launchers, but isolate newly provisioned
+  # environments by project so parallel staging stacks cannot overwrite each other.
+  env_file="$legacy_env_file"
+else
+  env_file="$state_dir/$project-kavita.env"
+fi
 env_dir=$(dirname "$env_file")
 env_name=$(basename "$env_file")
 pending_env="$state_dir/$project-kavita-pending.env"
@@ -29,8 +38,19 @@ case "$command" in
     cat "$env_file"
     exit 0
     ;;
+  reset-config)
+    [ "${2:-}" = "--yes" ] || {
+      echo "usage: scripts/kavita-local.sh reset-config --yes" >&2
+      echo "This removes only the disposable Kavita config volume and local credentials." >&2
+      exit 2
+    }
+    docker rm -f "$container" >/dev/null 2>&1 || true
+    docker volume rm "$volume" >/dev/null 2>&1 || true
+    rm -f "$env_file" "$pending_env"
+    exit 0
+    ;;
   up) ;;
-  *) echo "usage: scripts/kavita-local.sh up|down|status|credentials" >&2; exit 2 ;;
+  *) echo "usage: scripts/kavita-local.sh up|down|status|credentials|reset-config --yes" >&2; exit 2 ;;
 esac
 
 mkdir -p "$state_dir" "$env_dir" "$storage/kavita-library"
@@ -44,30 +64,39 @@ docker network inspect "$network" >/dev/null 2>&1 || docker network create "$net
 docker volume inspect "$volume" >/dev/null 2>&1 || docker volume create "$volume" >/dev/null
 app_image="$project:local"
 # Finish the I/O-heavy application build before Kavita initializes SQLite on slower disks.
-docker build -t "$app_image" .
+if [ "${KAVITA_BUILD:-false}" = "true" ] || ! docker image inspect "$app_image" >/dev/null 2>&1; then
+  docker build -t "$app_image" .
+fi
 expected_mount=$(cd "$storage/kavita-library" && pwd)
-if docker container inspect "$container" >/dev/null 2>&1; then
-  current_mount=$(docker inspect -f \
-    '{{range .Mounts}}{{if eq .Destination "/manga"}}{{.Source}}{{end}}{{end}}' \
-    "$container")
-  current_image=$(docker inspect -f '{{.Config.Image}}' "$container")
-  if [ "$current_mount" != "$expected_mount" ] || [ "$current_image" != "$image" ]; then
-    docker rm -f "$container" >/dev/null
-  else
-    docker start "$container" >/dev/null
+
+start_kavita() {
+  if docker container inspect "$container" >/dev/null 2>&1; then
+    current_mount=$(docker inspect -f \
+      '{{range .Mounts}}{{if eq .Destination "/manga"}}{{.Source}}{{end}}{{end}}' \
+      "$container")
+    current_image=$(docker inspect -f '{{.Config.Image}}' "$container")
+    if [ "$current_mount" != "$expected_mount" ] || [ "$current_image" != "$image" ]; then
+      docker rm -f "$container" >/dev/null
+    else
+      docker start "$container" >/dev/null
+    fi
   fi
-fi
-if ! docker container inspect "$container" >/dev/null 2>&1; then
-  docker run -d --name "$container" --network "$network" -p "${KAVITA_PORT:-15000}:5000" \
-    --log-opt max-size=10m --log-opt max-file=3 \
-    -e "TZ=${TZ:-UTC}" -v "$volume:/kavita/config" -v "$storage/kavita-library:/manga:ro" \
-    --restart unless-stopped "$image" >/dev/null
-fi
+  if ! docker container inspect "$container" >/dev/null 2>&1; then
+    docker run -d --name "$container" --network "$network" -p "${KAVITA_PORT:-15000}:5000" \
+      --log-opt max-size=10m --log-opt max-file=3 \
+      -e "TZ=${TZ:-UTC}" -v "$volume:/kavita/config" -v "$storage/kavita-library:/manga:ro" \
+      --restart unless-stopped "$image" >/dev/null
+  fi
+}
+
+start_kavita
 
 username=manga-manager-local
 password=""
 api_key=""
+had_credentials=false
 if [ -f "$env_file" ]; then
+  had_credentials=true
   password=$(sed -n 's/^KAVITA_PASSWORD=//p' "$env_file")
   api_key=$(sed -n 's/^KAVITA_API_KEY=//p' "$env_file")
 elif [ -f "$pending_env" ]; then
@@ -78,14 +107,31 @@ if [ ! -f "$env_file" ]; then
   (umask 077; printf 'KAVITA_PASSWORD=%s\n' "$password" >"$pending_env")
 fi
 
-docker run --rm --user "$(id -u):$(id -g)" --network "$network" -v "$env_dir:/state" \
-  -v "$PWD/scripts/kavita-e2e-setup.py:/app/scripts/kavita-e2e-setup.py:ro" \
-  -e UV_CACHE_DIR=/tmp/uv-cache \
-  -e KAVITA_E2E_URL="http://$container:5000" -e KAVITA_E2E_USERNAME="$username" \
-  -e KAVITA_E2E_PASSWORD="$password" -e KAVITA_E2E_API_KEY="$api_key" \
-  -e "KAVITA_ENV_OUTPUT=/state/$env_name" \
-  -e "KAVITA_WAIT_SECONDS=${KAVITA_WAIT_SECONDS:-900}" "$app_image" \
-  /app/.venv/bin/python scripts/kavita-e2e-setup.py >/dev/null
+provision_kavita() {
+  docker run --rm --user "$(id -u):$(id -g)" --network "$network" -v "$env_dir:/state" \
+    -v "$PWD/scripts/kavita-e2e-setup.py:/app/scripts/kavita-e2e-setup.py:ro" \
+    -e UV_CACHE_DIR=/tmp/uv-cache \
+    -e KAVITA_E2E_URL="http://$container:5000" -e KAVITA_E2E_USERNAME="$username" \
+    -e KAVITA_E2E_PASSWORD="$password" -e KAVITA_E2E_API_KEY="$api_key" \
+    -e "KAVITA_ENV_OUTPUT=/state/$env_name" \
+    -e "KAVITA_WAIT_SECONDS=${KAVITA_WAIT_SECONDS:-900}" "$app_image" \
+    /app/.venv/bin/python scripts/kavita-e2e-setup.py >/dev/null
+}
+
+set +e
+provision_kavita
+provision_status=$?
+set -e
+if [ "$provision_status" -eq 42 ] && [ "$had_credentials" = false ]; then
+  echo "Kavita credentials were lost while its disposable config volume remained; recreating only that volume." >&2
+  docker rm -f "$container" >/dev/null 2>&1 || true
+  docker volume rm "$volume" >/dev/null 2>&1 || true
+  docker volume create "$volume" >/dev/null
+  start_kavita
+  provision_kavita
+elif [ "$provision_status" -ne 0 ]; then
+  exit "$provision_status"
+fi
 rm -f "$pending_env"
 set -a
 . "$env_file"

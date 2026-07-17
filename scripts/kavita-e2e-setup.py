@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -18,6 +19,10 @@ PASSWORD = os.environ.get("KAVITA_E2E_PASSWORD") or secrets.token_urlsafe(18)
 EXISTING_API_KEY = os.environ.get("KAVITA_E2E_API_KEY", "")
 OUTPUT_ENV = os.environ.get("KAVITA_ENV_OUTPUT", "")
 WAIT_SECONDS = int(os.environ.get("KAVITA_WAIT_SECONDS", "300"))
+
+
+class CredentialMismatchError(RuntimeError):
+    """The persistent Kavita administrator does not match local credentials."""
 
 
 def request(path: str, *, method: str = "GET", payload=None, token: str = ""):
@@ -99,9 +104,9 @@ def main() -> None:
             break
         except urllib.error.HTTPError as exc:
             if exc.code in {401, 403}:
-                raise RuntimeError(
-                    "Kavita already has a different administrator; preserve .local/kavita.env "
-                    "or reset the local Kavita config volume"
+                raise CredentialMismatchError(
+                    "Kavita already has a different administrator; preserve the configured "
+                    "Kavita credential file or reset the local Kavita config volume"
                 ) from exc
             last_error = f"HTTP {exc.code} from {exc.url}"
             time.sleep(1)
@@ -142,4 +147,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except CredentialMismatchError as exc:
+        # The local launcher uses this distinct status to recover an orphaned disposable
+        # config volume without mistaking network or migration failures for bad credentials.
+        print(str(exc), file=sys.stderr)
+        raise SystemExit(42) from None

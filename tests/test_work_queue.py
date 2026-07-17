@@ -533,6 +533,30 @@ def test_expired_permits_are_recovered_with_job_lease(session: Session) -> None:
     assert {permit.owner for permit in permits} == {"replacement"}
 
 
+def test_expired_permits_are_pruned_by_maintenance(session: Session) -> None:
+    queue = JobQueue()
+    queue.enqueue(
+        session,
+        kind=JobKind.CHAPTER_DOWNLOAD,
+        dedupe_key="release:expired-permit",
+        payload=ChapterDownloadPayload(chapter_release_id=2),
+        source="mangafire",
+        series_key="series-expired",
+        available_at=NOW,
+    )
+    lease = queue.claim(
+        session,
+        owner="stopped-pool",
+        lease_for=timedelta(seconds=10),
+        now=NOW,
+        pool_limits={"download:mangafire": 1, "chapter_global": 4},
+    )
+    assert lease is not None
+
+    assert queue.cleanup_expired_permits(session, now=NOW + timedelta(seconds=11)) == 2
+    assert session.scalars(select(JobPermit).where(JobPermit.job_id == lease.id)).all() == []
+
+
 def test_shared_source_cooldown_skips_provider_jobs(session: Session) -> None:
     queue = JobQueue()
     queue.enqueue(
@@ -721,6 +745,54 @@ def test_refresh_enqueue_coalesces_without_growing_queue(session: Session) -> No
     )
     assert created and not created_again and first.id == second.id
     assert second.payload["url"] == "https://example/new"
+
+
+def test_kavita_batch_coalescing_preserves_unique_pending_series(session: Session) -> None:
+    queue = JobQueue()
+    first, created = queue.enqueue(
+        session,
+        kind=JobKind.KAVITA_SYNC,
+        dedupe_key="periodic-refresh",
+        payload=KavitaSyncPayload(series_ids=(1, 2)),
+        logical_units=2,
+        coalesce=True,
+        available_at=NOW,
+    )
+    merged, created_again = queue.enqueue(
+        session,
+        kind=JobKind.KAVITA_SYNC,
+        dedupe_key="periodic-refresh",
+        payload=KavitaSyncPayload(series_ids=(2, 3)),
+        logical_units=2,
+        coalesce=True,
+    )
+
+    assert created is True and created_again is False
+    assert merged.id == first.id
+    assert merged.payload["series_ids"] == [1, 2, 3]
+    assert merged.logical_units == 3
+
+    lease = queue.claim(
+        session,
+        owner="kavita-worker",
+        lease_for=timedelta(minutes=5),
+        kinds={JobKind.KAVITA_SYNC},
+        pools={"kavita"},
+        now=NOW,
+    )
+    assert lease is not None
+    leased, created_while_leased = queue.enqueue(
+        session,
+        kind=JobKind.KAVITA_SYNC,
+        dedupe_key="periodic-refresh",
+        payload=KavitaSyncPayload(series_ids=(3, 4)),
+        logical_units=2,
+        coalesce=True,
+    )
+
+    assert created_while_leased is False
+    assert leased.pending_payload["series_ids"] == [4]
+    assert leased.logical_units == 4
 
 
 def test_refresh_coalescing_keeps_newest_observation_while_leased(session: Session) -> None:

@@ -5,6 +5,10 @@ the legacy data or a particular staging database. Findings marked **measured** c
 size/build artifacts; findings marked **inferred** come from tracing code paths and should be
 confirmed with the profiling plan below.
 
+The 2026-07-17 live PostgreSQL follow-up, newly confirmed defects, and the ordered implementation
+roadmap are recorded in `database-and-runtime-improvement-plan.md`. That plan supersedes this
+document's remaining roadmap; the architecture and module inventory below remain the reference.
+
 ## Executive summary
 
 Manga Manager is a private, single-user manga discovery, download, repair, matching, and Kavita
@@ -58,10 +62,13 @@ The first code pass completed the following high-return items from this audit:
   counters, and the scale environment enforces latency and query-count ceilings across all primary
   read workspaces.
 
-Targeted Python tests, Ruff, Vitest, and the production frontend build pass. PostgreSQL concurrency,
-browser, staging, and ARM64 checks remain deployment validation because they require the container
-environment. The next measured priorities are SQL-shortlisted proposal read models, LISTEN/NOTIFY
-worker wakeups, thumbnail generation, and Kavita batch/list caching.
+The 2026-07-17 follow-up also added latest-release repair migration `0019`, durable provider
+observation versions, a bounded database audit, purpose-gated maintenance, SQL cover shortlisting,
+coalesced Kavita progress batches and list caching, role-specific PostgreSQL pools/timeouts,
+LISTEN/NOTIFY worker wakeups, a bounded HDD executor, local WebP derivatives, request cancellation,
+readiness probes, and queue/provider/job-duration metrics. Structural file moves remain optional:
+they do not change runtime behavior and should follow the container characterization suite rather
+than being mixed into the measured hot-path repair.
 
 ## Repository and runtime shape
 
@@ -79,7 +86,7 @@ are:
 | `manga_manager/worker/` | Pool construction, leases, retries, scheduler leadership |
 | `manga_manager/web/` | FastAPI application, JSON API, merge transaction |
 | `frontend/src/` | React SPA, React Query state, SSE updates, responsive CSS |
-| `manga_manager/migrations/` | Eighteen ordered PostgreSQL/Alembic migrations |
+| `manga_manager/migrations/` | Nineteen ordered PostgreSQL/Alembic migrations |
 | `tests/`, `frontend/tests/` | Unit, PostgreSQL, API, component, and browser behavior |
 | `scripts/` | Local staging, Kavita E2E, reset, seed, scale, memory, and final validation tools |
 
@@ -203,9 +210,9 @@ and queue repair tools. These are operational tools rather than a second runtime
 | `Cover`, `SourceChips`, `StatusPill`, `AutoPager` | display/filter props | reusable media/filter/status/infinite-scroll primitives |
 
 React Query owns server state; mutations invalidate affected views. An SSE connection receives job
-events, while the drawer also polls every five seconds and Operations every fifteen seconds. The
-current production JavaScript bundle is about 320 KiB uncompressed and CSS about 29 KiB
-(**measured**). All routes are eagerly loaded.
+events, while the drawer and Operations retain 20/30-second recovery polling. Infinite feeds keep at
+most ten pages and abort superseded requests. The current production JavaScript bundle is about
+310 KiB uncompressed and CSS about 29 KiB (**measured**); the matching workspace is lazy-loaded.
 
 ## Module inventory
 

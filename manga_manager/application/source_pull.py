@@ -26,9 +26,13 @@ from manga_manager.application.provider_health import (
     record_provider_failure,
 )
 from manga_manager.domain.jobs import JobKind, SourcePullPayload, SourceRefreshPayload
-from manga_manager.infrastructure.catalog_repository import CatalogRepository
+from manga_manager.infrastructure.catalog_repository import (
+    CatalogRepository,
+    listing_observation_version,
+)
 from manga_manager.infrastructure.job_queue import JobQueue
-from manga_manager.infrastructure.db_models import CatalogSourceState, WorkJob
+from manga_manager.infrastructure.db_models import CatalogSourceSeries, CatalogSourceState, WorkJob
+from sqlalchemy import select
 from manga_manager.worker.runtime import SessionFactory
 
 
@@ -47,7 +51,7 @@ class SourcePullHandler:
         adapter_factory: AdapterFactory = adapter_for_source,
         catalog: CatalogRepository | None = None,
         queue: JobQueue | None = None,
-        frontier_limit: int = 5,
+        frontier_limit: int = 20,
         close_adapter: bool = True,
     ) -> None:
         self.session_factory = session_factory
@@ -78,7 +82,6 @@ class SourcePullHandler:
         try:
             listed_items = await adapter.list_recent_frontier(frontier)
             observed_frontier = build_listing_frontier(listed_items, self.frontier_limit)
-            candidates = changed_before_stable_frontier(listed_items, frontier, required_hits=3)
         except SourceRateLimited as exc:
             retry_at = aware_datetime(exc.retry_after) or provider_cooldown_until(
                 self.session_factory, source
@@ -100,9 +103,7 @@ class SourcePullHandler:
                 raise DeferredJobError(
                     "source_network_error",
                     exception_message(exc),
-                    retry_after=max(
-                        effective_cooldown - utcnow(), timedelta(seconds=1)
-                    ),
+                    retry_after=max(effective_cooldown - utcnow(), timedelta(seconds=1)),
                 ) from exc
             raise RetryableJobError("source_network_error", exception_message(exc)) from exc
         except httpx.HTTPStatusError as exc:
@@ -112,9 +113,7 @@ class SourcePullHandler:
                 if is_cloudflare_origin_error(status)
                 else None
             )
-            effective_cooldown = self._record_failure(
-                source, exception_message(exc), cooldown
-            )
+            effective_cooldown = self._record_failure(source, exception_message(exc), cooldown)
             if 400 <= status < 500 and status not in {408, 429}:
                 raise PermanentJobError("source_http_error", exception_message(exc)) from exc
             if is_cloudflare_origin_error(status):
@@ -129,9 +128,7 @@ class SourcePullHandler:
                 raise DeferredJobError(
                     "source_http_error",
                     exception_message(exc),
-                    retry_after=max(
-                        effective_cooldown - utcnow(), timedelta(seconds=1)
-                    ),
+                    retry_after=max(effective_cooldown - utcnow(), timedelta(seconds=1)),
                 ) from exc
             raise RetryableJobError("source_http_error", exception_message(exc)) from exc
         except Exception as exc:
@@ -141,15 +138,6 @@ class SourcePullHandler:
             if self.close_adapter:
                 await adapter.aclose()
 
-        with self.session_factory() as progress_session, progress_session.begin():
-            self.queue.progress(
-                progress_session,
-                job_id=context.lease.id,
-                owner=context.lease.owner,
-                message=f"discovered {len(candidates)} changed series",
-                details={"phase": "discovery", "processed": 1, "total": 2, "unit": "phases"},
-            )
-
         with self.session_factory() as session, session.begin():
             workflow_key = payload.workflow_key or f"pull:{source}:{context.lease.id}"
             root_job = session.get(WorkJob, context.lease.id)
@@ -158,8 +146,14 @@ class SourcePullHandler:
                 root_job.group_key = workflow_key
             if source == "asura":
                 listed_items = self._apply_asura_revision_consensus(session, listed_items)
-                candidate_ids = {item.source_id for item in candidates}
-                candidates = [item for item in listed_items if item.source_id in candidate_ids]
+            candidates = self._changed_catalog_items(session, source, listed_items)
+            self.queue.progress(
+                session,
+                job_id=context.lease.id,
+                owner=context.lease.owner,
+                message=f"discovered {len(candidates)} changed series",
+                details={"phase": "discovery", "processed": 1, "total": 2, "unit": "phases"},
+            )
             created = 0
             for item in candidates:
                 _job, was_created = self.queue.enqueue(
@@ -196,6 +190,33 @@ class SourcePullHandler:
             )
 
     @staticmethod
+    def _changed_catalog_items(session, source: str, items: list[SeriesItem]) -> list[SeriesItem]:
+        identities = {
+            row.source_id: row
+            for row in session.scalars(
+                select(CatalogSourceSeries).where(
+                    CatalogSourceSeries.source == source,
+                    CatalogSourceSeries.source_id.in_([item.source_id for item in items] or [""]),
+                )
+            )
+        }
+        stale_before = utcnow() - timedelta(days=7)
+        changed: list[SeriesItem] = []
+        for item in items:
+            existing = identities.get(item.source_id)
+            current = listing_observation_version(item)
+            if existing is None:
+                changed.append(item)
+                continue
+            if current and chapter_key(current) > chapter_key(existing.observation_version):
+                changed.append(item)
+                continue
+            fetched_at = aware_datetime(existing.detail_fetched_at)
+            if fetched_at is None or fetched_at < stale_before:
+                changed.append(item)
+        return changed
+
+    @staticmethod
     def _apply_asura_revision_consensus(session, items: list[SeriesItem]) -> list[SeriesItem]:
         counts: dict[str, set[str]] = {}
         for item in items:
@@ -207,6 +228,7 @@ class SourcePullHandler:
         if state is None:
             state = CatalogSourceState(source="asura")
             session.add(state)
+            session.flush()
         cursor = dict(state.cursor_json or {})
         if consensus and len(counts[consensus]) >= 3:
             cursor["global_revision"] = consensus
@@ -326,9 +348,7 @@ class SourceRefreshHandler:
                 raise DeferredJobError(
                     "source_network_error",
                     exception_message(exc),
-                    retry_after=max(
-                        effective_cooldown - utcnow(), timedelta(seconds=1)
-                    ),
+                    retry_after=max(effective_cooldown - utcnow(), timedelta(seconds=1)),
                 ) from exc
             raise RetryableJobError("source_network_error", exception_message(exc)) from exc
         except httpx.HTTPStatusError as exc:
@@ -358,9 +378,7 @@ class SourceRefreshHandler:
                     raise DeferredJobError(
                         "source_http_error",
                         exception_message(exc),
-                        retry_after=max(
-                            effective_cooldown - utcnow(), timedelta(seconds=1)
-                        ),
+                        retry_after=max(effective_cooldown - utcnow(), timedelta(seconds=1)),
                     ) from exc
                 raise RetryableJobError("source_http_error", exception_message(exc)) from exc
             self._quarantine(payload, exception_message(exc))
@@ -432,7 +450,9 @@ def refresh_payload(item: SeriesItem, *, workflow_key: str = "") -> SourceRefres
         external_ids=item.external_ids,
         metadata=item.metadata,
         workflow_key=workflow_key,
-        observation_version=str(item.metadata.get("latest_chapter") or latest_listing_chapter(item)),
+        observation_version=str(
+            item.metadata.get("latest_chapter") or latest_listing_chapter(item)
+        ),
     )
 
 

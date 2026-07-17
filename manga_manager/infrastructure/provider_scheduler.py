@@ -13,6 +13,7 @@ from manga_manager.infrastructure.db_models import (
     ProviderPolicy,
 )
 from manga_manager.domain.providers import KNOWN_SOURCES
+from manga_manager.infrastructure.bounded_executor import AsyncBoundedExecutor
 
 
 def utcnow() -> datetime:
@@ -24,13 +25,20 @@ class ProviderRequestScheduler:
 
     def __init__(self, session_factory: Callable[[], Session]) -> None:
         self.session_factory = session_factory
+        self._executor = AsyncBoundedExecutor(
+            workers=1,
+            thread_name_prefix="manga-provider-schedule",
+        )
 
     async def wait(self, source: str, traffic_class: str, interval_seconds: float) -> None:
-        delay = await asyncio.to_thread(
+        delay = await self._executor.run(
             self.reserve, source, interval_seconds, traffic_class=traffic_class
         )
         if delay > 0:
             await asyncio.sleep(delay)
+
+    def close(self) -> None:
+        self._executor.close()
 
     def reserve(
         self,

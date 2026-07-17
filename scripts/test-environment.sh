@@ -85,7 +85,7 @@ wait_for_stage_check() {
 case "$command" in
   up)
     mkdir -p "$root"
-    scripts/kavita-local.sh up
+    KAVITA_BUILD="${TEST_ENV_BUILD:-true}" scripts/kavita-local.sh up
     seed small
     # Prove seed idempotency before the worker mutates the generated catalog.
     seed small

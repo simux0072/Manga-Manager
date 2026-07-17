@@ -60,6 +60,21 @@ def update_poll_cadence(
     policy.metadata_json = metadata
 
 
+def listing_observation_version(item: SeriesItem) -> str:
+    explicit = str(item.metadata.get("latest_chapter") or "").strip()
+    if explicit:
+        return explicit
+    rows = item.metadata.get("recent_chapters")
+    if not isinstance(rows, list):
+        return ""
+    values = [
+        str(row.get("number") or "").strip()
+        for row in rows
+        if isinstance(row, dict) and row.get("number")
+    ]
+    return max(values, key=chapter_sort_number, default="")
+
+
 class CatalogRepository:
     def source_frontier(self, session: Session, source: str) -> list[dict[str, str]]:
         state = session.get(CatalogSourceState, source)
@@ -97,7 +112,8 @@ class CatalogRepository:
                 normalized_source_id=normalized_source_id,
                 revision_override=(
                     str(item.metadata.get("asura_revision_override") or "")
-                    if item.source == "asura" else ""
+                    if item.source == "asura"
+                    else ""
                 ),
                 title=item.title,
                 normalized_title=normalize_title(item.title),
@@ -127,6 +143,8 @@ class CatalogRepository:
         source_series.metadata_json = dict(item.metadata)
         source_series.last_checked_at = now
         source_series.detail_fetched_at = now
+        source_series.observation_version = listing_observation_version(item)
+        source_series.observation_seen_at = now
         if not series.description and item.description:
             series.description = item.description
         if not series.cover_url and item.cover_url:
@@ -317,9 +335,7 @@ class CatalogRepository:
         identities = {
             identity.id: identity
             for identity in session.scalars(
-                select(CatalogSourceSeries).where(
-                    CatalogSourceSeries.id.in_(identity_ids or {-1})
-                )
+                select(CatalogSourceSeries).where(CatalogSourceSeries.id.in_(identity_ids or {-1}))
             )
         }
         candidate_ids = {
@@ -338,9 +354,7 @@ class CatalogRepository:
             if left is None or right is None:
                 continue
             candidate_id = (
-                right.series_id
-                if left.series_id == source_series.series_id
-                else left.series_id
+                right.series_id if left.series_id == source_series.series_id else left.series_id
             )
             evidence = evidence_by_series.get(candidate_id)
             if evidence is None:
@@ -507,6 +521,10 @@ class CatalogRepository:
             release.title = item.title
             release.url = item.url
             release.published_at = item.published_at
+        # Runtime sessions intentionally disable autoflush. Latest-release queries must see
+        # releases created above, otherwise new series remain blank and existing series lag one
+        # observation behind.
+        session.flush()
 
     @staticmethod
     def _recompute_latest(session: Session, series_id: int) -> None:
@@ -526,7 +544,10 @@ class CatalogRepository:
                 select(CatalogChapter, CatalogChapterRelease)
                 .join(CatalogChapterRelease)
                 .where(CatalogChapter.series_id == series_id)
-                .order_by(CatalogChapterRelease.published_at.desc().nullslast(), CatalogChapterRelease.id.desc())
+                .order_by(
+                    CatalogChapterRelease.published_at.desc().nullslast(),
+                    CatalogChapterRelease.id.desc(),
+                )
                 .limit(1)
             ).first()
         selected = numeric or fallback

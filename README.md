@@ -45,13 +45,16 @@ This isolated stack generates two synthetic manga and tiny valid CBZs at runtime
 uses 2,000 database-only series and 25,000 jobs, then removes its disposable volume. No fixture media
 or databases are stored in Git.
 
-Kavita credentials are generated once in `.local/kavita.env` with mode `0600`. The library is
-created automatically and mapped to the tracked-only `storage-v2-stage/kavita-library` projection.
+Kavita credentials are generated once in the ignored project-scoped
+`.local/manga-manager-stage-kavita.env` file with mode `0600` (or the corresponding
+`STAGE_PROJECT` name). The library is created automatically and mapped to the tracked-only
+`storage-v2-stage/kavita-library` projection.
 Use the Operations action or `manga-manager enqueue-kavita-pending` to synchronize existing
 downloaded series. Manga Manager rewrites canonical `ComicInfo.xml`, waits for Kavita's asynchronous
 scan to finish, then uploads the chosen series cover to both the series and every chapter. It also
-imports Kavita chapter progress on each synchronization; the scheduler refreshes tracked series at
-most every ten minutes, while the Operations action requests an immediate refresh.
+imports Kavita chapter progress on each synchronization. The scheduler checks for work every ten
+minutes but coalesces unchanged reading-state refreshes into one bounded batch no more often than
+every six hours; the Operations action requests an immediate refresh.
 
 ## Development
 
@@ -91,6 +94,11 @@ storage by default. Local staging uses 1 GiB (`STAGE_MIN_FREE_BYTES` overrides i
   `export-match-training` without requiring a model.
 - `manga-manager diagnostic-bundle --output diagnostics.json` writes a bounded, credential-redacted
   database/provider/worker/storage snapshot suitable for issue reports.
+- `manga-manager database-audit --json --report database-audit.json` performs a read-only,
+  statement-timeout-bounded integrity and PostgreSQL size/dead-tuple audit. Run it after migrations
+  and after a soak; use `stage-check` separately when every active CBZ must be read.
+- `/livez` checks the web process, `/readyz` checks PostgreSQL readiness, and `/metrics` exposes
+  bounded route, SQL, queue-age, job-duration, and provider-latency measurements.
 
 Legacy SQLite is not an application runtime. `audit-legacy`, `repair-legacy`, `validate-legacy`,
 `migrate-legacy-library`, `audit-catalog-recovery`, `repair-catalog-recovery`, and `import-cbz`

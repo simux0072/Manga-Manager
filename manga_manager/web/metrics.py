@@ -4,9 +4,14 @@ import contextvars
 import threading
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from sqlalchemy import Engine, event
+from sqlalchemy import func, select
+from sqlalchemy.orm import Session
+
+from manga_manager.infrastructure.db_models import ProviderRequestSample, WorkJob
 
 
 @dataclass
@@ -144,3 +149,66 @@ class RequestMetrics:
 
 def _escape(value: str) -> str:
     return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+def render_database_metrics(session: Session) -> str:
+    """Render bounded durable worker/provider metrics shared by every web request."""
+    now = datetime.now(timezone.utc)
+    active = session.execute(
+        select(WorkJob.pool, func.count(), func.min(WorkJob.created_at))
+        .where(WorkJob.status.in_(("queued", "leased", "retry_wait")))
+        .group_by(WorkJob.pool)
+    ).all()
+    completed = session.execute(
+        select(WorkJob.kind, WorkJob.created_at, WorkJob.completed_at)
+        .where(WorkJob.completed_at.is_not(None), WorkJob.completed_at >= now - timedelta(days=1))
+        .order_by(WorkJob.id.desc())
+        .limit(5_000)
+    ).all()
+    samples = session.execute(
+        select(ProviderRequestSample.source, ProviderRequestSample.latency_ms)
+        .where(ProviderRequestSample.created_at >= now - timedelta(hours=1))
+        .order_by(ProviderRequestSample.id.desc())
+        .limit(5_000)
+    ).all()
+    pools: dict[str, tuple[int, float]] = {}
+    for pool, count, created_at in active:
+        pools[pool] = (int(count), max((now - _aware(created_at)).total_seconds(), 0.0))
+    durations: dict[str, list[float]] = {}
+    for kind, created_at, completed_at in completed:
+        if completed_at is not None:
+            durations.setdefault(kind, []).append(
+                max((_aware(completed_at) - _aware(created_at)).total_seconds(), 0.0)
+            )
+    latencies: dict[str, list[int]] = {}
+    for source, latency_ms in samples:
+        latencies.setdefault(source, []).append(max(int(latency_ms), 0))
+    lines = [
+        "# HELP manga_manager_queue_jobs Active jobs by pool.",
+        "# TYPE manga_manager_queue_jobs gauge",
+        "# HELP manga_manager_queue_oldest_age_seconds Age of the oldest active job by pool.",
+        "# TYPE manga_manager_queue_oldest_age_seconds gauge",
+        "# HELP manga_manager_job_duration_seconds Recent mean end-to-end job duration by kind.",
+        "# TYPE manga_manager_job_duration_seconds gauge",
+        "# HELP manga_manager_provider_latency_seconds Recent mean provider request latency.",
+        "# TYPE manga_manager_provider_latency_seconds gauge",
+    ]
+    for pool, (count, age) in sorted(pools.items()):
+        label = _escape(pool)
+        lines.append(f'manga_manager_queue_jobs{{pool="{label}"}} {count}')
+        lines.append(f'manga_manager_queue_oldest_age_seconds{{pool="{label}"}} {age:.3f}')
+    for kind, values in sorted(durations.items()):
+        lines.append(
+            f'manga_manager_job_duration_seconds{{kind="{_escape(kind)}"}} '
+            f"{sum(values) / len(values):.6f}"
+        )
+    for source, values in sorted(latencies.items()):
+        lines.append(
+            f'manga_manager_provider_latency_seconds{{source="{_escape(source)}"}} '
+            f"{sum(values) / len(values) / 1000:.6f}"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _aware(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)

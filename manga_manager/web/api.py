@@ -7,7 +7,7 @@ from collections.abc import Callable
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import String, and_, case, func, or_, select
 from sqlalchemy.orm import Session, aliased, sessionmaker
@@ -25,11 +25,17 @@ from manga_manager.application.kavita_sync import KavitaSyncPlanner
 from manga_manager.application.library_repair import enqueue_library_repair
 from manga_manager.application.match_training import record_training_label
 from manga_manager.application.matching_score import score_candidate_set
+from manga_manager.application.cover_evidence import (
+    ensure_cover_thumbnail,
+    thumbnail_relative_path,
+)
 
 from manga_manager.infrastructure.db_models import (
     CatalogChapter,
     CatalogChapterReadingState,
     CatalogChapterRelease,
+    CatalogCoverAsset,
+    CatalogCoverSignature,
     CatalogMatchDecision,
     CatalogSeries,
     CatalogSeriesAlias,
@@ -66,12 +72,16 @@ def job_state_predicate(states: list[str]):
     if "failed" not in states:
         return WorkJob.status.in_(non_failed)
     later = aliased(WorkJob)
-    unresolved = ~select(later.id).where(
-        later.kind == WorkJob.kind,
-        later.dedupe_key == WorkJob.dedupe_key,
-        later.id > WorkJob.id,
-        later.status == "succeeded",
-    ).exists()
+    unresolved = (
+        ~select(later.id)
+        .where(
+            later.kind == WorkJob.kind,
+            later.dedupe_key == WorkJob.dedupe_key,
+            later.id > WorkJob.id,
+            later.status == "succeeded",
+        )
+        .exists()
+    )
     failed = and_(WorkJob.status == "failed", unresolved)
     return or_(WorkJob.status.in_(non_failed), failed) if non_failed else failed
 
@@ -105,8 +115,7 @@ def utcnow() -> datetime:
 
 def provider_merge_conflicts(session: Session, series_ids: list[int]) -> list[str]:
     identities = session.scalars(
-        select(CatalogSourceSeries)
-        .where(CatalogSourceSeries.series_id.in_(series_ids))
+        select(CatalogSourceSeries).where(CatalogSourceSeries.series_id.in_(series_ids))
     ).all()
     grouped: dict[str, list[CatalogSourceSeries]] = defaultdict(list)
     for identity in identities:
@@ -170,11 +179,8 @@ def pending_match_proposals(session: Session) -> list[dict[str, Any]]:
     grouped: dict[tuple[int, int], dict[str, Any]] = {}
     for decision, left, right in rows:
         if left.series_id == right.series_id:
-            # Canonical merges can make queued source-level decisions obsolete.
-            # Close them atomically so they do not reappear in later reviews.
-            decision.decision = "accepted"
-            decision.decided_by = "canonicalized"
-            decision.decided_at = utcnow()
+            # GET requests remain read-only. Maintenance and merge transactions close obsolete
+            # source-level decisions; until then they are simply omitted from review.
             continue
         key = tuple(sorted((left.series_id, right.series_id)))
         proposal = grouped.get(key)
@@ -191,13 +197,13 @@ def pending_match_proposals(session: Session) -> list[dict[str, Any]]:
             proposal["decision_ids"].append(decision.id)
             if decision.confidence > proposal["decision"].confidence:
                 proposal.update(id=decision.id, decision=decision, left=left, right=right)
-    return sorted(
-        grouped.values(), key=lambda row: (-row["decision"].confidence, row["id"])
-    )
+    return sorted(grouped.values(), key=lambda row: (-row["decision"].confidence, row["id"]))
 
 
 def proposal_blockers(session: Session, series_ids: list[int]) -> list[str]:
-    blockers = [f"provider conflict: {value}" for value in provider_merge_conflicts(session, series_ids)]
+    blockers = [
+        f"provider conflict: {value}" for value in provider_merge_conflicts(session, series_ids)
+    ]
     active = session.scalar(
         select(WorkJob.id)
         .where(
@@ -234,8 +240,9 @@ def create_api_router(
     factory_provider: Callable[[], sessionmaker[Session]],
 ) -> APIRouter:
     router = APIRouter(prefix="/api/v2")
+    storage_root = V2Settings().storage_root
 
-    async def sessions():
+    def sessions():
         with factory_provider()() as session:
             yield session
 
@@ -283,11 +290,56 @@ def create_api_router(
         return len(chapter_ids)
 
     @router.get("/providers")
-    async def providers():
+    def providers():
         return {"items": list(provider_names())}
 
+    @router.get("/covers/{series_id}/{checksum}.webp", include_in_schema=False)
+    def cover_thumbnail(
+        series_id: int,
+        checksum: str,
+        request: Request,
+        session: SessionDep,
+    ):
+        if len(checksum) != 64 or any(character not in "0123456789abcdef" for character in checksum):
+            raise HTTPException(status_code=404, detail="cover not found")
+        asset = session.scalar(
+            select(CatalogCoverAsset)
+            .join(
+                CatalogSourceSeries,
+                CatalogSourceSeries.id == CatalogCoverAsset.source_series_id,
+            )
+            .where(
+                CatalogSourceSeries.series_id == series_id,
+                CatalogCoverAsset.content_checksum == checksum,
+            )
+            .limit(1)
+        )
+        if asset is None:
+            raise HTTPException(status_code=404, detail="cover not found")
+        etag = f'"{checksum}"'
+        cache_headers = {
+            "Cache-Control": "public, max-age=31536000, immutable",
+            "ETag": etag,
+        }
+        if request.headers.get("if-none-match") == etag:
+            return Response(status_code=304, headers=cache_headers)
+        path = storage_root / thumbnail_relative_path(checksum)
+        if not path.is_file():
+            original = storage_root / asset.relative_path
+            if not original.is_file():
+                raise HTTPException(status_code=404, detail="cover not found")
+            try:
+                ensure_cover_thumbnail(original, checksum, storage_root)
+            except (OSError, ValueError):
+                raise HTTPException(status_code=404, detail="cover not found") from None
+        return FileResponse(
+            path,
+            media_type="image/webp",
+            headers=cache_headers,
+        )
+
     @router.get("/discovery")
-    async def discovery(
+    def discovery(
         session: SessionDep,
         q: str = Query(default="", max_length=200),
         source: list[str] = Query(default=[]),
@@ -349,7 +401,7 @@ def create_api_router(
         }
 
     @router.get("/library")
-    async def library(
+    def library(
         session: SessionDep,
         q: str = Query(default="", max_length=200),
         source: list[str] = Query(default=[]),
@@ -406,7 +458,7 @@ def create_api_router(
         }
 
     @router.patch("/series/{series_id}")
-    async def change_series(series_id: int, change: SeriesStateChange, session: SessionDep):
+    def change_series(series_id: int, change: SeriesStateChange, session: SessionDep):
         allowed = {"untracked", *TRACKED_STATES}
         if change.status not in allowed:
             raise HTTPException(422, "invalid series state")
@@ -437,7 +489,7 @@ def create_api_router(
         }
 
     @router.patch("/chapters/{chapter_id}")
-    async def change_chapter(chapter_id: int, change: ChapterStateChange, session: SessionDep):
+    def change_chapter(chapter_id: int, change: ChapterStateChange, session: SessionDep):
         if change.status not in {"unread", "reading", "read"}:
             raise HTTPException(422, "invalid chapter state")
         with session.begin():
@@ -454,7 +506,7 @@ def create_api_router(
         return {"chapter_id": chapter_id, "status": change.status}
 
     @router.post("/series/{series_id}/chapters/read")
-    async def read_all(series_id: int, session: SessionDep):
+    def read_all(series_id: int, session: SessionDep):
         now = utcnow()
         with session.begin():
             series = session.get(CatalogSeries, series_id)
@@ -464,7 +516,7 @@ def create_api_router(
         return {"series_id": series_id, "updated": updated}
 
     @router.get("/updates")
-    async def updates(
+    def updates(
         session: SessionDep,
         cursor: str = Query(default="", max_length=80),
         limit: int = Query(default=20, ge=1, le=40),
@@ -561,13 +613,12 @@ def create_api_router(
         }
 
     @router.get("/matches")
-    async def matches(
+    def matches(
         session: SessionDep,
         cursor: int = Query(default=0, ge=0),
         limit: int = Query(default=24, ge=1, le=100),
     ):
-        with session.begin():
-            proposals = pending_match_proposals(session)
+        proposals = pending_match_proposals(session)
         if cursor:
             start = next(
                 (index + 1 for index, value in enumerate(proposals) if value["id"] == cursor),
@@ -576,9 +627,7 @@ def create_api_router(
         else:
             start = 0
         rows = proposals[start : start + limit]
-        canonical_ids = {
-            source.series_id for row in rows for source in (row["left"], row["right"])
-        }
+        canonical_ids = {source.series_id for row in rows for source in (row["left"], row["right"])}
         canonical = {
             item["id"]: item
             for item in serialize_series(
@@ -588,9 +637,7 @@ def create_api_router(
                 ).all(),
             )
         }
-        source_identity_ids = {
-            source.id for row in rows for source in (row["left"], row["right"])
-        }
+        source_identity_ids = {source.id for row in rows for source in (row["left"], row["right"])}
         latest_by_identity: dict[int, str] = {}
         for source_series_id, display_number in session.execute(
             select(
@@ -598,9 +645,7 @@ def create_api_router(
                 CatalogChapter.display_number,
             )
             .join(CatalogChapter, CatalogChapter.id == CatalogChapterRelease.chapter_id)
-            .where(
-                CatalogChapterRelease.source_series_id.in_(source_identity_ids or {-1})
-            )
+            .where(CatalogChapterRelease.source_series_id.in_(source_identity_ids or {-1}))
             .order_by(
                 CatalogChapterRelease.source_series_id,
                 CatalogChapter.sort_number.desc().nullslast(),
@@ -666,7 +711,7 @@ def create_api_router(
         }
 
     @router.get("/merge-candidates")
-    async def merge_candidates(
+    def merge_candidates(
         session: SessionDep,
         selected_id: list[int] = Query(default=[]),
         anchor_id: int | None = Query(default=None, gt=0),
@@ -687,6 +732,30 @@ def create_api_router(
             row.status not in TRACKED_STATES for row in selected_rows
         ):
             raise HTTPException(404, "selected manga is not in the library")
+        selected_identity_ids = session.scalars(
+            select(CatalogSourceSeries.id).where(CatalogSourceSeries.series_id.in_(selected_ids))
+        ).all()
+        decision_candidate_ids: set[int] = set()
+        if selected_identity_ids:
+            candidate_identity = aliased(CatalogSourceSeries)
+            for candidate_id in session.scalars(
+                select(candidate_identity.series_id)
+                .join(
+                    CatalogMatchDecision,
+                    or_(
+                        and_(
+                            CatalogMatchDecision.left_source_series_id.in_(selected_identity_ids),
+                            CatalogMatchDecision.right_source_series_id == candidate_identity.id,
+                        ),
+                        and_(
+                            CatalogMatchDecision.right_source_series_id.in_(selected_identity_ids),
+                            CatalogMatchDecision.left_source_series_id == candidate_identity.id,
+                        ),
+                    ),
+                )
+                .where(CatalogMatchDecision.decision != "rejected")
+            ):
+                decision_candidate_ids.add(candidate_id)
         query = select(CatalogSeries).where(
             CatalogSeries.id.not_in(selected_ids), CatalogSeries.status.in_(TRACKED_STATES)
         )
@@ -714,7 +783,54 @@ def create_api_router(
                 )
                 .exists()
             )
-        rows = session.scalars(query).all()
+        else:
+            terms = {
+                token
+                for selected in selected_rows
+                for token in selected.normalized_title.split()
+                if len(token) >= 4
+            }
+            selected_bands = {
+                value
+                for row in session.execute(
+                    select(
+                        CatalogCoverSignature.hash_band_0,
+                        CatalogCoverSignature.hash_band_1,
+                        CatalogCoverSignature.hash_band_2,
+                        CatalogCoverSignature.hash_band_3,
+                    ).where(
+                        CatalogCoverSignature.source_series_id.in_(selected_identity_ids or [-1])
+                    )
+                )
+                for value in row
+                if value
+            }
+            shortlist = [CatalogSeries.id.in_(decision_candidate_ids or {-1})]
+            shortlist.extend(CatalogSeries.normalized_title.ilike(f"%{term}%") for term in terms)
+            if selected_bands:
+                cover_identity = aliased(CatalogSourceSeries)
+                cover_signature = aliased(CatalogCoverSignature)
+                shortlist.append(
+                    select(cover_identity.id)
+                    .join(
+                        cover_signature,
+                        cover_signature.source_series_id == cover_identity.id,
+                    )
+                    .where(
+                        cover_identity.series_id == CatalogSeries.id,
+                        or_(
+                            cover_signature.hash_band_0.in_(selected_bands),
+                            cover_signature.hash_band_1.in_(selected_bands),
+                            cover_signature.hash_band_2.in_(selected_bands),
+                            cover_signature.hash_band_3.in_(selected_bands),
+                        ),
+                    )
+                    .exists()
+                )
+            query = query.where(or_(*shortlist))
+        rows = session.scalars(
+            query.order_by(CatalogSeries.normalized_title, CatalogSeries.id).limit(500)
+        ).all()
 
         identity_rows = session.scalars(
             select(CatalogSourceSeries).where(
@@ -787,7 +903,7 @@ def create_api_router(
         return {"items": items, "next_cursor": next_cursor}
 
     @router.post("/series/merge-preview")
-    async def preview_series_merge(change: MergeSeriesChange, session: SessionDep):
+    def preview_series_merge(change: MergeSeriesChange, session: SessionDep):
         ids = sorted(set(change.series_ids))
         provider_count = len(provider_names())
         if not 2 <= len(ids) <= provider_count:
@@ -806,7 +922,9 @@ def create_api_router(
         for series_id, provider in source_rows:
             providers[series_id].add(provider)
         conflicts = provider_merge_conflicts(session, ids)
-        priority = {name: len(SOURCE_PRIORITY) - index for index, name in enumerate(SOURCE_PRIORITY)}
+        priority = {
+            name: len(SOURCE_PRIORITY) - index for index, name in enumerate(SOURCE_PRIORITY)
+        }
         target = max(
             rows,
             key=lambda row: (
@@ -830,7 +948,7 @@ def create_api_router(
         }
 
     @router.post("/series/merge")
-    async def merge_series(change: MergeSeriesChange, session: SessionDep):
+    def merge_series(change: MergeSeriesChange, session: SessionDep):
         if change.confirmation != "MERGE":
             raise HTTPException(422, "MERGE confirmation required")
         from manga_manager.web.app import merge_canonical_series
@@ -862,7 +980,7 @@ def create_api_router(
         return {"target_id": target_id, "merged_ids": sorted(set(change.series_ids))}
 
     @router.post("/matches/{decision_id}")
-    async def decide_match(decision_id: int, change: MatchChange, session: SessionDep):
+    def decide_match(decision_id: int, change: MatchChange, session: SessionDep):
         if change.decision not in {"accepted", "rejected"}:
             raise HTTPException(422, "invalid match decision")
         if change.decision == "accepted" and change.confirmation != "MERGE":
@@ -901,12 +1019,14 @@ def create_api_router(
         return {"id": decision_id, "decision": change.decision}
 
     @router.post("/match-batch/preview")
-    async def preview_match_batch(change: BatchMatchChange, session: SessionDep):
+    def preview_match_batch(change: BatchMatchChange, session: SessionDep):
         with session.begin():
             proposals = pending_match_proposals(session)
-        selected = proposals if change.entire_queue else [
-            row for row in proposals if row["id"] in set(change.ids)
-        ]
+        selected = (
+            proposals
+            if change.entire_queue
+            else [row for row in proposals if row["id"] in set(change.ids)]
+        )
         items = [
             {
                 "id": row["id"],
@@ -922,8 +1042,11 @@ def create_api_router(
         }
 
     @router.post("/match-batch")
-    async def decide_match_batch(change: BatchMatchChange, session: SessionDep):
-        if (not change.ids and not change.entire_queue) or change.decision not in {"accepted", "rejected"}:
+    def decide_match_batch(change: BatchMatchChange, session: SessionDep):
+        if (not change.ids and not change.entire_queue) or change.decision not in {
+            "accepted",
+            "rejected",
+        }:
             raise HTTPException(422, "select matches and a valid decision")
         if change.decision == "accepted" and change.confirmation != "MERGE":
             raise HTTPException(422, "MERGE confirmation required")
@@ -931,16 +1054,19 @@ def create_api_router(
 
         with session.begin():
             proposals = pending_match_proposals(session)
-            selected = proposals if change.entire_queue else [
-                row for row in proposals if row["id"] in set(change.ids)
-            ]
+            selected = (
+                proposals
+                if change.entire_queue
+                else [row for row in proposals if row["id"] in set(change.ids)]
+            )
             applied: list[int] = []
             blocked: list[dict[str, Any]] = []
             components = connected_proposal_components(selected)
             for component in components:
                 reasons = (
                     proposal_blockers(session, component["series_ids"])
-                    if change.decision == "accepted" else []
+                    if change.decision == "accepted"
+                    else []
                 )
                 if reasons:
                     blocked.extend(
@@ -974,7 +1100,7 @@ def create_api_router(
         return {"ids": applied, "blocked": blocked, "decision": change.decision}
 
     @router.get("/jobs")
-    async def jobs(
+    def jobs(
         session: SessionDep,
         state: list[str] = Query(default=[]),
         cursor: int = Query(default=0, ge=0),
@@ -992,16 +1118,24 @@ def create_api_router(
         }
 
     @router.get("/workload-cycle")
-    async def workload_cycle(session: SessionDep):
+    def workload_cycle(session: SessionDep):
         cycle = session.scalar(
-            select(WorkloadCycle).order_by(
-                (WorkloadCycle.status == "active").desc(), WorkloadCycle.id.desc()
-            ).limit(1)
+            select(WorkloadCycle)
+            .order_by((WorkloadCycle.status == "active").desc(), WorkloadCycle.id.desc())
+            .limit(1)
         )
         if cycle is None:
-            return {"id": None, "status": "settled", "total": 0, "successful": 0,
-                    "failed": 0, "cancelled": 0, "superseded": 0,
-                    "remaining": 0, "added": 0}
+            return {
+                "id": None,
+                "status": "settled",
+                "total": 0,
+                "successful": 0,
+                "failed": 0,
+                "cancelled": 0,
+                "superseded": 0,
+                "remaining": 0,
+                "added": 0,
+            }
         active_units = int(
             session.scalar(
                 select(func.coalesce(func.sum(WorkJob.logical_units), 0)).where(
@@ -1039,7 +1173,7 @@ def create_api_router(
         }
 
     @router.get("/job-groups")
-    async def job_groups(
+    def job_groups(
         session: SessionDep,
         state: list[str] = Query(default=[]),
         cursor: str = Query(default="", max_length=200),
@@ -1050,17 +1184,11 @@ def create_api_router(
             WorkJob.kind + ":" + func.cast(WorkJob.id, String),
         ).label("group_key")
         running = func.sum(case((WorkJob.status == "leased", 1), else_=0)).label("running")
-        succeeded = func.sum(case((WorkJob.status == "succeeded", 1), else_=0)).label(
-            "succeeded"
-        )
+        succeeded = func.sum(case((WorkJob.status == "succeeded", 1), else_=0)).label("succeeded")
         failed = func.sum(case((WorkJob.status == "failed", 1), else_=0)).label("failed")
-        cancelled = func.sum(case((WorkJob.status == "cancelled", 1), else_=0)).label(
-            "cancelled"
-        )
+        cancelled = func.sum(case((WorkJob.status == "cancelled", 1), else_=0)).label("cancelled")
         queued = func.sum(case((WorkJob.status == "queued", 1), else_=0)).label("queued")
-        retrying = func.sum(case((WorkJob.status == "retry_wait", 1), else_=0)).label(
-            "retry_wait"
-        )
+        retrying = func.sum(case((WorkJob.status == "retry_wait", 1), else_=0)).label("retry_wait")
         priority = func.min(WorkJob.priority)
         available_at = func.min(WorkJob.available_at)
         last_id = func.max(WorkJob.id)
@@ -1082,14 +1210,23 @@ def create_api_router(
         query = query.group_by(key)
         if cursor:
             cursor_running, cursor_priority, cursor_available, cursor_id = decode_job_cursor(cursor)
-            query = query.having(or_(
-                running < cursor_running,
-                and_(running == cursor_running, priority > cursor_priority),
-                and_(running == cursor_running, priority == cursor_priority,
-                     available_at > cursor_available),
-                and_(running == cursor_running, priority == cursor_priority,
-                     available_at == cursor_available, last_id < cursor_id),
-            ))
+            query = query.having(
+                or_(
+                    running < cursor_running,
+                    and_(running == cursor_running, priority > cursor_priority),
+                    and_(
+                        running == cursor_running,
+                        priority == cursor_priority,
+                        available_at > cursor_available,
+                    ),
+                    and_(
+                        running == cursor_running,
+                        priority == cursor_priority,
+                        available_at == cursor_available,
+                        last_id < cursor_id,
+                    ),
+                )
+            )
         rows = session.execute(
             query.order_by(running.desc(), priority, available_at, last_id.desc()).limit(limit)
         ).all()
@@ -1113,8 +1250,7 @@ def create_api_router(
             child_key = child.group_key or f"{child.kind}:{child.id}"
             representatives.setdefault(child_key, child)
         serialized_representatives = {
-            item["id"]: item
-            for item in serialize_jobs(session, list(representatives.values()))
+            item["id"]: item for item in serialize_jobs(session, list(representatives.values()))
         }
         all_status_counts: dict[str, dict[str, int]] = defaultdict(dict)
         for child_key, status, count in session.execute(
@@ -1136,9 +1272,7 @@ def create_api_router(
         plans = {
             plan.series_id: plan
             for plan in session.scalars(
-                select(SeriesDownloadPlan).where(
-                    SeriesDownloadPlan.series_id.in_(plan_ids or {-1})
-                )
+                select(SeriesDownloadPlan).where(SeriesDownloadPlan.series_id.in_(plan_ids or {-1}))
             )
         }
         items = []
@@ -1163,8 +1297,7 @@ def create_api_router(
             group_status_counts = all_status_counts[row.group_key]
             total = sum(group_status_counts.values())
             done = sum(
-                group_status_counts.get(value, 0)
-                for value in ("succeeded", "failed", "cancelled")
+                group_status_counts.get(value, 0) for value in ("succeeded", "failed", "cancelled")
             )
             successful = group_status_counts.get("succeeded", 0)
             failed_count = group_status_counts.get("failed", 0)
@@ -1182,45 +1315,53 @@ def create_api_router(
                     successful = plan.satisfied_chapters
                     failed_count = plan.attention_chapters
                     cancelled_count = 0
-            items.append({
-                "key": row.group_key,
-                "kind": "source_pull" if is_pull_group else representative.kind,
-                "source": representative.source,
-                "title": (
-                    f"{representative.source.replace('_', ' ').title()} catalog pull"
-                    if is_pull_group
-                    else "Normalize library metadata"
-                    if representative.kind == "library_repair"
-                    else "Synchronize downloaded manga with Kavita"
-                    if representative.kind == "kavita_sync"
-                    else "Build cover matching evidence"
-                    if representative.kind == "cover_backfill"
-                    else "Maintenance and health checks"
-                    if representative.kind == "maintenance"
-                    else serialized["context"].get("title") or serialized["description"]
-                ),
-                "cover_url": serialized["context"].get("cover_url", ""),
-                "task_count": row.task_count,
-                "status_counts": status_counts,
-                "progress": {"current": done, "total": total,
-                             "percent": round(done * 100 / total) if total else None,
-                             "successful": successful,
-                             "failed": failed_count,
-                             "cancelled": cancelled_count},
-                "representative": serialized,
-                "single": row.task_count == 1,
-            })
+            items.append(
+                {
+                    "key": row.group_key,
+                    "kind": "source_pull" if is_pull_group else representative.kind,
+                    "source": representative.source,
+                    "title": (
+                        f"{representative.source.replace('_', ' ').title()} catalog pull"
+                        if is_pull_group
+                        else "Normalize library metadata"
+                        if representative.kind == "library_repair"
+                        else "Synchronize downloaded manga with Kavita"
+                        if representative.kind == "kavita_sync"
+                        else "Build cover matching evidence"
+                        if representative.kind == "cover_backfill"
+                        else "Maintenance and health checks"
+                        if representative.kind == "maintenance"
+                        else serialized["context"].get("title") or serialized["description"]
+                    ),
+                    "cover_url": serialized["context"].get("cover_url", ""),
+                    "task_count": row.task_count,
+                    "status_counts": status_counts,
+                    "progress": {
+                        "current": done,
+                        "total": total,
+                        "percent": round(done * 100 / total) if total else None,
+                        "successful": successful,
+                        "failed": failed_count,
+                        "cancelled": cancelled_count,
+                    },
+                    "representative": serialized,
+                    "single": row.task_count == 1,
+                }
+            )
         next_cursor = (
             encode_job_cursor(
-                int(rows[-1].running or 0), rows[-1].priority,
-                rows[-1].available_at, rows[-1].last_id,
+                int(rows[-1].running or 0),
+                rows[-1].priority,
+                rows[-1].available_at,
+                rows[-1].last_id,
             )
-            if len(rows) == limit else None
+            if len(rows) == limit
+            else None
         )
         return {"items": items, "next_cursor": next_cursor}
 
     @router.get("/job-groups/{group_key:path}/children")
-    async def job_group_children(
+    def job_group_children(
         group_key: str,
         session: SessionDep,
         state: list[str] = Query(default=[]),
@@ -1233,31 +1374,45 @@ def create_api_router(
         if cursor:
             running, priority, available, job_id = decode_job_cursor(cursor)
             is_running = case((WorkJob.status == "leased", 1), else_=0)
-            query = query.where(or_(
-                is_running < running,
-                and_(is_running == running, WorkJob.priority > priority),
-                and_(is_running == running, WorkJob.priority == priority,
-                     WorkJob.available_at > available),
-                and_(is_running == running, WorkJob.priority == priority,
-                     WorkJob.available_at == available, WorkJob.id > job_id),
-            ))
+            query = query.where(
+                or_(
+                    is_running < running,
+                    and_(is_running == running, WorkJob.priority > priority),
+                    and_(
+                        is_running == running,
+                        WorkJob.priority == priority,
+                        WorkJob.available_at > available,
+                    ),
+                    and_(
+                        is_running == running,
+                        WorkJob.priority == priority,
+                        WorkJob.available_at == available,
+                        WorkJob.id > job_id,
+                    ),
+                )
+            )
         rows = session.scalars(
             query.order_by(
-                (WorkJob.status == "leased").desc(), WorkJob.priority,
-                WorkJob.available_at, WorkJob.id,
+                (WorkJob.status == "leased").desc(),
+                WorkJob.priority,
+                WorkJob.available_at,
+                WorkJob.id,
             ).limit(limit)
         ).all()
         next_cursor = (
             encode_job_cursor(
-                int(rows[-1].status == "leased"), rows[-1].priority,
-                rows[-1].available_at, rows[-1].id,
+                int(rows[-1].status == "leased"),
+                rows[-1].priority,
+                rows[-1].available_at,
+                rows[-1].id,
             )
-            if len(rows) == limit else None
+            if len(rows) == limit
+            else None
         )
         return {"items": serialize_jobs(session, rows), "next_cursor": next_cursor}
 
     @router.get("/activity")
-    async def activity(
+    def activity(
         session: SessionDep,
         event_type: list[str] = Query(default=[]),
         source: list[str] = Query(default=[]),
@@ -1292,15 +1447,13 @@ def create_api_router(
         }
 
     @router.get("/operations")
-    async def operations(session: SessionDep):
+    def operations(session: SessionDep):
         counts = dict(
             session.execute(select(WorkJob.status, func.count()).group_by(WorkJob.status)).all()
         )
         counts["failed"] = int(
             session.scalar(
-                select(func.count())
-                .select_from(WorkJob)
-                .where(job_state_predicate(["failed"]))
+                select(func.count()).select_from(WorkJob).where(job_state_predicate(["failed"]))
             )
             or 0
         )
@@ -1454,7 +1607,7 @@ def create_api_router(
         }
 
     @router.post("/sources/{source}/pull")
-    async def pull_source(source: str, session: SessionDep):
+    def pull_source(source: str, session: SessionDep):
         if source not in provider_names():
             raise HTTPException(422, "invalid source")
         with session.begin():
@@ -1468,7 +1621,7 @@ def create_api_router(
         return {"job": serialize_jobs(session, [job])[0]}
 
     @router.post("/probe")
-    async def probe(session: SessionDep):
+    def probe(session: SessionDep):
         with session.begin():
             job, _created = JobQueue().enqueue(
                 session,
@@ -1481,17 +1634,18 @@ def create_api_router(
         return {"job": serialize_jobs(session, [job])[0]}
 
     @router.post("/operations/kavita-sync")
-    async def sync_pending_kavita(session: SessionDep, limit: int = Query(100, ge=1, le=500)):
+    def sync_pending_kavita(session: SessionDep, limit: int = Query(100, ge=1, le=500)):
         with session.begin():
             pending, created = KavitaSyncPlanner().enqueue_pending(
                 session,
                 limit=limit,
                 reading_refresh_after=timedelta(seconds=0),
+                batch=True,
             )
         return {"pending": pending, "created": created}
 
     @router.post("/jobs/{job_id}/retry")
-    async def retry_job(job_id: int, session: SessionDep):
+    def retry_job(job_id: int, session: SessionDep):
         with session.begin():
             job = session.get(WorkJob, job_id)
             if job is None or job.status not in {"failed", "cancelled"}:
@@ -1572,6 +1726,29 @@ def serialize_series(
     session: Session, rows: list[CatalogSeries], include_progress: bool = False
 ) -> list[dict[str, Any]]:
     ids = [row.id for row in rows]
+    cover_assets: dict[int, str] = {}
+    if ids:
+        priority = {source: index for index, source in enumerate(SOURCE_PRIORITY)}
+        candidates = session.execute(
+            select(
+                CatalogSourceSeries.series_id,
+                CatalogSourceSeries.source,
+                CatalogCoverAsset.content_checksum,
+            )
+            .join(
+                CatalogCoverAsset,
+                CatalogCoverAsset.source_series_id == CatalogSourceSeries.id,
+            )
+            .where(CatalogSourceSeries.series_id.in_(ids))
+        ).all()
+        for series_id, source, checksum in sorted(
+            candidates,
+            key=lambda value: (value[0], priority.get(value[1], len(priority))),
+        ):
+            cover_assets.setdefault(
+                series_id,
+                f"/api/v2/covers/{series_id}/{checksum}.webp",
+            )
     sources: dict[int, list[dict[str, str]]] = defaultdict(list)
     for source in session.scalars(
         select(CatalogSourceSeries)
@@ -1616,7 +1793,7 @@ def serialize_series(
             "id": row.id,
             "title": row.title,
             "description": row.description,
-            "cover_url": row.cover_url,
+            "cover_url": cover_assets.get(row.id, row.cover_url),
             "status": row.status,
             "integrity_state": row.integrity_state,
             "latest_chapter": row.latest_release_number,
@@ -1668,6 +1845,9 @@ def serialize_jobs(session: Session, rows: list[WorkJob]) -> list[dict[str, Any]
         for row in rows
         if row.kind in {"library_repair", "kavita_sync"} and row.payload.get("series_id")
     }
+    for row in rows:
+        if row.kind == "kavita_sync":
+            series_ids.update(int(value) for value in row.payload.get("series_ids", []) if value)
     series_context = {
         series.id: {
             "series_id": series.id,
@@ -1707,11 +1887,16 @@ def serialize_jobs(session: Session, rows: list[WorkJob]) -> list[dict[str, Any]
         elif row.kind == "kavita_sync":
             series_id = int(row.payload.get("series_id", 0))
             context = series_context.get(series_id, {})
-            description = (
-                f"Synchronize {context['title']} with Kavita"
-                if context
-                else "Synchronize downloaded manga with Kavita"
-            )
+            batch_ids = [int(value) for value in row.payload.get("series_ids", []) if value]
+            if batch_ids:
+                context = series_context.get(batch_ids[0], {})
+                description = f"Synchronize {len(batch_ids)} manga with Kavita"
+            else:
+                description = (
+                    f"Synchronize {context['title']} with Kavita"
+                    if context
+                    else "Synchronize downloaded manga with Kavita"
+                )
         elif row.kind == "library_repair":
             series_id = int(row.payload.get("series_id", 0))
             context = series_context.get(series_id, {})
@@ -1721,7 +1906,9 @@ def serialize_jobs(session: Session, rows: list[WorkJob]) -> list[dict[str, Any]
                 else f"Normalize library metadata · series #{series_id or '?'}"
             )
         elif row.kind == "cover_backfill":
-            description = f"Build cover evidence · source series #{row.payload.get('source_series_id', '?')}"
+            description = (
+                f"Build cover evidence · source series #{row.payload.get('source_series_id', '?')}"
+            )
         elif row.kind == "maintenance":
             action = str(row.payload.get("action", ""))
             if action.startswith("provider_probe_"):

@@ -6,9 +6,12 @@ from collections.abc import Mapping
 from contextlib import suppress
 from datetime import timedelta
 
+import psycopg
+
 from manga_manager.application.job_handlers import JobHandler
 from manga_manager.domain.jobs import JobKind
 from manga_manager.infrastructure.worker_registry import WorkerRegistry
+from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.settings import V2Settings
 from manga_manager.worker.runtime import JobWorker, SessionFactory, WorkerSettings
 
@@ -30,14 +33,17 @@ class WorkerService:
         self.handlers = dict(handlers)
         self.settings = settings
         self.registry = registry or WorkerRegistry()
+        self.queue = JobQueue()
         self.pools = pools
 
     async def run(self, stop: asyncio.Event) -> None:
         specs = self._pool_specs()
+        wakeups = {pool: asyncio.Event() for _slot, pool, _kinds in specs}
         tasks = [
-            asyncio.create_task(self._run_slot(slot, pool, kinds, stop))
+            asyncio.create_task(self._run_slot(slot, pool, kinds, stop, wakeups[pool]))
             for slot, pool, kinds in specs
         ]
+        listener = asyncio.create_task(self._listen_for_jobs(stop, wakeups))
         await stop.wait()
         grace = self.settings.worker_shutdown_grace_seconds
         try:
@@ -47,6 +53,8 @@ class WorkerService:
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+        listener.cancel()
+        await asyncio.gather(listener, return_exceptions=True)
 
     def _pool_specs(self) -> list[tuple[int, str, set[JobKind]]]:
         requested = [
@@ -96,7 +104,12 @@ class WorkerService:
         return specs
 
     async def _run_slot(
-        self, slot: int, pool: str, kinds: set[JobKind], stop: asyncio.Event
+        self,
+        slot: int,
+        pool: str,
+        kinds: set[JobKind],
+        stop: asyncio.Event,
+        wakeup: asyncio.Event,
     ) -> None:
         worker_id = f"{self.settings.worker_id}-{pool.replace(':', '-')}-{slot}"
         with self.session_factory() as session, session.begin():
@@ -110,6 +123,7 @@ class WorkerService:
             owner=worker_id,
             session_factory=self.session_factory,
             handlers=self.handlers,
+            queue=self.queue,
             claim_kinds=kinds.intersection(self.handlers),
             claim_pools={pool},
             settings=WorkerSettings(
@@ -122,13 +136,58 @@ class WorkerService:
             ),
         )
         try:
-            await runtime.run_forever(stop)
+            await runtime.run_forever(stop, wakeup)
         finally:
             heartbeat.cancel()
             with suppress(asyncio.CancelledError):
                 await heartbeat
             with self.session_factory() as session, session.begin():
                 self.registry.heartbeat(session, worker_id=worker_id, status="stopped")
+
+    async def _listen_for_jobs(
+        self,
+        stop: asyncio.Event,
+        wakeups: Mapping[str, asyncio.Event],
+    ) -> None:
+        """Use one async LISTEN socket per worker process with polling as recovery."""
+        with self.session_factory() as session:
+            bind = session.get_bind()
+            url = getattr(bind, "url", None)
+        if url is None or bind.dialect.name != "postgresql":
+            return
+        connect = {
+            "host": url.host or "localhost",
+            "port": url.port or 5432,
+            "dbname": url.database or "",
+            "user": url.username or "",
+            "password": url.password or "",
+            "connect_timeout": 10,
+            "application_name": f"{self.settings.worker_id}-listener",
+        }
+        while not stop.is_set():
+            try:
+                connection = await psycopg.AsyncConnection.connect(**connect, autocommit=True)
+                async with connection:
+                    await connection.execute("LISTEN manga_manager_jobs")
+                    async for notification in connection.notifies():
+                        wakeup = wakeups.get(notification.payload)
+                        if wakeup is not None:
+                            wakeup.set()
+                        else:
+                            # Unknown/legacy pool names are rare and should not
+                            # wait for the recovery poll after a rolling upgrade.
+                            for event in wakeups.values():
+                                event.set()
+                        if stop.is_set():
+                            return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("job notification listener failed; polling remains active")
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=10)
+                except TimeoutError:
+                    continue
 
     async def _heartbeat(self, worker_id: str, stop: asyncio.Event) -> None:
         interval = max(5.0, self.settings.worker_heartbeat_seconds / 2)

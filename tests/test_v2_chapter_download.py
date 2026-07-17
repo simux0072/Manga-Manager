@@ -163,7 +163,7 @@ async def test_download_handler_keeps_database_closed_and_materializes_cbz(
         storage=store,
         adapter_factory=lambda _source: adapter,
     )
-    await handler(context)
+    await asyncio.wait_for(handler(context), timeout=5)
     assert adapter.closed is True
 
     with sessions() as session:

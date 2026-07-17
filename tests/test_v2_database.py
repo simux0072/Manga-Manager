@@ -87,7 +87,7 @@ def test_v2_migration_builds_job_constraints_and_indexes(tmp_path: Path) -> None
     sessions = create_session_factory(engine)
     with sessions() as session:
         version = session.scalar(text("SELECT version_num FROM alembic_version"))
-    assert version == "0018_workflow_progress_identity"
+    assert version == "0019_latest_release_integrity"
 
 
 def test_catalog_recovery_migration_downgrades_and_reapplies_on_sqlite(tmp_path: Path) -> None:
@@ -103,5 +103,5 @@ def test_catalog_recovery_migration_downgrades_and_reapplies_on_sqlite(tmp_path:
 
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0018_workflow_progress_identity"
+            "0019_latest_release_integrity"
         )

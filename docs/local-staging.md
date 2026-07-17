@@ -41,9 +41,13 @@ live sources, two generated manga, and four tiny generated CBZs. `scale-check` u
 temporary project on port 18002, stops its worker before inserting 2,000 series and 25,000 jobs,
 checks cursor completeness/grouping/latency and per-route SQL-query ceilings, and always tears
 itself down. Every HTTP response includes `Server-Timing` and `X-SQL-Query-Count`; `/metrics`
-provides bounded Prometheus-compatible request, duration, SQL, and response-size counters.
+provides bounded Prometheus-compatible request, duration, SQL, response-size, queue-age,
+job-duration, and provider-latency counters. `/livez` is process-only and `/readyz` verifies the
+database; `/healthz` remains a readiness-compatible alias.
 The small check also downloads each tracked fixture's series and chapter covers from Kavita and
 requires their response bytes to match, rather than trusting only Manga Manager's stored checksums.
+`scripts/test-environment.sh up` rebuilds its application image by default so it cannot validate
+stale code; set `TEST_ENV_BUILD=false` only when restarting an unchanged checkout.
 Kavita is temporarily pinned to `jvmilazz0/kavita:0.8.9` because `0.9.0.2` cannot initialize an
 empty local-test database reliably. This isolated instance is not public-facing. Set `KAVITA_IMAGE`
 explicitly to retest a future fixed release before updating the pin.
@@ -63,11 +67,18 @@ scripts/kavita-local.sh status
 scripts/kavita-local.sh down
 ```
 
-Credentials are stored in ignored `.local/kavita.env` with mode `0600`. Manga Manager is exposed
-on port 18000 and Kavita on port 15000. Kavita reads only `kavita-library/`; untracked series are
-removed from that projection while content-addressed blobs remain intact. `STAGE_MIN_FREE_BYTES`
-overrides the 1 GiB staging reserve. Web readiness retries quietly for 120 seconds; set
-`STAGE_WEB_WAIT_ATTEMPTS` to a larger number on unusually slow storage.
+Credentials default to the project-scoped ignored file
+`.local/<STAGE_PROJECT>-kavita.env`; an existing legacy `.local/kavita.env` remains supported. If the
+disposable Kavita volume remains but its ignored credentials file was deleted, `up` detects
+the administrator mismatch and recreates only the Kavita config volume. It preserves PostgreSQL,
+content-addressed blobs, and both manga projection trees. When a credentials file exists, an
+authentication failure remains non-destructive; explicitly reset test metadata with
+`scripts/kavita-local.sh reset-config --yes` before running `up` again.
+
+Manga Manager is exposed on port 18000 and Kavita on port 15000. Kavita reads only
+`kavita-library/`; untracked series are removed from that projection while content-addressed blobs
+remain intact. `STAGE_MIN_FREE_BYTES` overrides the 1 GiB staging reserve. Web readiness retries
+quietly for 120 seconds; set `STAGE_WEB_WAIT_ATTEMPTS` to a larger number on unusually slow storage.
 
 `KAVITA_WAIT_SECONDS` controls the provisioning readiness deadline (900 seconds by default for
 mechanical disks).
@@ -117,6 +128,17 @@ from the web container for a stable result. Failure output includes counts and a
 category by default. Pass `--full-details` only when a complete machine-readable failure manifest is
 needed.
 
+Before the archive scan, run the bounded relational audit without touching CBZ contents:
+
+```bash
+docker exec manga-manager-stage-worker uv run --frozen manga-manager database-audit \
+  --json --report /tmp/database-audit.json
+```
+
+It checks migration `0019` aggregates, provider uniqueness, projections, reading state, leases,
+permits, reservations, workload cycles, source hygiene, and PostgreSQL table/index/dead-tuple
+statistics under a short statement timeout.
+
 Before deleting a staging catalog, use the preview-first reset workflow:
 
 ```bash
@@ -154,7 +176,7 @@ byte-for-byte with the IDs shown by Kavita's API:
 
 ```bash
 set -a
-. .local/kavita.env
+. .local/manga-manager-stage-kavita.env
 set +a
 UV_CACHE_DIR=/tmp/uv-cache uv run python scripts/kavita-cover-check.py \
   --url http://127.0.0.1:15000 --api-key "$KAVITA_API_KEY" \

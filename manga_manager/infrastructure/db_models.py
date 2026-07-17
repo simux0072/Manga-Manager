@@ -161,7 +161,11 @@ class JobDailyAggregate(JobBase):
     __tablename__ = "job_daily_aggregate"
     __table_args__ = (
         UniqueConstraint(
-            "day", "kind", "source", "status", "error_code",
+            "day",
+            "kind",
+            "source",
+            "status",
+            "error_code",
             name="uq_job_daily_aggregate_bucket",
         ),
         Index("ix_job_daily_aggregate_day", "day"),
@@ -351,6 +355,10 @@ class CatalogSourceSeries(JobBase):
     detail_fetched_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    observation_version: Mapped[str] = mapped_column(String(100), default="")
+    observation_seen_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
 
 class CatalogAlternateSourceListing(JobBase):
@@ -411,14 +419,16 @@ class CatalogCoverAsset(JobBase):
 
 class CatalogCoverSignature(JobBase):
     __tablename__ = "cover_signature_v2"
-    __table_args__ = (
-        Index("ix_cover_signature_algorithm", "algorithm_version"),
-    )
+    __table_args__ = (Index("ix_cover_signature_algorithm", "algorithm_version"),)
 
     source_series_id: Mapped[int] = mapped_column(
         ForeignKey("source_series_v2.id", ondelete="CASCADE"), primary_key=True
     )
     algorithm_version: Mapped[str] = mapped_column(String(50))
+    hash_band_0: Mapped[str] = mapped_column(String(16), default="", index=True)
+    hash_band_1: Mapped[str] = mapped_column(String(16), default="", index=True)
+    hash_band_2: Mapped[str] = mapped_column(String(16), default="", index=True)
+    hash_band_3: Mapped[str] = mapped_column(String(16), default="", index=True)
     feature_json: Mapped[dict[str, Any]] = mapped_column(
         JSON().with_variant(JSONB(none_as_null=True), "postgresql"), default=dict
     )

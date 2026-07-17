@@ -17,14 +17,32 @@ def create_database_engine(
     database_url: str,
     *,
     allow_sqlite_for_tests: bool = False,
+    role: str = "cli",
 ) -> Engine:
     if not database_url.startswith("postgresql+") and not allow_sqlite_for_tests:
         raise ValueError("the v2 runtime requires a PostgreSQL database URL")
-    connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
+    if database_url.startswith("sqlite"):
+        connect_args = {"check_same_thread": False}
+        pool_options = {}
+    else:
+        connect_args = {
+            "connect_timeout": 10,
+            "application_name": f"manga-manager-{role}",
+            "options": "-c statement_timeout=30000 -c lock_timeout=5000",
+        }
+        pool_size = {"web": 4, "worker": 12, "cli": 2}.get(role, 2)
+        pool_options = {
+            "pool_size": pool_size,
+            "max_overflow": 2,
+            "pool_timeout": 10,
+            "pool_recycle": 1800,
+            "pool_use_lifo": True,
+        }
     return create_engine(
         database_url,
         connect_args=connect_args,
         pool_pre_ping=True,
+        **pool_options,
     )
 
 

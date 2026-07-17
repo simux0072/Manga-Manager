@@ -3,7 +3,10 @@ from __future__ import annotations
 import importlib.util
 import os
 import subprocess
+import urllib.error
 from pathlib import Path
+
+import pytest
 
 from manga_manager.application.cbz_import import read_comic_info
 from manga_manager.infrastructure.storage import ContentAddressedStorage
@@ -179,6 +182,39 @@ def test_kavita_launcher_preserves_pending_password() -> None:
     launcher = (ROOT / "scripts" / "kavita-local.sh").read_text()
 
     assert "$project-kavita-pending.env" in launcher
+    assert "$state_dir/$project-kavita.env" in launcher
+    assert 'elif [ -f "$legacy_env_file" ]' in launcher
     assert "umask 077" in launcher
     assert 'rm -f "$pending_env"' in launcher
     assert "KAVITA_WAIT_SECONDS:-900" in launcher
+    assert '[ "$provision_status" -eq 42 ] && [ "$had_credentials" = false ]' in launcher
+    assert 'docker volume rm "$volume"' in launcher
+    assert 'KAVITA_BUILD:-false' in launcher
+
+
+def test_isolated_environment_rebuilds_the_test_image_by_default() -> None:
+    launcher = (ROOT / "scripts" / "test-environment.sh").read_text()
+
+    assert 'KAVITA_BUILD="${TEST_ENV_BUILD:-true}" scripts/kavita-local.sh up' in launcher
+
+
+def test_kavita_setup_classifies_persistent_admin_mismatch(monkeypatch) -> None:
+    setup = load_kavita_setup_module()
+
+    monkeypatch.setattr(setup, "WAIT_SECONDS", 1)
+    monkeypatch.setattr(
+        setup,
+        "request",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            urllib.error.HTTPError(
+                url="http://kavita/api/Account/login",
+                code=401,
+                msg="Unauthorized",
+                hdrs=None,
+                fp=None,
+            )
+        ),
+    )
+
+    with pytest.raises(setup.CredentialMismatchError, match="different administrator"):
+        setup.main()

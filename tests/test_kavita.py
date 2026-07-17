@@ -19,7 +19,7 @@ class FakeResponse:
 class FakeAsyncClient:
     request = None
 
-    def __init__(self, timeout):
+    def __init__(self, timeout, **_options):
         self.timeout = timeout
 
     async def __aenter__(self):
@@ -50,7 +50,7 @@ async def test_kavita_client_uses_x_api_key(monkeypatch):
 class FakeFullAsyncClient:
     requests = []
 
-    def __init__(self, timeout):
+    def __init__(self, timeout, **_options):
         self.timeout = timeout
 
     async def __aenter__(self):

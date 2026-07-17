@@ -14,6 +14,7 @@ from manga_manager.infrastructure.db_models import (
     ProviderPolicy,
     ProviderRequestSample,
 )
+from manga_manager.infrastructure.bounded_executor import AsyncBoundedExecutor
 from manga_manager.worker.runtime import SessionFactory
 
 
@@ -345,6 +346,10 @@ class BufferedTelemetryObserver:
         self.batch_size = max(1, batch_size)
         self._samples: deque[dict[str, Any]] = deque(maxlen=max(1, max_samples))
         self._lock = Lock()
+        self._executor = AsyncBoundedExecutor(
+            workers=1,
+            thread_name_prefix="manga-provider-telemetry",
+        )
 
     def observe(self, sample: dict[str, Any]) -> None:
         # Copy mutable callback data before returning control to the HTTP client.
@@ -364,9 +369,12 @@ class BufferedTelemetryObserver:
             try:
                 await asyncio.wait_for(stop.wait(), timeout=self.flush_interval_seconds)
             except TimeoutError:
-                await asyncio.to_thread(self.flush)
-        while await asyncio.to_thread(self.flush):
+                await self._executor.run(self.flush)
+        while await self._executor.run(self.flush):
             pass
+
+    def close(self) -> None:
+        self._executor.close()
 
 
 def poll_cadence_metadata(metadata: dict | None, base_seconds: int) -> dict:

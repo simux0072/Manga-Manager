@@ -346,7 +346,7 @@ async def test_matches_return_human_evidence_and_require_confirmation() -> None:
     assert "evidence_json" not in matches.text
 
 
-async def test_matches_close_decisions_already_in_the_same_canonical_series() -> None:
+async def test_matches_omit_obsolete_decisions_without_mutating_during_get() -> None:
     app, sessions = app_with_catalog()
     with sessions() as session, session.begin():
         identities = session.query(CatalogSourceSeries).order_by(CatalogSourceSeries.id).all()
@@ -358,7 +358,7 @@ async def test_matches_close_decisions_already_in_the_same_canonical_series() ->
     assert response.status_code == 200 and response.json()["total"] == 0
     with sessions() as session:
         decision = session.query(CatalogMatchDecision).one()
-        assert decision.decision == "accepted"
+        assert decision.decision == "pending"
         assert decision.decided_by == "canonicalized"
 
 

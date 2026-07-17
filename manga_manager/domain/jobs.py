@@ -5,7 +5,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class JobKind(StrEnum):
@@ -67,9 +67,20 @@ class CoverBackfillPayload(JobPayload):
 
 
 class KavitaSyncPayload(JobPayload):
-    series_id: int = Field(gt=0)
+    series_id: int = Field(default=0, ge=0)
+    series_ids: tuple[int, ...] = Field(default=(), max_length=100)
     folder_path: str = Field(default="", max_length=4096)
     reading_status: Literal["", "read", "unread"] = ""
+
+    @model_validator(mode="after")
+    def validate_targets(self) -> "KavitaSyncPayload":
+        if self.series_id <= 0 and not self.series_ids:
+            raise ValueError("Kavita sync requires at least one series")
+        if any(series_id <= 0 for series_id in self.series_ids):
+            raise ValueError("Kavita batch series IDs must be positive")
+        if self.series_ids and (self.folder_path or self.reading_status):
+            raise ValueError("Kavita batch sync cannot contain an outbound series mutation")
+        return self
 
 
 class LibraryRepairPayload(JobPayload):

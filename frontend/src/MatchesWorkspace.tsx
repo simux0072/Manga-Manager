@@ -9,7 +9,11 @@ const fallbackProviders = ['asura', 'mangafire', 'kingofshojo']
 
 export function MatchesWorkspace() {
   const [tab, setTab] = useState<'suggested' | 'manual'>('suggested')
-  const providerQuery = useQuery({queryKey: ['providers'], queryFn: api.providers, staleTime: 300_000})
+  const providerQuery = useQuery({
+    queryKey: ['providers'],
+    queryFn: ({signal}) => api.providers(signal),
+    staleTime: 300_000,
+  })
   const providers = providerQuery.data?.items?.length ? providerQuery.data.items : fallbackProviders
   return <>
     <header className="page-header">
@@ -35,9 +39,10 @@ function SuggestedMatches() {
   const [confirmBatch, setConfirmBatch] = useState(false)
   const query = useInfiniteQuery({
     queryKey: ['matches'],
-    queryFn: ({pageParam}) => api.matches(pageParam),
+    queryFn: ({pageParam, signal}) => api.matches(pageParam, signal),
     initialPageParam: 0,
     getNextPageParam: page => page.next_cursor || undefined,
+    maxPages: 10,
   })
   const decision = useMutation({
     mutationFn: ({id, value}: {id: number; value: 'accepted' | 'rejected'}) =>
@@ -123,16 +128,18 @@ function ManualMerge({providers}: {providers: string[]}) {
 
   const library = useInfiniteQuery({
     queryKey: ['merge-library', debounced, sources],
-    queryFn: ({pageParam}) => api.library(debounced, sources, ['interested', 'reading', 'caught_up', 'paused'], pageParam),
+    queryFn: ({pageParam, signal}) => api.library(debounced, sources, ['interested', 'reading', 'caught_up', 'paused'], pageParam, signal),
     initialPageParam: '',
     getNextPageParam: page => page.next_cursor || undefined,
+    maxPages: 10,
     enabled: selected.length === 0,
   })
   const candidates = useInfiniteQuery({
     queryKey: ['merge-candidates', selected.map(item => item.id), debounced, sources],
-    queryFn: ({pageParam}) => api.mergeCandidates(selected.map(item => item.id), debounced, sources, pageParam),
+    queryFn: ({pageParam, signal}) => api.mergeCandidates(selected.map(item => item.id), debounced, sources, pageParam, signal),
     initialPageParam: 0,
     getNextPageParam: page => page.next_cursor || undefined,
+    maxPages: 10,
     enabled: selected.length > 0,
   })
   const previewMutation = useMutation({
