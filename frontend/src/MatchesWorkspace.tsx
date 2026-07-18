@@ -45,43 +45,67 @@ function SuggestedMatches() {
     getNextPageParam: page => page.next_cursor || undefined,
     maxPages: 10,
   })
+  const updateCachedMatches = (remove: (match: Match) => boolean) => {
+    client.setQueryData<InfiniteData<Page<Match, number>>>(['matches'], current => current && ({
+      ...current,
+      pages: current.pages.map(page => ({
+        ...page,
+        items: page.items.filter(match => !remove(match)),
+      })),
+    }))
+  }
   const decision = useMutation({
     mutationFn: ({id, value}: {id: number; value: 'accepted' | 'rejected'}) =>
       api.decideMatch(id, value, value === 'accepted' ? 'MERGE' : ''),
     onMutate: async ({id}) => {
       await client.cancelQueries({queryKey: ['matches'], exact: true})
       const previous = client.getQueryData<InfiniteData<Page<Match, number>>>(['matches'])
-      client.setQueryData<InfiniteData<Page<Match, number>>>(['matches'], current => current && ({
-        ...current,
-        pages: current.pages.map(page => ({
-          ...page,
-          items: page.items.filter(match => match.id !== id),
-        })),
-      }))
-      return {previous}
+      const reviewed = previous?.pages.flatMap(page => page.items).find(match => match.id === id)
+      updateCachedMatches(match => match.id === id)
+      return {previous, reviewed}
     },
     onError: (error, _variables, context) => {
       if (context?.previous) client.setQueryData(['matches'], context.previous)
       window.dispatchEvent(new CustomEvent('manga-toast', {detail: {message: error.message, tone: 'error'}}))
     },
-    onSuccess: async (_result, variables) => {
+    onSuccess: (_result, variables, context) => {
       setConfirm(null)
-      // A rejection only removes this proposal, so the optimistic cache is authoritative. A
-      // merge can make connected proposals obsolete; reset it to one initial page instead of
-      // refetching every retained infinite-query page concurrently.
-      if (variables.value === 'accepted') {
-        await client.resetQueries({queryKey: ['matches'], exact: true})
+      if (variables.value === 'accepted' && context?.reviewed) {
+        const affectedSeries = new Set([context.reviewed.left.id, context.reviewed.right.id])
+        // Connected proposals can become obsolete after a merge. Remove them from the current
+        // view without collapsing the infinite list or moving a deep-scroll viewport to page one.
+        updateCachedMatches(match => affectedSeries.has(match.left.id) || affectedSeries.has(match.right.id))
       }
       client.invalidateQueries({queryKey: ['library']})
+      const titles = context?.reviewed
+        ? `${context.reviewed.left.title} and ${context.reviewed.right.title}`
+        : `Match #${variables.id}`
+      window.dispatchEvent(new CustomEvent('manga-toast', {detail: {message:
+        variables.value === 'accepted' ? `Merged ${titles}` : `Kept ${titles} separate`,
+      }}))
     },
   })
   const batch = useMutation({
     mutationFn: ({value}:{value:'accepted'|'rejected'}) => api.decideMatches(selected,value,value==='accepted'?'MERGE':'',entireQueue),
-    onSuccess: async result => {
+    onSuccess: (result, variables) => {
+      const applied = new Set(result.ids)
+      const cached = client.getQueryData<InfiniteData<Page<Match, number>>>(['matches'])
+      const affectedSeries = new Set<number>()
+      if (variables.value === 'accepted') {
+        cached?.pages.flatMap(page => page.items).filter(match => applied.has(match.id)).forEach(match => {
+          affectedSeries.add(match.left.id); affectedSeries.add(match.right.id)
+        })
+      }
+      updateCachedMatches(match => applied.has(match.id)
+        || affectedSeries.has(match.left.id) || affectedSeries.has(match.right.id))
       setSelected([]); setEntireQueue(false); setBatchPreview(null); setConfirmBatch(false)
-      await client.resetQueries({queryKey:['matches'], exact:true}); client.invalidateQueries({queryKey:['library']})
+      client.invalidateQueries({queryKey:['library']})
+      window.dispatchEvent(new CustomEvent('manga-toast',{detail:{message:
+        `${result.ids.length} proposal${result.ids.length===1?'':'s'} ${variables.value==='accepted'?'merged':'kept separate'}`,
+      }}))
       if(result.blocked.length) window.dispatchEvent(new CustomEvent('manga-toast',{detail:{message:`${result.blocked.length} blocked proposals remain pending`}}))
     },
+    onError: error => window.dispatchEvent(new CustomEvent('manga-toast',{detail:{message:error.message,tone:'error'}})),
   })
   const reviewBusy = decision.isPending || batch.isPending
   const items = query.data?.pages.flatMap(page => page.items) || []

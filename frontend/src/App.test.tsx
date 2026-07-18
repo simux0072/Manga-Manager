@@ -112,18 +112,23 @@ describe('media library frontend',()=>{
     expect(await screen.findByText(/Merged into series #7/)).toBeInTheDocument()
   })
 
-  it('keeps rejected suggestions out of cache without refetching every loaded page',async()=>{
+  it('reviews deep suggestions without resetting or refetching loaded pages',async()=>{
     const match={
       id:41,decision_ids:[41],confidence:.92,evidence:[],blocked_reasons:[],
       left:{...series,source_title:series.title,source:'asura',url:'https://asura.test/painter'},
       right:{...matchingSeries,source_title:matchingSeries.title,source:'mangafire',url:'https://mangafire.test/painter'},
     }
+    const secondMatch={
+      ...match,id:42,decision_ids:[42],confidence:.88,
+      left:{...match.left,id:11,title:'Another Hero'},
+      right:{...match.right,id:12,title:'The Other Hero'},
+    }
     vi.stubGlobal('fetch',vi.fn((input:string|URL|Request,init?:RequestInit)=>{
       const url=String(input)
       if(url.includes('/api/v2/operations'))return response({job_counts:{},health:{series:2,chapters:1,active_artifacts:0,missing_projections:0},sources:[],workers:[],permits:{}})
       if(url.includes('/api/v2/providers'))return response({items:['asura','mangafire','kingofshojo']})
-      if(url.includes('/api/v2/matches/41')&&init?.method==='POST')return response({id:41,decision:'rejected'})
-      if(url.includes('/api/v2/matches'))return response({items:[match],next_cursor:null,total:1})
+      if(url.includes('/api/v2/matches/')&&init?.method==='POST')return response({id:Number(url.split('/').at(-1)),decision:'reviewed'})
+      if(url.includes('/api/v2/matches'))return response({items:[match,secondMatch],next_cursor:null,total:2})
       return response({items:[],next_cursor:null})
     }))
     renderApp('/matches')
@@ -132,7 +137,12 @@ describe('media library frontend',()=>{
       String(input).includes('/api/v2/matches?')&&(!init||!(init as RequestInit).method),
     ).length
     await userEvent.click(keepSeparate)
-    await waitFor(()=>expect(screen.queryAllByRole('button',{name:'Keep separate'})).toHaveLength(0))
+    await waitFor(()=>expect(document.querySelectorAll('.match-card')).toHaveLength(1))
+    expect(screen.getByText(`Kept ${series.title} and ${matchingSeries.title} separate`)).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button',{name:'Merge'}))
+    await userEvent.click(await screen.findByRole('button',{name:'Confirm merge'}))
+    await waitFor(()=>expect(document.querySelectorAll('.match-card')).toHaveLength(0))
+    expect(screen.getByText('Merged Another Hero and The Other Hero')).toBeInTheDocument()
     const requestsAfter=(fetch as ReturnType<typeof vi.fn>).mock.calls.filter(([input,init])=>
       String(input).includes('/api/v2/matches?')&&(!init||!(init as RequestInit).method),
     ).length
