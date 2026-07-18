@@ -501,6 +501,82 @@ async def test_connected_batch_matches_merge_once() -> None:
         assert session.query(WorkJob).filter_by(kind="library_repair").count() == 1
 
 
+async def test_oversized_connected_match_batch_is_previewed_and_left_pending() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        first_identity = session.query(CatalogSourceSeries).filter_by(source="asura").one()
+        second_identity = session.query(CatalogSourceSeries).filter_by(
+            source="mangafire"
+        ).one()
+        third = CatalogSeries(title="Third", normalized_title="third", status="interested")
+        fourth = CatalogSeries(title="Fourth", normalized_title="fourth", status="interested")
+        session.add_all([third, fourth])
+        session.flush()
+        third_identity = CatalogSourceSeries(
+            series_id=third.id,
+            source="kingofshojo",
+            source_id="third",
+            title=third.title,
+            normalized_title=third.normalized_title,
+            url="https://kingofshojo.example/third",
+        )
+        # This is an equivalent historical Asura identity: the rotating revision suffix is
+        # intentionally ignored. It therefore has no provider conflict but still makes the
+        # connected component larger than the configured three-provider merge limit.
+        fourth_identity = CatalogSourceSeries(
+            series_id=fourth.id,
+            source="asura",
+            source_id="example-deadbeef",
+            title=fourth.title,
+            normalized_title=fourth.normalized_title,
+            url="https://asura.example/example-deadbeef",
+        )
+        session.add_all([third_identity, fourth_identity])
+        session.flush()
+        for left, right in (
+            (second_identity, third_identity),
+            (third_identity, fourth_identity),
+        ):
+            session.add(
+                CatalogMatchDecision(
+                    left_source_series_id=min(left.id, right.id),
+                    right_source_series_id=max(left.id, right.id),
+                    confidence=0.8,
+                )
+            )
+        assert first_identity.series_id != fourth_identity.series_id
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        preview = await client.post(
+            "/api/v2/match-batch/preview",
+            json={"ids": [], "entire_queue": True, "decision": "accepted"},
+        )
+        result = await client.post(
+            "/api/v2/match-batch",
+            json={
+                "ids": [],
+                "entire_queue": True,
+                "decision": "accepted",
+                "confirmation": "MERGE",
+            },
+        )
+
+    assert preview.status_code == 200
+    assert preview.json()["selected"] == 3
+    assert preview.json()["eligible"] == 0
+    assert preview.json()["blocked"] == 3
+    reasons = {reason for item in preview.json()["items"] for reason in item["blocked_reasons"]}
+    assert "connected component contains 4 manga; maximum is 3" in reasons
+    assert result.status_code == 200
+    assert result.json()["ids"] == []
+    assert len(result.json()["blocked"]) == 3
+    with sessions() as session:
+        assert session.query(CatalogSeries).count() == 4
+        assert {row.decision for row in session.query(CatalogMatchDecision)} == {"pending"}
+
+
 async def test_provider_registry_expands_manual_merge_limit_dynamically(monkeypatch) -> None:
     from manga_manager.domain import providers
 

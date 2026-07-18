@@ -123,15 +123,17 @@ describe('media library frontend',()=>{
       left:{...match.left,id:11,title:'Another Hero'},
       right:{...match.right,id:12,title:'The Other Hero'},
     }
+    const duplicateMatch={...match,id:43,decision_ids:[43],confidence:.90}
     vi.stubGlobal('fetch',vi.fn((input:string|URL|Request,init?:RequestInit)=>{
       const url=String(input)
       if(url.includes('/api/v2/operations'))return response({job_counts:{},health:{series:2,chapters:1,active_artifacts:0,missing_projections:0},sources:[],workers:[],permits:{}})
       if(url.includes('/api/v2/providers'))return response({items:['asura','mangafire','kingofshojo']})
       if(url.includes('/api/v2/matches/')&&init?.method==='POST')return response({id:Number(url.split('/').at(-1)),decision:'reviewed'})
-      if(url.includes('/api/v2/matches'))return response({items:[match,secondMatch],next_cursor:null,total:2})
+      if(url.includes('/api/v2/matches'))return response({items:[match,duplicateMatch,secondMatch],next_cursor:null,total:3})
       return response({items:[],next_cursor:null})
     }))
     renderApp('/matches')
+    await waitFor(()=>expect(document.querySelectorAll('.match-card')).toHaveLength(2))
     const keepSeparate=(await screen.findAllByRole('button',{name:'Keep separate'})).find(button=>!button.hasAttribute('disabled'))!
     const requestsBefore=(fetch as ReturnType<typeof vi.fn>).mock.calls.filter(([input,init])=>
       String(input).includes('/api/v2/matches?')&&(!init||!(init as RequestInit).method),
@@ -147,5 +149,39 @@ describe('media library frontend',()=>{
       String(input).includes('/api/v2/matches?')&&(!init||!(init as RequestInit).method),
     ).length
     expect(requestsAfter).toBe(requestsBefore)
+  })
+
+  it('deduplicates match pairs and previews only the explicit batch selection',async()=>{
+    const match={
+      id:51,decision_ids:[51],confidence:.91,evidence:[],blocked_reasons:[],
+      left:{...series,source_title:series.title,source:'asura',url:'https://asura.test/painter'},
+      right:{...matchingSeries,source_title:matchingSeries.title,source:'mangafire',url:'https://mangafire.test/painter'},
+    }
+    const duplicate={...match,id:52,decision_ids:[52],confidence:.89}
+    const other={
+      ...match,id:53,decision_ids:[53],confidence:.80,
+      left:{...match.left,id:21,title:'Another Left'},
+      right:{...match.right,id:22,title:'Another Right'},
+    }
+    let previewBody:{ids:number[];entire_queue:boolean}|null=null
+    vi.stubGlobal('fetch',vi.fn((input:string|URL|Request,init?:RequestInit)=>{
+      const url=String(input)
+      if(url.includes('/api/v2/operations'))return response({job_counts:{},health:{series:2,chapters:1,active_artifacts:0,missing_projections:0},sources:[],workers:[],permits:{}})
+      if(url.includes('/api/v2/providers'))return response({items:['asura','mangafire','kingofshojo']})
+      if(url.endsWith('/api/v2/match-batch/preview')){
+        previewBody=JSON.parse(String(init?.body))
+        return response({selected:previewBody!.ids.length,eligible:previewBody!.ids.length,blocked:0,items:[]})
+      }
+      if(url.includes('/api/v2/matches'))return response({items:[match,duplicate,other],next_cursor:null,total:3})
+      return response({items:[],next_cursor:null})
+    }))
+    renderApp('/matches')
+    await waitFor(()=>expect(document.querySelectorAll('.match-card')).toHaveLength(2))
+    const checkboxes=screen.getAllByRole('checkbox')
+    await userEvent.click(checkboxes[1])
+    await userEvent.click(checkboxes[2])
+    await userEvent.click(screen.getByRole('button',{name:'Merge eligible'}))
+    expect(await screen.findByText('Merge 2 eligible proposals?')).toBeInTheDocument()
+    expect(previewBody).toEqual({ids:[51,53],entire_queue:false,decision:'rejected'})
   })
 })

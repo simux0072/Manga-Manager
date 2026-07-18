@@ -329,6 +329,19 @@ def connected_proposal_components(proposals: list[dict[str, Any]]) -> list[dict[
     return result
 
 
+def proposal_component_blockers(session: Session, series_ids: list[int]) -> list[str]:
+    """Apply the same validation to batch previews and batch execution."""
+    unique_ids = set(series_ids)
+    blockers = proposal_blockers(session, sorted(unique_ids))
+    provider_count = len(provider_names())
+    if len(unique_ids) > provider_count:
+        blockers.append(
+            f"connected component contains {len(unique_ids)} manga; "
+            f"maximum is {provider_count}"
+        )
+    return blockers
+
+
 def create_api_router(
     factory_provider: Callable[[], sessionmaker[Session]],
 ) -> APIRouter:
@@ -1136,13 +1149,13 @@ def create_api_router(
             if change.entire_queue
             else [row for row in proposals if row["id"] in set(change.ids)]
         )
-        items = [
-            {
-                "id": row["id"],
-                "blocked_reasons": proposal_blockers(session, row["series_ids"]),
-            }
-            for row in selected
-        ]
+        items = []
+        for component in connected_proposal_components(selected):
+            reasons = proposal_component_blockers(session, component["series_ids"])
+            items.extend(
+                {"id": row["id"], "blocked_reasons": reasons}
+                for row in component["proposals"]
+            )
         return {
             "selected": len(items),
             "eligible": sum(not row["blocked_reasons"] for row in items),
@@ -1173,7 +1186,7 @@ def create_api_router(
             components = connected_proposal_components(selected)
             for component in components:
                 reasons = (
-                    proposal_blockers(session, component["series_ids"])
+                    proposal_component_blockers(session, component["series_ids"])
                     if change.decision == "accepted"
                     else []
                 )
@@ -1183,28 +1196,38 @@ def create_api_router(
                         for proposal in component["proposals"]
                     )
                     continue
-                decision_ids = {
-                    decision_id
-                    for proposal in component["proposals"]
-                    for decision_id in proposal["decision_ids"]
-                }
-                rows = session.scalars(
-                    select(CatalogMatchDecision).where(CatalogMatchDecision.id.in_(decision_ids))
-                ).all()
-                for row in rows:
-                    record_training_label(
-                        session,
-                        left_source_series_id=row.left_source_series_id,
-                        right_source_series_id=row.right_source_series_id,
-                        label=int(change.decision == "accepted"),
-                        origin="batch_review",
-                        decision=row,
+                try:
+                    with session.begin_nested():
+                        decision_ids = {
+                            decision_id
+                            for proposal in component["proposals"]
+                            for decision_id in proposal["decision_ids"]
+                        }
+                        rows = session.scalars(
+                            select(CatalogMatchDecision).where(
+                                CatalogMatchDecision.id.in_(decision_ids)
+                            )
+                        ).all()
+                        for row in rows:
+                            record_training_label(
+                                session,
+                                left_source_series_id=row.left_source_series_id,
+                                right_source_series_id=row.right_source_series_id,
+                                label=int(change.decision == "accepted"),
+                                origin="batch_review",
+                                decision=row,
+                            )
+                            row.decision = change.decision
+                            row.decided_by = "operator"
+                            row.decided_at = utcnow()
+                        if change.decision == "accepted":
+                            merge_canonical_series(session, component["series_ids"])
+                except HTTPException as error:
+                    blocked.extend(
+                        {"id": proposal["id"], "reasons": [str(error.detail)]}
+                        for proposal in component["proposals"]
                     )
-                    row.decision = change.decision
-                    row.decided_by = "operator"
-                    row.decided_at = utcnow()
-                if change.decision == "accepted":
-                    merge_canonical_series(session, component["series_ids"])
+                    continue
                 applied.extend(proposal["id"] for proposal in component["proposals"])
         return {"ids": applied, "blocked": blocked, "decision": change.decision}
 

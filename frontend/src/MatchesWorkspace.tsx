@@ -38,6 +38,7 @@ function SuggestedMatches() {
   const [entireQueue, setEntireQueue] = useState(false)
   const [batchPreview, setBatchPreview] = useState<{selected:number;eligible:number;blocked:number;items:{id:number;blocked_reasons:string[]}[]}|null>(null)
   const [confirmBatch, setConfirmBatch] = useState(false)
+  const [previewBusy, setPreviewBusy] = useState(false)
   const query = useInfiniteQuery({
     queryKey: ['matches'],
     queryFn: ({pageParam, signal}) => api.matches(pageParam, signal),
@@ -61,7 +62,8 @@ function SuggestedMatches() {
       await client.cancelQueries({queryKey: ['matches'], exact: true})
       const previous = client.getQueryData<InfiniteData<Page<Match, number>>>(['matches'])
       const reviewed = previous?.pages.flatMap(page => page.items).find(match => match.id === id)
-      updateCachedMatches(match => match.id === id)
+      const reviewedPair = reviewed && matchPairKey(reviewed)
+      updateCachedMatches(match => match.id === id || (!!reviewedPair && matchPairKey(match) === reviewedPair))
       return {previous, reviewed}
     },
     onError: (error, _variables, context) => {
@@ -90,13 +92,17 @@ function SuggestedMatches() {
     onSuccess: (result, variables) => {
       const applied = new Set(result.ids)
       const cached = client.getQueryData<InfiniteData<Page<Match, number>>>(['matches'])
+      const appliedPairs = new Set(
+        cached?.pages.flatMap(page => page.items)
+          .filter(match => applied.has(match.id)).map(matchPairKey) || [],
+      )
       const affectedSeries = new Set<number>()
       if (variables.value === 'accepted') {
         cached?.pages.flatMap(page => page.items).filter(match => applied.has(match.id)).forEach(match => {
           affectedSeries.add(match.left.id); affectedSeries.add(match.right.id)
         })
       }
-      updateCachedMatches(match => applied.has(match.id)
+      updateCachedMatches(match => applied.has(match.id) || appliedPairs.has(matchPairKey(match))
         || affectedSeries.has(match.left.id) || affectedSeries.has(match.right.id))
       setSelected([]); setEntireQueue(false); setBatchPreview(null); setConfirmBatch(false)
       client.invalidateQueries({queryKey:['library']})
@@ -107,24 +113,51 @@ function SuggestedMatches() {
     },
     onError: error => window.dispatchEvent(new CustomEvent('manga-toast',{detail:{message:error.message,tone:'error'}})),
   })
-  const reviewBusy = decision.isPending || batch.isPending
-  const items = query.data?.pages.flatMap(page => page.items) || []
+  const reviewBusy = decision.isPending || batch.isPending || previewBusy
+  const items = useMemo(
+    () => deduplicateMatches(query.data?.pages.flatMap(page => page.items) || []),
+    [query.data],
+  )
+  const visibleIds = items.map(match => match.id).join(',')
+  useEffect(() => {
+    if (entireQueue) return
+    const currentIds = new Set(items.map(match => match.id))
+    setSelected(current => {
+      const visible = current.filter(id => currentIds.has(id))
+      return visible.length === current.length ? current : visible
+    })
+  }, [entireQueue, visibleIds])
+  const loadBatchPreview = async (openConfirmation = false) => {
+    setPreviewBusy(true)
+    try {
+      const preview = await api.previewMatches(selected, entireQueue)
+      setBatchPreview(preview)
+      if (openConfirmation) setConfirmBatch(true)
+    } catch (error) {
+      window.dispatchEvent(new CustomEvent('manga-toast', {detail: {
+        message: error instanceof Error ? error.message : 'Could not preview matches',
+        tone: 'error',
+      }}))
+    } finally {
+      setPreviewBusy(false)
+    }
+  }
   if (query.isLoading) return <Loading />
   if (query.isError) return <Message icon={<AlertTriangle />} title="Could not load matches" detail={query.error.message} />
   if (!items.length) return <Message icon={<Check />} title="No matches need review" detail="Use Manual merge when you already know two titles belong together." />
   return <>
     <section className="match-batch-bar">
-      <label><input type="checkbox" checked={entireQueue} onChange={async event=>{const value=event.target.checked;setEntireQueue(value);setSelected(value?[]:selected);setBatchPreview(await api.previewMatches(value?[]:selected,value))}}/> Select entire queue</label>
+      <label><input type="checkbox" checked={entireQueue} disabled={reviewBusy} onChange={event=>{setEntireQueue(event.target.checked);setSelected([]);setBatchPreview(null)}}/> Select entire queue</label>
       <span>{entireQueue?'Entire queue':`${selected.length} selected`}</span>
-      <button className="secondary" disabled={reviewBusy||(!entireQueue&&!selected.length)} onClick={async()=>setBatchPreview(await api.previewMatches(selected,entireQueue))}>Preview</button>
+      <button className="secondary" disabled={reviewBusy||(!entireQueue&&!selected.length)} onClick={()=>loadBatchPreview()}>Preview</button>
       <button className="secondary" disabled={reviewBusy||(!entireQueue&&!selected.length)} onClick={()=>batch.mutate({value:'rejected'})}>Keep separate</button>
-      <button className="primary" disabled={reviewBusy||(!entireQueue&&!selected.length)} onClick={async()=>{setBatchPreview(await api.previewMatches(selected,entireQueue));setConfirmBatch(true)}}>Merge eligible</button>
+      <button className="primary" disabled={reviewBusy||(!entireQueue&&!selected.length)} onClick={()=>loadBatchPreview(true)}>Merge eligible</button>
       {batchPreview&&<span>{batchPreview.eligible} eligible · {batchPreview.blocked} blocked</span>}
     </section>
     {batchPreview?.items.some(item=>item.blocked_reasons.length>0)&&<div className="inline-notice" role="status">Blocked proposals remain pending: {batchPreview.items.filter(item=>item.blocked_reasons.length).map(item=>`#${item.id} ${item.blocked_reasons.join(', ')}`).join(' · ')}</div>}
     <div className="match-list">
       {items.map(match => <article className="match-card" key={match.id}>
-        <label className="match-select"><input type="checkbox" checked={selected.includes(match.id)} disabled={entireQueue||reviewBusy} onChange={()=>setSelected(current=>current.includes(match.id)?current.filter(id=>id!==match.id):[...current,match.id])}/>Select</label>
+        <label className="match-select"><input type="checkbox" checked={entireQueue||selected.includes(match.id)} disabled={entireQueue||reviewBusy} onChange={()=>{setBatchPreview(null);setSelected(current=>current.includes(match.id)?current.filter(id=>id!==match.id):[...current,match.id])}}/>Select</label>
         <Side side={match.left} />
         <div className="match-evidence">
           <div className="confidence"><b>{Math.round(match.confidence * 100)}%</b><span>confidence</span></div>
@@ -157,6 +190,23 @@ function SuggestedMatches() {
       disabled={batchPreview.eligible===0}
     />}
   </>
+}
+
+function matchPairKey(match: Match) {
+  return [match.left.id, match.right.id].sort((left, right) => left - right).join(':')
+}
+
+function deduplicateMatches(matches: Match[]) {
+  const byPair = new Map<string, Match>()
+  for (const match of matches) {
+    const key = matchPairKey(match)
+    const current = byPair.get(key)
+    if (!current || match.confidence > current.confidence
+      || (match.confidence === current.confidence && match.id < current.id)) {
+      byPair.set(key, match)
+    }
+  }
+  return [...byPair.values()]
 }
 
 function ManualMerge({providers}: {providers: string[]}) {
