@@ -1,7 +1,7 @@
 # Raspberry Pi deployment and rollback
 
 Target a 64-bit ARM OS and keep PostgreSQL, storage, and Kavita data on the external SSD. The Compose
-limits are web 256 MiB, worker 1 GiB, PostgreSQL 384 MiB, and migration/maintenance 256 MiB. Only web
+limits are web 384 MiB, worker 1 GiB, PostgreSQL 384 MiB, and migration/maintenance 256 MiB. Only web
 joins the routed edge; PostgreSQL remains on the internal network. Enable Traefik labels only after
 the local ARM64 rehearsal passes, and keep Authelia in front of this private application.
 

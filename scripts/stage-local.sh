@@ -203,7 +203,7 @@ if [ "$run_repairs" = true ]; then
     -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" manga-manager \
     reconcile-refresh-queue --report /data/refresh-queue-applied.json --apply
 fi
-docker run -d --name "$web" --network "$network" --restart unless-stopped --memory 256m -p "${STAGE_PORT:-18000}:8000" \
+docker run -d --name "$web" --network "$network" --restart unless-stopped --memory 384m -p "${STAGE_PORT:-18000}:8000" \
   --log-opt max-size=10m --log-opt max-file=3 \
   -e "V2_DATABASE_URL=$database_url" -e V2_STORAGE_ROOT=/data \
   -e "V2_ENABLE_ASURA=$sources_enabled" -e "V2_ENABLE_MANGAFIRE=$sources_enabled" \

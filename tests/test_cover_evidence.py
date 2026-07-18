@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import io
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -31,6 +33,24 @@ from manga_manager.infrastructure.db_models import (
     JobBase,
     WorkJob,
 )
+
+
+def test_web_import_does_not_load_native_cover_matcher() -> None:
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import sys; import manga_manager.web.app; "
+                "assert 'cv2' not in sys.modules; assert 'numpy' not in sys.modules"
+            ),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def cover(*, badge: bool = False, inverted: bool = False) -> bytes:
@@ -90,6 +110,10 @@ def test_orb_signature_matches_translated_overlay_and_zoom_but_rejects_other_art
     assert compare_signatures(original, translated)["cover_match"] is True
     assert compare_signatures(original, zoomed)["cover_match"] is True
     assert compare_signatures(original, unrelated)["cover_match"] is False
+
+    import cv2
+
+    assert cv2.getNumThreads() == 1
 
 
 def test_corrupt_signature_is_treated_as_inconclusive() -> None:

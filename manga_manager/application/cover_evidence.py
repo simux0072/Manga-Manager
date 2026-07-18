@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
+from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
-import cv2
-import numpy as np
 from PIL import Image, ImageOps
 from sqlalchemy import or_, select, tuple_
 
@@ -30,6 +30,29 @@ LEGACY_ALGORITHM = "dhash-crop-v2"
 ALGORITHM = "orb-multihash-v1"
 THUMBNAIL_MAX_SIZE = (480, 720)
 _COVER_EXECUTOR = AsyncBoundedExecutor(workers=1, thread_name_prefix="manga-cover")
+
+
+@lru_cache(maxsize=1)
+def _image_modules():
+    """Load the heavy native matcher only in processes that actually compare covers.
+
+    The web service imports thumbnail helpers from this module, but Suggested Matches only reads
+    cover evidence that workers have already stored.  Importing OpenCV and NumPy eagerly made the
+    256 MiB web container retain their native heaps and worker threads while merely serving cards.
+    Keep the dependency lazy and use one OpenCV lane; provider workers already bound cover CPU
+    work with ``_COVER_EXECUTOR``.
+    """
+    # The cover executor is deliberately single-lane. Native math libraries should not create a
+    # second, hidden pool sized for the development host when this runs on a four-core Pi.
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+
+    import cv2
+    import numpy as np
+
+    cv2.setNumThreads(1)
+    return cv2, np
 
 
 async def run_cover_cpu(function, /, *args, **kwargs):
@@ -120,6 +143,7 @@ def _dhash(image: Image.Image) -> str:
 
 
 def cover_signature(content: bytes) -> tuple[dict, bytes, bytes]:
+    cv2, np = _image_modules()
     with Image.open(io.BytesIO(content)) as opened:
         image = ImageOps.exif_transpose(opened).convert("RGB")
         width, height = image.size
@@ -150,6 +174,7 @@ def cover_signature(content: bytes) -> tuple[dict, bytes, bytes]:
 
 
 def compare_signatures(left: CatalogCoverSignature, right: CatalogCoverSignature) -> dict:
+    cv2, np = _image_modules()
     left_hashes = list((left.feature_json or {}).get("hashes") or [])
     right_hashes = list((right.feature_json or {}).get("hashes") or [])
     hash_distance = min(
