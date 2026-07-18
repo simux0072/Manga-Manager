@@ -248,6 +248,17 @@ class KavitaClient:
     async def upload_series_cover(self, series_id: int, data_url: str) -> None:
         await self._upload_cover("series", series_id, data_url)
 
+    async def series_cover(self, series_id: int) -> bytes:
+        if not self.configured:
+            return b""
+        response = await self._client().get(
+            f"{self.base_url}/api/image/series-cover",
+            params={"seriesId": series_id, "apiKey": self.api_key},
+            headers=self.headers(),
+        )
+        response.raise_for_status()
+        return response.content
+
     async def upload_chapter_cover(self, chapter_id: int, data_url: str) -> None:
         await self._upload_cover("chapter", chapter_id, data_url)
 

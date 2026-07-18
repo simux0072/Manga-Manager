@@ -5,13 +5,13 @@ import base64
 import hashlib
 import io
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Protocol
 
 import httpx
-from PIL import Image
+from PIL import Image, ImageChops, ImageOps, ImageStat
 from sqlalchemy import exists, or_, select
 
 from app.kavita import (
@@ -20,6 +20,7 @@ from app.kavita import (
     KavitaSeries,
     configured_kavita_client,
 )
+from manga_manager.application.cover_evidence import fingerprint_cover, hamming_distance
 from manga_manager.application.job_handlers import (
     DeferredJobError,
     JobContext,
@@ -66,6 +67,8 @@ class KavitaClientProtocol(Protocol):
     async def remove_want_to_read(self, series_ids: list[int]) -> None: ...
 
     async def upload_series_cover(self, series_id: int, data_url: str) -> None: ...
+
+    async def series_cover(self, series_id: int) -> bytes: ...
 
     async def upload_chapter_cover(self, chapter_id: int, data_url: str) -> None: ...
 
@@ -174,6 +177,7 @@ class KavitaSnapshot:
     chapter_cover_checksums: dict[str, str]
     expected_chapters: tuple[str, ...] = ()
     cached_cover_paths: tuple[str, ...] = ()
+    chapter_kavita_ids: dict[str, int] = field(default_factory=dict)
 
 
 class KavitaSyncHandler:
@@ -277,15 +281,23 @@ class KavitaSyncHandler:
                 data_url = f"data:{content_type};base64," + base64.b64encode(content).decode(
                     "ascii"
                 )
-                if not same_kavita_series or snapshot.kavita_cover_checksum != checksum:
+                refresh_all_covers = (
+                    not same_kavita_series or snapshot.kavita_cover_checksum != checksum
+                )
+                if not refresh_all_covers:
+                    refresh_all_covers = not await self._remote_series_cover_matches(
+                        client, match.id, content
+                    )
+                if refresh_all_covers:
                     await self._retry_cover_write(
                         lambda: client.upload_series_cover(match.id, data_url)
                     )
                 for remote_chapter in chapters:
                     number = canonical_chapter_number(remote_chapter.number)
                     if (
-                        not same_kavita_series
+                        refresh_all_covers
                         or snapshot.chapter_cover_checksums.get(number, "") != checksum
+                        or snapshot.chapter_kavita_ids.get(number) != remote_chapter.id
                     ):
                         await self._retry_cover_write(
                             lambda chapter_id=remote_chapter.id: client.upload_chapter_cover(
@@ -450,6 +462,39 @@ class KavitaSyncHandler:
                     raise
             await asyncio.sleep(0.5 * (2**attempt))
 
+    @staticmethod
+    async def _remote_series_cover_matches(
+        client: KavitaClientProtocol,
+        series_id: int,
+        expected: bytes,
+    ) -> bool:
+        fetch = getattr(client, "series_cover", None)
+        if fetch is None:
+            return True
+        try:
+            actual = await fetch(series_id)
+            if not actual:
+                return False
+            expected_hash = fingerprint_cover(expected)[0]
+            actual_hash = fingerprint_cover(actual)[0]
+            if hamming_distance(expected_hash, actual_hash) > 8:
+                return False
+            with (
+                Image.open(io.BytesIO(expected)) as expected_image,
+                Image.open(io.BytesIO(actual)) as actual_image,
+            ):
+                expected_rgb = ImageOps.exif_transpose(expected_image).convert("RGB")
+                actual_rgb = ImageOps.exif_transpose(actual_image).convert("RGB")
+                size = (64, 96)
+                expected_rgb = ImageOps.fit(expected_rgb, size, Image.Resampling.LANCZOS)
+                actual_rgb = ImageOps.fit(actual_rgb, size, Image.Resampling.LANCZOS)
+                rms = ImageStat.Stat(ImageChops.difference(expected_rgb, actual_rgb)).rms
+            return max(rms) <= 45
+        except (httpx.HTTPError, OSError, ValueError, TypeError):
+            # A transient verification failure should not turn a successful metadata sync into
+            # a retry storm. The persisted checksum and remote-ID checks remain the fallback.
+            return True
+
     async def _cover(self, snapshot: KavitaSnapshot) -> tuple[str, str, str, bytes] | None:
         for relative_path in snapshot.cached_cover_paths:
             path = self.library_root.parent / relative_path
@@ -608,20 +653,34 @@ class KavitaSyncHandler:
                 .where(CatalogChapter.series_id == series.id)
             ).all()
         )
+        chapter_kavita_ids = dict(
+            session.execute(
+                select(
+                    CatalogChapter.canonical_number,
+                    CatalogChapter.kavita_chapter_id,
+                )
+                .join(KavitaProjection, KavitaProjection.chapter_id == CatalogChapter.id)
+                .where(
+                    CatalogChapter.series_id == series.id,
+                    CatalogChapter.kavita_chapter_id.is_not(None),
+                )
+            ).all()
+        )
         return KavitaSnapshot(
-            series.id,
-            series.title,
-            series.kavita_series_id,
-            folder,
-            series.status in {"interested", "reading", "caught_up", "paused"},
-            aliases,
-            external_ids,
-            tuple(ordered_covers),
-            series.cover_checksum,
-            series.kavita_cover_checksum,
-            chapter_cover_checksums,
-            tuple(sorted(chapter_cover_checksums)),
-            ordered_cached_covers,
+            series_id=series.id,
+            title=series.title,
+            existing_kavita_id=series.kavita_series_id,
+            folder_path=folder,
+            tracked=series.status in {"interested", "reading", "caught_up", "paused"},
+            aliases=aliases,
+            external_ids=external_ids,
+            cover_urls=tuple(ordered_covers),
+            cover_checksum=series.cover_checksum,
+            kavita_cover_checksum=series.kavita_cover_checksum,
+            chapter_cover_checksums=chapter_cover_checksums,
+            expected_chapters=tuple(sorted(chapter_cover_checksums)),
+            cached_cover_paths=ordered_cached_covers,
+            chapter_kavita_ids=chapter_kavita_ids,
         )
 
     async def _await_scan(

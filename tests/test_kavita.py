@@ -6,8 +6,9 @@ from app.kavita import KavitaClient, KavitaSeries
 
 
 class FakeResponse:
-    def __init__(self, payload=None):
+    def __init__(self, payload=None, content=b""):
         self.payload = payload
+        self.content = content
 
     def raise_for_status(self):
         return None
@@ -90,6 +91,8 @@ class FakeFullAsyncClient:
             )
         if url.endswith("/api/Reader/get-progress"):
             return FakeResponse({"chapterId": params["chapterId"], "pageNum": 11})
+        if url.endswith("/api/image/series-cover"):
+            return FakeResponse(content=b"cover")
         return FakeResponse(None)
 
 
@@ -109,6 +112,7 @@ async def test_kavita_client_folder_scan_series_and_want_to_read(monkeypatch, tm
     await client.add_want_to_read([7])
     await client.mark_series_read(7)
     await client.mark_series_unread(7)
+    assert await client.series_cover(7) == b"cover"
     await client.upload_series_cover(7, "data:image/png;base64,Y292ZXI=")
     await client.upload_chapter_cover(42, "Y292ZXI=")
 
@@ -127,6 +131,12 @@ async def test_kavita_client_folder_scan_series_and_want_to_read(monkeypatch, tm
     assert progress.pages_read == 11
     assert progress.pages_total == 11
     assert wanted[0].name == "Wanted"
+    assert {
+        "method": "GET",
+        "url": "http://kavita/api/image/series-cover",
+        "headers": {"x-api-key": "secret"},
+        "params": {"seriesId": 7, "apiKey": "secret"},
+    } in FakeFullAsyncClient.requests
     assert {
         "method": "POST",
         "url": "http://kavita/api/Reader/mark-read",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import io
 import zipfile
 from collections.abc import Iterator
@@ -66,6 +67,8 @@ class FakeKavitaClient:
         self.pages_read: int | None = None
         self.marked_read: list[int] = []
         self.marked_unread: list[int] = []
+        self.chapter_id = 30
+        self.remote_series_cover: bytes | None = None
 
     async def scan_folder_or_all(self, folder_path: Path) -> None:
         assert self.sessions.active == 0
@@ -78,7 +81,7 @@ class FakeKavitaClient:
     async def series_detail(self, series_id: int) -> list[KavitaChapter]:
         assert self.sessions.active == 0
         assert series_id == 20
-        return [KavitaChapter(id=30, number="1", volume_id=4, pages_total=10)]
+        return [KavitaChapter(id=self.chapter_id, number="1", volume_id=4, pages_total=10)]
 
     async def chapter_progress(
         self, chapter_id: int, pages_total: int = 0
@@ -104,6 +107,11 @@ class FakeKavitaClient:
 
     async def upload_series_cover(self, series_id: int, data_url: str) -> None:
         self.series_covers.append((series_id, data_url))
+        self.remote_series_cover = base64.b64decode(data_url.split(",", 1)[-1])
+
+    async def series_cover(self, series_id: int) -> bytes:
+        assert series_id == 20
+        return self.remote_series_cover or b""
 
     async def upload_chapter_cover(self, chapter_id: int, data_url: str) -> None:
         self.chapter_covers.append((chapter_id, data_url))
@@ -220,6 +228,38 @@ async def test_kavita_sync_maps_series_and_chapters_without_open_database_sessio
         reading = session.get(CatalogChapterReadingState, chapter.id)
         assert reading is not None and reading.status == "read"
         assert series.status == "caught_up"
+
+    # Kavita can replace a chapter entity during a scan. The source cover checksum remains the
+    # same, but the custom cover belongs to the old Kavita ID and must be uploaded again.
+    client.chapter_id = 31
+    client.chapter_covers.clear()
+    await KavitaSyncHandler(
+        session_factory=sessions,
+        library_root=storage.kavita_root,
+        client_factory=lambda: client,
+        cover_fetcher=fetch_cover,
+    )(JobContext(lease=lease, lease_lost=asyncio.Event()))
+    assert [row[0] for row in client.chapter_covers] == [31]
+    with sessions() as session:
+        chapter = session.scalar(select(CatalogChapter))
+        assert chapter is not None and chapter.kavita_chapter_id == 31
+
+    # Kavita can also replace a custom cover while retaining the same series and chapter IDs.
+    # Detect the visual mismatch from its image endpoint and repair the entire cover set.
+    wrong_cover = io.BytesIO()
+    Image.new("RGB", (16, 24), color="red").save(wrong_cover, format="PNG")
+    client.remote_series_cover = wrong_cover.getvalue()
+    client.series_covers.clear()
+    client.chapter_covers.clear()
+    await KavitaSyncHandler(
+        session_factory=sessions,
+        library_root=storage.kavita_root,
+        client_factory=lambda: client,
+        cover_fetcher=fetch_cover,
+    )(JobContext(lease=lease, lease_lost=asyncio.Event()))
+    assert [row[0] for row in client.series_covers] == [20]
+    assert [row[0] for row in client.chapter_covers] == [31]
+    client.remote_series_cover = cover_image.getvalue()
 
     client.pages_read = 5
     await KavitaSyncHandler(

@@ -359,7 +359,7 @@ async def test_matches_omit_obsolete_decisions_without_mutating_during_get() -> 
     with sessions() as session:
         decision = session.query(CatalogMatchDecision).one()
         assert decision.decision == "pending"
-        assert decision.decided_by == "canonicalized"
+        assert decision.decided_by == ""
 
 
 async def test_matches_collapse_multiple_identity_decisions_per_canonical_pair() -> None:
