@@ -250,11 +250,18 @@ class KavitaSyncHandler:
 
         cover_error = ""
         try:
-            self._progress(context, 0, "requesting Kavita library scan")
-            await client.scan_folder_or_all(snapshot.folder_path)
             mapper = getattr(client, "kavita_path_for_local", None)
             kavita_folder = mapper(snapshot.folder_path) if mapper else snapshot.folder_path
-            match, chapters = await self._await_scan(client, snapshot, str(kavita_folder), context)
+            self._progress(context, 0, "checking existing Kavita mapping")
+            match, chapters = await self._existing_mapping(
+                client, snapshot, str(kavita_folder)
+            )
+            if match is None:
+                self._progress(context, 0, "requesting Kavita library scan")
+                await client.scan_folder_or_all(snapshot.folder_path)
+                match, chapters = await self._await_scan(
+                    client, snapshot, str(kavita_folder), context
+                )
             if match is None:
                 self._invalidate_kavita_mapping(
                     snapshot.series_id,
@@ -304,6 +311,9 @@ class KavitaSyncHandler:
                                 chapter_id, data_url
                             )
                         )
+                        # Kavita persists custom covers in SQLite. Yield a small write-free window
+                        # so interactive login/progress updates are not starved by a large repair.
+                        await asyncio.sleep(0.2)
             else:
                 checksum = ""
                 relative_path = ""
@@ -703,6 +713,27 @@ class KavitaSyncHandler:
             await asyncio.sleep(delay)
             delay = min(delay * 1.35, 15.0)
         return None, []
+
+    @staticmethod
+    async def _existing_mapping(
+        client: KavitaClientProtocol,
+        snapshot: KavitaSnapshot,
+        kavita_folder: str,
+    ) -> tuple[KavitaSeries | None, list[KavitaChapter]]:
+        if snapshot.existing_kavita_id is None:
+            return None, []
+        candidates = await client.list_series()
+        candidate = next(
+            (row for row in candidates if row.id == snapshot.existing_kavita_id),
+            None,
+        )
+        if candidate is None or match_series(snapshot, [candidate], kavita_folder) is None:
+            return None, []
+        chapters = await client.series_detail(candidate.id)
+        available = {canonical_chapter_number(chapter.number) for chapter in chapters}
+        if snapshot.tracked and not set(snapshot.expected_chapters).issubset(available):
+            return None, []
+        return candidate, chapters
 
 
 def match_series(

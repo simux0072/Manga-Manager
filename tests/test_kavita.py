@@ -267,7 +267,7 @@ async def test_kavita_duplicate_folder_scan_uses_full_scan(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
-async def test_kavita_unique_folder_keeps_targeted_scan(monkeypatch, tmp_path):
+async def test_kavita_unique_folder_uses_safe_full_scan(monkeypatch, tmp_path):
     client = KavitaClient(
         "http://kavita/",
         "secret",
@@ -291,4 +291,4 @@ async def test_kavita_unique_folder_keeps_targeted_scan(monkeypatch, tmp_path):
 
     await client.scan_folder_or_all(tmp_path / "library" / "Example")
 
-    assert calls == ["folder"]
+    assert calls == ["all"]

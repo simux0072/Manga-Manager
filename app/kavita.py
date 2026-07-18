@@ -113,34 +113,13 @@ class KavitaClient:
             self._last_scan_at = now
 
     async def _scan_folder_or_all(self, folder_path: Path) -> None:
-        kavita_folder_path = self.kavita_path_for_local(folder_path)
-        kavita_library_root = self.kavita_path_for_local(self.local_library_root)
-        if _same_folder_path(kavita_folder_path, kavita_library_root):
-            await self.scan_all()
-            return
-
-        # Kavita's targeted scan endpoint uses SingleOrDefault when resolving a
-        # folder. A stale/duplicate Kavita series mapping therefore raises a
-        # fatal server-side exception instead of returning a useful response.
-        # Detect that state from the catalog first and use the safe full scan.
-        try:
-            series = await self.list_series()
-        except Exception:
-            series = []
-        folder_matches = sum(
-            1
-            for candidate in series
-            if candidate.folder_path
-            and _same_folder_path(Path(candidate.folder_path), kavita_folder_path)
-        )
-        if folder_matches > 1:
-            await self.scan_all()
-            return
-
-        try:
-            await self.scan_folder(folder_path)
-        except Exception:
-            await self.scan_all()
+        # Kavita returns 200 before its targeted scanner resolves the folder. If stale series
+        # rows map to that folder, the asynchronous task then fails with SingleOrDefault and the
+        # caller has no status to inspect or retry. Full-library scans use Kavita's safe path.
+        # The synchronization handler avoids this operation entirely when its existing mapping
+        # already contains every projected chapter, so this fallback is not the common path.
+        del folder_path
+        await self.scan_all()
 
     async def list_series(self) -> list[KavitaSeries]:
         if not self.configured:
@@ -324,11 +303,6 @@ def parse_series(item: dict) -> KavitaSeries:
         mal_id=str(item.get("malId") or ""),
         anilist_id=str(item.get("aniListId") or ""),
     )
-
-
-def _same_folder_path(left: Path, right: Path) -> bool:
-    """Compare Kavita paths without requiring either container path to exist."""
-    return Path(left) == Path(right)
 
 
 def parse_chapter(item: dict) -> KavitaChapter | None:

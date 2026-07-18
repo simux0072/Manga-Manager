@@ -61,6 +61,7 @@ class FakeKavitaClient:
     def __init__(self, sessions: TrackingSessions) -> None:
         self.sessions = sessions
         self.scanned: Path | None = None
+        self.scan_calls = 0
         self.wanted: list[int] = []
         self.series_covers: list[tuple[int, str]] = []
         self.chapter_covers: list[tuple[int, str]] = []
@@ -73,6 +74,7 @@ class FakeKavitaClient:
     async def scan_folder_or_all(self, folder_path: Path) -> None:
         assert self.sessions.active == 0
         self.scanned = folder_path
+        self.scan_calls += 1
 
     async def list_series(self) -> list[KavitaSeries]:
         assert self.sessions.active == 0
@@ -240,6 +242,7 @@ async def test_kavita_sync_maps_series_and_chapters_without_open_database_sessio
         cover_fetcher=fetch_cover,
     )(JobContext(lease=lease, lease_lost=asyncio.Event()))
     assert [row[0] for row in client.chapter_covers] == [31]
+    assert client.scan_calls == 1
     with sessions() as session:
         chapter = session.scalar(select(CatalogChapter))
         assert chapter is not None and chapter.kavita_chapter_id == 31
