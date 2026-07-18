@@ -331,15 +331,10 @@ def connected_proposal_components(proposals: list[dict[str, Any]]) -> list[dict[
 
 def proposal_component_blockers(session: Session, series_ids: list[int]) -> list[str]:
     """Apply the same validation to batch previews and batch execution."""
-    unique_ids = set(series_ids)
-    blockers = proposal_blockers(session, sorted(unique_ids))
-    provider_count = len(provider_names())
-    if len(unique_ids) > provider_count:
-        blockers.append(
-            f"connected component contains {len(unique_ids)} manga; "
-            f"maximum is {provider_count}"
-        )
-    return blockers
+    # Suggested components may contain more canonical records than providers when historical
+    # pulls created duplicate identities. That is safe only when provider_merge_conflicts can
+    # prove every repeated provider identity equivalent (or strongly chapter-overlapping).
+    return proposal_blockers(session, sorted(set(series_ids)))
 
 
 def create_api_router(
@@ -1081,6 +1076,9 @@ def create_api_router(
 
         with session.begin():
             ids = sorted(set(change.series_ids))
+            provider_count = len(provider_names())
+            if not 2 <= len(ids) <= provider_count:
+                raise HTTPException(422, f"select two to {provider_count} manga")
             rows = session.scalars(select(CatalogSeries).where(CatalogSeries.id.in_(ids))).all()
             if len(rows) != len(ids):
                 raise HTTPException(404, "one or more manga no longer exist")

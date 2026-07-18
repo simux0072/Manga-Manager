@@ -32,7 +32,7 @@ from manga_manager.infrastructure.db_models import (
 from manga_manager.settings import V2Settings
 from manga_manager.application.library_repair import enqueue_library_repair
 from manga_manager.domain.jobs import JobKind
-from manga_manager.domain.providers import SOURCE_PRIORITY, provider_names
+from manga_manager.domain.providers import SOURCE_PRIORITY
 from manga_manager.domain.matching import provider_identities_equivalent
 from manga_manager.web.api import create_api_router
 from manga_manager.web.metrics import (
@@ -364,9 +364,8 @@ def merge_match_groups(session: Session, decision: CatalogMatchDecision) -> None
 
 def merge_canonical_series(session: Session, series_ids: list[int]) -> int:
     unique_ids = sorted(set(series_ids))
-    provider_count = len(provider_names())
-    if not 2 <= len(unique_ids) <= provider_count:
-        raise HTTPException(422, f"select two to {provider_count} manga")
+    if len(unique_ids) < 2:
+        raise HTTPException(422, "select at least two manga")
     rows = session.scalars(
         select(CatalogSeries)
         .where(CatalogSeries.id.in_(unique_ids))
@@ -517,16 +516,45 @@ def _consolidate_overlapping_provider_identities(
         equivalent = provider_identities_equivalent(keeper, duplicate)
         if not equivalent and (overlap < 2 or (minimum and overlap / minimum < 0.5)):
             raise HTTPException(409, f"duplicate {source} identities lack strong chapter overlap")
-        session.add(
-            CatalogAlternateSourceListing(
-                primary_source_series_id=keeper.id,
-                source=duplicate.source,
-                source_id=duplicate.source_id,
-                title=duplicate.title,
-                url=duplicate.url,
-                evidence_json={"chapter_overlap": overlap, "compared_chapters": minimum},
+        for alternate in session.scalars(
+            select(CatalogAlternateSourceListing).where(
+                CatalogAlternateSourceListing.primary_source_series_id == duplicate.id
+            )
+        ):
+            conflict = session.scalar(
+                select(CatalogAlternateSourceListing.id).where(
+                    CatalogAlternateSourceListing.id != alternate.id,
+                    CatalogAlternateSourceListing.source == alternate.source,
+                    CatalogAlternateSourceListing.source_id == alternate.source_id,
+                )
+            )
+            if conflict is None:
+                alternate.primary_source_series_id = keeper.id
+            else:
+                session.delete(alternate)
+        alternate = session.scalar(
+            select(CatalogAlternateSourceListing).where(
+                CatalogAlternateSourceListing.source == duplicate.source,
+                CatalogAlternateSourceListing.source_id == duplicate.source_id,
             )
         )
+        evidence = {"chapter_overlap": overlap, "compared_chapters": minimum}
+        if alternate is None:
+            session.add(
+                CatalogAlternateSourceListing(
+                    primary_source_series_id=keeper.id,
+                    source=duplicate.source,
+                    source_id=duplicate.source_id,
+                    title=duplicate.title,
+                    url=duplicate.url,
+                    evidence_json=evidence,
+                )
+            )
+        else:
+            alternate.primary_source_series_id = keeper.id
+            alternate.title = duplicate.title
+            alternate.url = duplicate.url
+            alternate.evidence_json = evidence
         for release in session.scalars(
             select(CatalogChapterRelease).where(
                 CatalogChapterRelease.source_series_id == duplicate.id

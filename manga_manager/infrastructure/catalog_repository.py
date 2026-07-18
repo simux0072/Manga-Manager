@@ -13,6 +13,7 @@ from manga_manager.domain.catalog import (
     normalize_title,
 )
 from manga_manager.infrastructure.db_models import (
+    CatalogAlternateSourceListing,
     CatalogChapter,
     CatalogChapterRelease,
     CatalogExternalIdentifier,
@@ -95,6 +96,16 @@ class CatalogRepository:
                 | (CatalogSourceSeries.source_id == item.source_id),
             )
         )
+        alternate = None
+        if source_series is None:
+            alternate = session.scalar(
+                select(CatalogAlternateSourceListing).where(
+                    CatalogAlternateSourceListing.source == item.source,
+                    CatalogAlternateSourceListing.source_id == item.source_id,
+                )
+            )
+            if alternate is not None:
+                source_series = session.get(CatalogSourceSeries, alternate.primary_source_series_id)
         if source_series is None:
             series = self._matching_series(session, item) or CatalogSeries(
                 title=item.title,
@@ -129,8 +140,16 @@ class CatalogRepository:
 
         now = utcnow()
         source_series.title = item.title
-        source_series.source_id = normalized_source_id if item.source == "asura" else item.source_id
-        source_series.normalized_source_id = normalized_source_id
+        if alternate is None:
+            source_series.source_id = (
+                normalized_source_id if item.source == "asura" else item.source_id
+            )
+            source_series.normalized_source_id = normalized_source_id
+        else:
+            # Keep the selected primary identity stable while recording that this historical
+            # alternate is still live and may carry fresher metadata.
+            alternate.title = item.title
+            alternate.url = item.url
         if item.source == "asura":
             source_series.revision_override = str(
                 item.metadata.get("asura_revision_override") or ""

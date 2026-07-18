@@ -23,6 +23,7 @@ from manga_manager.application.source_pull import (
 )
 from manga_manager.domain.jobs import JobKind, SourcePullPayload, SourceRefreshPayload
 from manga_manager.infrastructure.db_models import (
+    CatalogAlternateSourceListing,
     CatalogChapter,
     CatalogChapterRelease,
     CatalogObservation,
@@ -338,6 +339,52 @@ def test_shared_external_id_never_adds_second_identity_from_same_provider(
             [],
         )
         assert first.series_id != second.series_id
+
+
+def test_ingest_reuses_historical_alternate_provider_identity(
+    sessions: TrackingSessionFactory,
+) -> None:
+    repository = CatalogRepository()
+    with sessions() as session, session.begin():
+        primary = repository.ingest(
+            session,
+            SeriesItem("mangafire", "primary-id", "Same Manga", "https://mf.test/primary"),
+            [],
+        )
+        primary_id = primary.id
+        session.add(
+            CatalogAlternateSourceListing(
+                primary_source_series_id=primary.id,
+                source="mangafire",
+                source_id="historical-id",
+                title="Old title",
+                url="https://mf.test/historical",
+                evidence_json={},
+            )
+        )
+
+    with sessions() as session, session.begin():
+        alternate_item = SeriesItem(
+            "mangafire",
+            "historical-id",
+            "Same Manga Updated",
+            "https://mf.test/historical-new",
+        )
+        assert (
+            SourcePullHandler._changed_catalog_items(session, "mangafire", [alternate_item]) == []
+        )
+        resolved = repository.ingest(
+            session,
+            alternate_item,
+            [],
+        )
+        assert resolved.id == primary_id
+        assert resolved.source_id == "primary-id"
+        assert session.query(CatalogSourceSeries).count() == 1
+        assert session.query(CatalogSeries).count() == 1
+        alternate = session.query(CatalogAlternateSourceListing).one()
+        assert alternate.title == "Same Manga Updated"
+        assert alternate.url == "https://mf.test/historical-new"
 
 
 def test_asura_ingest_uses_global_revision_without_persisting_an_override(

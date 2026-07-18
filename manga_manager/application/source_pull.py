@@ -31,7 +31,12 @@ from manga_manager.infrastructure.catalog_repository import (
     listing_observation_version,
 )
 from manga_manager.infrastructure.job_queue import JobQueue
-from manga_manager.infrastructure.db_models import CatalogSourceSeries, CatalogSourceState, WorkJob
+from manga_manager.infrastructure.db_models import (
+    CatalogAlternateSourceListing,
+    CatalogSourceSeries,
+    CatalogSourceState,
+    WorkJob,
+)
 from sqlalchemy import select
 from manga_manager.worker.runtime import SessionFactory
 
@@ -200,6 +205,19 @@ class SourcePullHandler:
                 )
             )
         }
+        alternate_ids = [item.source_id for item in items if item.source_id not in identities]
+        for source_id, identity in session.execute(
+            select(CatalogAlternateSourceListing.source_id, CatalogSourceSeries)
+            .join(
+                CatalogSourceSeries,
+                CatalogSourceSeries.id == CatalogAlternateSourceListing.primary_source_series_id,
+            )
+            .where(
+                CatalogAlternateSourceListing.source == source,
+                CatalogAlternateSourceListing.source_id.in_(alternate_ids or [""]),
+            )
+        ):
+            identities[source_id] = identity
         stale_before = utcnow() - timedelta(days=7)
         changed: list[SeriesItem] = []
         for item in items:

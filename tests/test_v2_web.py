@@ -501,13 +501,11 @@ async def test_connected_batch_matches_merge_once() -> None:
         assert session.query(WorkJob).filter_by(kind="library_repair").count() == 1
 
 
-async def test_oversized_connected_match_batch_is_previewed_and_left_pending() -> None:
+async def test_connected_batch_consolidates_equivalent_duplicate_provider_records() -> None:
     app, sessions = app_with_catalog()
     with sessions() as session, session.begin():
         first_identity = session.query(CatalogSourceSeries).filter_by(source="asura").one()
-        second_identity = session.query(CatalogSourceSeries).filter_by(
-            source="mangafire"
-        ).one()
+        second_identity = session.query(CatalogSourceSeries).filter_by(source="mangafire").one()
         third = CatalogSeries(title="Third", normalized_title="third", status="interested")
         fourth = CatalogSeries(title="Fourth", normalized_title="fourth", status="interested")
         session.add_all([third, fourth])
@@ -521,8 +519,8 @@ async def test_oversized_connected_match_batch_is_previewed_and_left_pending() -
             url="https://kingofshojo.example/third",
         )
         # This is an equivalent historical Asura identity: the rotating revision suffix is
-        # intentionally ignored. It therefore has no provider conflict but still makes the
-        # connected component larger than the configured three-provider merge limit.
+        # intentionally ignored. Suggested repair may therefore consolidate all four canonical
+        # records even though the manual three-provider selection UI remains capped at three.
         fourth_identity = CatalogSourceSeries(
             series_id=fourth.id,
             source="asura",
@@ -565,16 +563,15 @@ async def test_oversized_connected_match_batch_is_previewed_and_left_pending() -
 
     assert preview.status_code == 200
     assert preview.json()["selected"] == 3
-    assert preview.json()["eligible"] == 0
-    assert preview.json()["blocked"] == 3
-    reasons = {reason for item in preview.json()["items"] for reason in item["blocked_reasons"]}
-    assert "connected component contains 4 manga; maximum is 3" in reasons
+    assert preview.json()["eligible"] == 3
+    assert preview.json()["blocked"] == 0
     assert result.status_code == 200
-    assert result.json()["ids"] == []
-    assert len(result.json()["blocked"]) == 3
+    assert len(result.json()["ids"]) == 3
+    assert result.json()["blocked"] == []
     with sessions() as session:
-        assert session.query(CatalogSeries).count() == 4
-        assert {row.decision for row in session.query(CatalogMatchDecision)} == {"pending"}
+        assert session.query(CatalogSeries).count() == 1
+        assert session.query(CatalogSourceSeries).count() == 3
+        assert {row.decision for row in session.query(CatalogMatchDecision)} == {"accepted"}
 
 
 async def test_provider_registry_expands_manual_merge_limit_dynamically(monkeypatch) -> None:
@@ -641,6 +638,16 @@ async def test_merge_consolidates_strong_same_provider_duplicate_before_group_me
         )
         session.add(duplicate)
         session.flush()
+        session.add(
+            CatalogAlternateSourceListing(
+                primary_source_series_id=duplicate.id,
+                source="mangafire",
+                source_id="older-alternate-slug",
+                title="Older alternate",
+                url="https://example.test/older-alternate",
+                evidence_json={},
+            )
+        )
         keeper = (
             session.query(CatalogSourceSeries)
             .filter_by(series_id=right.id, source="mangafire")
@@ -677,8 +684,12 @@ async def test_merge_consolidates_strong_same_provider_duplicate_before_group_me
     with sessions() as session:
         assert session.query(CatalogSeries).count() == 1
         assert session.query(CatalogSourceSeries).filter_by(source="mangafire").count() == 1
-        alternate = session.query(CatalogAlternateSourceListing).one()
-        assert alternate.source_id == "alternate-slug"
+        alternates = session.query(CatalogAlternateSourceListing).all()
+        assert {row.source_id for row in alternates} == {
+            "alternate-slug",
+            "older-alternate-slug",
+        }
+        assert len({row.primary_source_series_id for row in alternates}) == 1
         label = session.query(MatchTrainingLabel).one()
         assert label.label == 1
         assert label.origin == "suggested_review"
