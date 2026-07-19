@@ -27,8 +27,9 @@ from manga_manager.worker.runtime import SessionFactory
 
 
 LEGACY_ALGORITHM = "dhash-crop-v2"
-ALGORITHM = "orb-multihash-v1"
+ALGORITHM = "orb-normalized-multihash-v2"
 THUMBNAIL_MAX_SIZE = (480, 720)
+FEATURE_LONG_EDGE = 720
 _COVER_EXECUTOR = AsyncBoundedExecutor(workers=1, thread_name_prefix="manga-cover")
 
 
@@ -151,10 +152,16 @@ def cover_signature(content: bytes) -> tuple[dict, bytes, bytes]:
             _dhash(_fractional_crop(image, margin, margin * 0.75))
             for margin in (0, 0.05, 0.1, 0.15)
         ]
-    encoded = np.frombuffer(content, dtype=np.uint8)
-    gray = cv2.imdecode(encoded, cv2.IMREAD_GRAYSCALE)
-    if gray is None:
-        raise ValueError("cover cannot be decoded by OpenCV")
+        # Provider covers range from small thumbnails to multi-megapixel originals. ORB's
+        # scale pyramid cannot bridge a tenfold size difference reliably, so calculate every
+        # descriptor in the same coordinate space while retaining the original for storage.
+        scale = FEATURE_LONG_EDGE / max(width, height)
+        normalized_size = (
+            max(1, round(width * scale)),
+            max(1, round(height * scale)),
+        )
+        normalized = image.resize(normalized_size, Image.Resampling.LANCZOS)
+        gray = cv2.cvtColor(np.asarray(normalized), cv2.COLOR_RGB2GRAY)
     orb = cv2.ORB_create(nfeatures=1000, fastThreshold=7)
     keypoints, descriptors = orb.detectAndCompute(gray, None)
     points = np.asarray([point.pt for point in keypoints], dtype=np.float32)
@@ -166,6 +173,8 @@ def cover_signature(content: bytes) -> tuple[dict, bytes, bytes]:
     features = {
         "width": width,
         "height": height,
+        "normalized_width": normalized_size[0],
+        "normalized_height": normalized_size[1],
         "hashes": hashes,
         "keypoint_count": int(len(points)),
         "descriptor_rows": int(len(descriptors)),
@@ -191,6 +200,7 @@ def compare_signatures(left: CatalogCoverSignature, right: CatalogCoverSignature
             "cover_signature_invalid": True,
             "cover_hash_distance": hash_distance,
             "cover_match": False,
+            "cover_evidence_state": "invalid",
         }
     if len(left_points) != len(left_descriptors) or len(right_points) != len(right_descriptors):
         return {
@@ -198,6 +208,7 @@ def compare_signatures(left: CatalogCoverSignature, right: CatalogCoverSignature
             "cover_signature_invalid": True,
             "cover_hash_distance": hash_distance,
             "cover_match": False,
+            "cover_evidence_state": "invalid",
         }
     good = []
     if len(left_descriptors) >= 2 and len(right_descriptors) >= 2:
@@ -218,6 +229,7 @@ def compare_signatures(left: CatalogCoverSignature, right: CatalogCoverSignature
                 "cover_signature_invalid": True,
                 "cover_hash_distance": hash_distance,
                 "cover_match": False,
+                "cover_evidence_state": "invalid",
             }
     inliers = 0
     if len(good) >= 4:
@@ -229,14 +241,30 @@ def compare_signatures(left: CatalogCoverSignature, right: CatalogCoverSignature
         except cv2.error:
             inliers = 0
     ratio = inliers / max(len(good), 1)
-    strong = inliers >= 12 and ratio >= 0.65 and hash_distance <= 14
+    strong_geometry = inliers >= 12 and ratio >= 0.65 and hash_distance <= 18
+    strong_hash_with_geometry = inliers >= 4 and ratio >= 0.6 and hash_distance <= 4
+    cover_match = strong_geometry or strong_hash_with_geometry
+    likely = not cover_match and (
+        (inliers >= 8 and ratio >= 0.5 and hash_distance <= 22)
+        or (inliers >= 4 and ratio >= 0.5 and hash_distance <= 10)
+    )
+    different = hash_distance >= 28 and inliers < 4
+    if cover_match:
+        state = "match"
+    elif likely:
+        state = "likely"
+    elif different:
+        state = "different"
+    else:
+        state = "inconclusive"
     return {
         "cover_compared": True,
         "cover_hash_distance": hash_distance,
         "cover_ratio_matches": len(good),
         "cover_inliers": inliers,
         "cover_inlier_ratio": round(ratio, 6),
-        "cover_match": strong,
+        "cover_match": cover_match,
+        "cover_evidence_state": state,
     }
 
 
@@ -276,6 +304,18 @@ def _score_cover_candidates(
 
     with session_factory() as session:
         return score_candidate_set(session, [source_series_id], candidate_series_ids)
+
+
+def _rescore_pending_decisions(
+    session_factory: SessionFactory,
+    canonical_series_id: int,
+) -> int:
+    from manga_manager.application.matching_score import (
+        rescore_pending_decisions_for_series,
+    )
+
+    with session_factory() as session, session.begin():
+        return rescore_pending_decisions_for_series(session, canonical_series_id)
 
 
 class CoverEvidenceService:
@@ -330,6 +370,14 @@ class CoverEvidenceService:
             source_id = source.id
             canonical_id = source.series_id
             source_title = source.title
+        # Catalog ingestion necessarily runs before a newly fetched signature exists. Revisit all
+        # existing pending proposals for this canonical series once the signature is ready. This
+        # updates evidence only; decisions remain pending until a user confirms them.
+        await run_cover_cpu(
+            _rescore_pending_decisions,
+            self.session_factory,
+            canonical_id,
+        )
         candidates = await run_cover_cpu(
             _visual_candidate_shortlist,
             source_title,
@@ -386,6 +434,7 @@ class CoverEvidenceService:
                     decision.feature_vector_json = features
 
     async def _ensure_signature(self, source_series_id: int) -> None:
+        cached_original: Path | None = None
         with self.session_factory() as session:
             identity = session.get(CatalogSourceSeries, source_series_id)
             existing = session.get(CatalogCoverSignature, source_series_id)
@@ -419,14 +468,24 @@ class CoverEvidenceService:
                     session.commit()
                 return
             cover_url, source = identity.cover_url, identity.source
-        parts = urlsplit(cover_url)
-        client = HttpSourceClient(
-            f"{parts.scheme}://{parts.netloc}",
-            source=source,
-            provider_origin_url=PROVIDER_ORIGINS.get(source),
-        )
+            if existing_asset is not None and existing_asset.source_url == cover_url:
+                candidate = self.storage_root / existing_asset.relative_path
+                if candidate.is_file():
+                    cached_original = candidate
         try:
-            content = await client.get_bytes(cover_url)
+            if cached_original is not None:
+                content = await run_cover_cpu(cached_original.read_bytes)
+            else:
+                parts = urlsplit(cover_url)
+                client = HttpSourceClient(
+                    f"{parts.scheme}://{parts.netloc}",
+                    source=source,
+                    provider_origin_url=PROVIDER_ORIGINS.get(source),
+                )
+                try:
+                    content = await client.get_bytes(cover_url)
+                finally:
+                    await client.aclose()
             if not content or len(content) > 5 * 1024 * 1024:
                 raise ValueError("cover is empty or exceeds 5 MiB")
             (
@@ -442,8 +501,6 @@ class CoverEvidenceService:
             ) = await run_cover_cpu(process_cover_content, content, self.storage_root)
         except Exception:
             return
-        finally:
-            await client.aclose()
         with self.session_factory() as session, session.begin():
             asset = session.get(CatalogCoverAsset, source_series_id) or CatalogCoverAsset(
                 source_series_id=source_series_id,

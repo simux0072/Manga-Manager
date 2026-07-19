@@ -20,6 +20,7 @@ from manga_manager.infrastructure.db_models import (
     WorkloadCycle,
 )
 from manga_manager.web.api import (
+    human_evidence,
     operational_error_message,
     pending_match_proposal_index,
     proposal_component_blockers,
@@ -98,6 +99,23 @@ def app_with_catalog():
         session.flush()
         session.add(JobEvent(job_id=job.id, event_type="enqueued", status="queued"))
     return create_app(sessions), sessions
+
+
+def test_match_evidence_labels_cover_and_latest_chapter_states() -> None:
+    labels = human_evidence(
+        {
+            "cover_evidence_state": "match",
+            "cover_inliers": 125,
+            "latest_chapter_compared": True,
+            "latest_chapter_match": True,
+            "latest_chapter_delta": "2",
+        }
+    )
+
+    assert {row["label"] for row in labels} == {
+        "Visual cover match · 125 aligned features",
+        "Latest chapters align · Δ2",
+    }
 
 
 async def test_health_and_legacy_bookmarks() -> None:

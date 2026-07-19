@@ -86,12 +86,14 @@ storage by default. Local staging uses 1 GiB (`STAGE_MIN_FREE_BYTES` overrides i
 - The scheduler automatically queues the same bounded repair for tracked artifacts missing their
   Kavita projection, so upgrades heal incrementally without a one-off command.
 - Cover evidence jobs stop after a bounded failed attempt for a specific cover URL and become
-  eligible again when that URL changes. A temporarily unavailable cover no longer prevents Kavita
-  series/chapter mapping or reading-progress synchronization.
-- Matches are review-only. Suggested matches combine title evidence with crop hashes and local ORB
-  geometry; Manual merge ranks the whole tracked library and accepts two or more provider-distinct
-  records (up to the configured provider count). Reviewed labels can be exported with
-  `export-match-training` without requiring a model.
+  eligible again when that URL or signature algorithm changes. Outdated signatures are rebuilt
+  from cached originals when possible. A temporarily unavailable cover does not prevent Kavita
+  mapping or reading-progress synchronization.
+- Matches are review-only; scores never merge records automatically. Suggested matches prioritize
+  normalized local ORB/hash cover evidence, then stricter title/alias evidence, descriptions,
+  chapter overlap, and latest numeric chapters with a two-chapter provider-delay tolerance. Manual
+  merge accepts two or more provider-distinct records (up to the configured provider count).
+  Reviewed labels can be exported with `export-match-training` without requiring a model.
 - `manga-manager diagnostic-bundle --output diagnostics.json` writes a bounded, credential-redacted
   database/provider/worker/storage snapshot suitable for issue reports.
 - `manga-manager database-audit --json --report database-audit.json` performs a read-only,

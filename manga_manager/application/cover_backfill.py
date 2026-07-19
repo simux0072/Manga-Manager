@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import hashlib
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 
-from manga_manager.application.cover_evidence import CoverEvidenceService
+from manga_manager.application.cover_evidence import ALGORITHM, CoverEvidenceService
 from manga_manager.application.job_handlers import JobContext, RetryableJobError
 from manga_manager.domain.jobs import CoverBackfillPayload, JobKind
 from manga_manager.infrastructure.db_models import (
@@ -36,7 +36,8 @@ class CoverBackfillHandler:
         await self.service.refresh_for_source_series(payload.source_series_id)
         context.ensure_lease()
         with self.service.session_factory() as session, session.begin():
-            if session.get(CatalogCoverSignature, payload.source_series_id) is None:
+            signature = session.get(CatalogCoverSignature, payload.source_series_id)
+            if signature is None or signature.algorithm_version != ALGORITHM:
                 raise RetryableJobError(
                     "cover_fetch_failed",
                     "provider cover could not be downloaded or decoded",
@@ -68,20 +69,27 @@ class CoverBackfillPlanner:
         )
         if active_chapters >= chapter_threshold:
             return 0
-        rows = session.scalars(
-            select(CatalogSourceSeries)
+        rows = session.execute(
+            select(CatalogSourceSeries, CatalogCoverSignature)
+            .outerjoin(
+                CatalogCoverSignature,
+                CatalogCoverSignature.source_series_id == CatalogSourceSeries.id,
+            )
             .where(CatalogSourceSeries.cover_url != "")
             .where(
-                ~select(CatalogCoverSignature.source_series_id)
-                .where(CatalogCoverSignature.source_series_id == CatalogSourceSeries.id)
-                .exists()
+                or_(
+                    CatalogCoverSignature.source_series_id.is_(None),
+                    CatalogCoverSignature.algorithm_version != ALGORITHM,
+                    CatalogCoverSignature.hash_band_0 == "",
+                )
             )
             .order_by(CatalogSourceSeries.last_checked_at.desc(), CatalogSourceSeries.id)
             .limit(max(limit * 20, 100))
         ).all()
         created = 0
-        for row in rows:
-            revision = hashlib.sha1(row.cover_url.encode("utf-8")).hexdigest()[:12]
+        for row, signature in rows:
+            revision_input = row.cover_url if signature is None else f"{ALGORITHM}:{row.cover_url}"
+            revision = hashlib.sha1(revision_input.encode()).hexdigest()[:12]
             dedupe_key = f"cover:{row.id}:{revision}"
             exhausted = session.scalar(
                 select(WorkJob.id)

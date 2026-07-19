@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 from PIL import Image, ImageDraw
 from sqlalchemy import create_engine, select
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from manga_manager.application.cover_evidence import (
@@ -101,6 +101,14 @@ def detailed_cover(*, zoom: bool = False, translated_title: bool = False) -> byt
     return output.getvalue()
 
 
+def resized_cover(content: bytes, size: tuple[int, int]) -> bytes:
+    with Image.open(io.BytesIO(content)) as opened:
+        image = opened.convert("RGB").resize(size, Image.Resampling.LANCZOS)
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=88)
+    return output.getvalue()
+
+
 def test_orb_signature_matches_translated_overlay_and_zoom_but_rejects_other_art() -> None:
     original = signature(detailed_cover(), 1)
     translated = signature(detailed_cover(translated_title=True), 2)
@@ -114,6 +122,19 @@ def test_orb_signature_matches_translated_overlay_and_zoom_but_rejects_other_art
     import cv2
 
     assert cv2.getNumThreads() == 1
+
+
+def test_orb_signature_normalizes_provider_thumbnail_and_original_sizes() -> None:
+    content = detailed_cover()
+    original = signature(resized_cover(content, (2880, 4120)), 1)
+    thumbnail = signature(resized_cover(content, (280, 400)), 2)
+
+    evidence = compare_signatures(original, thumbnail)
+
+    assert evidence["cover_match"] is True
+    assert evidence["cover_evidence_state"] == "match"
+    assert original.feature_json["normalized_height"] == 720
+    assert thumbnail.feature_json["normalized_height"] == 720
 
 
 def test_corrupt_signature_is_treated_as_inconclusive() -> None:
@@ -187,6 +208,95 @@ def test_cover_backfill_does_not_requeue_an_exhausted_url_forever() -> None:
 
     assert created == 1
     assert [row.payload["source_series_id"] for row in queued] == [pending.id]
+
+
+def test_cover_backfill_requeues_outdated_signature_from_cached_asset() -> None:
+    engine = create_engine("sqlite://")
+    JobBase.metadata.create_all(engine)
+    with Session(engine) as session, session.begin():
+        series = CatalogSeries(title="Example", normalized_title="example")
+        session.add(series)
+        session.flush()
+        identity = CatalogSourceSeries(
+            series_id=series.id,
+            source="asura",
+            source_id="example",
+            title="Example",
+            normalized_title="example",
+            url="https://asurascans.com/comics/example",
+            cover_url="https://cdn.asurascans.com/example.webp",
+        )
+        session.add(identity)
+        session.flush()
+        session.add(
+            CatalogCoverSignature(
+                source_series_id=identity.id,
+                algorithm_version="orb-multihash-v1",
+                feature_json={"hashes": ["0" * 16]},
+                keypoints_blob=b"",
+                descriptors_blob=b"",
+            )
+        )
+        identity_id = identity.id
+
+    with Session(engine) as session, session.begin():
+        created = CoverBackfillPlanner().enqueue_pending(session, limit=10)
+        queued = session.query(WorkJob).filter_by(status="queued").one()
+
+        assert created == 1
+        assert queued.payload["source_series_id"] == identity_id
+
+
+@pytest.mark.asyncio
+async def test_outdated_signature_is_rebuilt_from_cached_cover_without_network(tmp_path) -> None:
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    sessions = sessionmaker(engine, autoflush=False, expire_on_commit=False)
+    JobBase.metadata.create_all(engine)
+    content = detailed_cover()
+    processed = process_cover_content(content, tmp_path)
+    with sessions() as session, session.begin():
+        series = CatalogSeries(title="Example", normalized_title="example")
+        session.add(series)
+        session.flush()
+        identity = CatalogSourceSeries(
+            series_id=series.id,
+            source="asura",
+            source_id="example",
+            title="Example",
+            normalized_title="example",
+            url="https://asurascans.com/comics/example",
+            cover_url="https://unreachable.test/example.webp",
+        )
+        session.add(identity)
+        session.flush()
+        old = signature(content, identity.id)
+        old.algorithm_version = "orb-multihash-v1"
+        session.add_all(
+            [
+                old,
+                CatalogCoverAsset(
+                    source_series_id=identity.id,
+                    content_checksum=processed[1],
+                    relative_path=processed[-1].as_posix(),
+                    source_url=identity.cover_url,
+                    width=processed[2],
+                    height=processed[3],
+                ),
+            ]
+        )
+        identity_id = identity.id
+
+    await CoverEvidenceService(sessions, tmp_path).refresh_for_source_series(identity_id)
+
+    with sessions() as session:
+        rebuilt = session.get(CatalogCoverSignature, identity_id)
+        assert rebuilt is not None
+        assert rebuilt.algorithm_version == ALGORITHM
+        assert rebuilt.feature_json["normalized_height"] == 720
 
 
 @pytest.mark.asyncio

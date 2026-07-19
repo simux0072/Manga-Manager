@@ -57,10 +57,13 @@ UV_CACHE_DIR=/tmp/uv-cache uv run manga-manager export-match-training training-d
 
 The JSONL manifest contains immutable feature and identity snapshots. Cached covers are hardlinked
 where possible, so exporting does not duplicate a large image collection on the same filesystem.
-The current scorer uses four crop-aware difference hashes as a cheap candidate gate, then ORB feature
-matching with RANSAC geometry. It tolerates translated title overlays and modest crop/zoom changes
-without a transformer. Every proposed match remains operator-reviewed; accepted and rejected labels
-are snapshotted before identities are merged or deleted.
+The current scorer normalizes covers to a shared feature resolution, uses four crop-aware difference
+hashes as a cheap candidate gate, then applies ORB matching with RANSAC geometry. This handles
+provider thumbnails, translated title overlays, and modest crop/zoom changes without a transformer.
+Cover evidence is weighted above title similarity; latest numeric chapters provide supporting
+evidence when providers differ by no more than two chapters. Every proposal remains operator-reviewed
+regardless of score. Pending decisions are rescored after a signature is created or replaced, and
+accepted/rejected labels are snapshotted before identities are merged or deleted.
 
 ## PostgreSQL provider identity repair
 

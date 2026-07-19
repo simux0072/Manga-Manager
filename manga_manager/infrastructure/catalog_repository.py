@@ -448,58 +448,11 @@ class CatalogRepository:
 
     @staticmethod
     def _refresh_match_scores(session: Session, source_series: CatalogSourceSeries) -> None:
-        from manga_manager.application.matching_score import score_candidate_set
-
-        decisions = session.scalars(
-            select(CatalogMatchDecision).where(
-                CatalogMatchDecision.decision == "pending",
-                (CatalogMatchDecision.left_source_series_id == source_series.id)
-                | (CatalogMatchDecision.right_source_series_id == source_series.id),
-            )
-        ).all()
-        identity_ids = {
-            identity_id
-            for decision in decisions
-            for identity_id in (
-                decision.left_source_series_id,
-                decision.right_source_series_id,
-            )
-        }
-        identities = {
-            identity.id: identity
-            for identity in session.scalars(
-                select(CatalogSourceSeries).where(CatalogSourceSeries.id.in_(identity_ids or {-1}))
-            )
-        }
-        candidate_ids = {
-            identity.series_id
-            for identity in identities.values()
-            if identity.series_id != source_series.series_id
-        }
-        evidence_by_series = score_candidate_set(
-            session,
-            [source_series.series_id],
-            sorted(candidate_ids),
+        from manga_manager.application.matching_score import (
+            rescore_pending_decisions_for_series,
         )
-        for decision in decisions:
-            left = identities.get(decision.left_source_series_id)
-            right = identities.get(decision.right_source_series_id)
-            if left is None or right is None:
-                continue
-            candidate_id = (
-                right.series_id if left.series_id == source_series.series_id else left.series_id
-            )
-            evidence = evidence_by_series.get(candidate_id)
-            if evidence is None:
-                continue
-            decision.confidence = float(evidence["score"])
-            decision.evidence_json = {
-                **evidence,
-                "title_or_alias": [left.title, right.title],
-                "policy": "manual_review_required",
-            }
-            decision.scorer_version = str(evidence["scorer_version"])
-            decision.feature_vector_json = evidence
+
+        rescore_pending_decisions_for_series(session, source_series.series_id)
 
     def _sync_aliases(
         self,

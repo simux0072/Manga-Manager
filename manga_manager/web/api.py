@@ -2128,19 +2128,32 @@ def human_evidence(raw: dict[str, Any] | None) -> list[dict[str, str]]:
     labels: list[dict[str, str]] = []
     if data.get("shared_external_id") or data.get("external_id"):
         labels.append({"tone": "positive", "label": "Shared external ID"})
-    if data.get("cover_match") is True:
+    cover_state = str(data.get("cover_evidence_state") or "")
+    if data.get("cover_match") is True or cover_state == "match":
         raw_inliers = data.get("cover_inliers")
         inliers = int(raw_inliers) if isinstance(raw_inliers, (int, float)) else 0
         label = f"Visual cover match · {inliers} aligned features" if inliers else "Cover match"
         labels.append({"tone": "positive", "label": label})
-    elif data.get("cover_compared") and data.get("cover_match") is False:
+    elif cover_state == "likely":
+        labels.append({"tone": "positive", "label": "Covers are likely similar"})
+    elif cover_state == "different":
+        labels.append({"tone": "warning", "label": "Cover artwork differs"})
+    elif data.get("cover_compared"):
         labels.append({"tone": "warning", "label": "Cover evidence inconclusive"})
-    elif data.get("cover_signature_invalid"):
+    elif cover_state == "invalid" or data.get("cover_signature_invalid"):
         labels.append({"tone": "warning", "label": "Cover signature needs refresh"})
+    else:
+        labels.append({"tone": "neutral", "label": "Cover comparison pending"})
     if data.get("title_or_alias") or data.get("title_match"):
         labels.append({"tone": "positive", "label": "Strong title or alias match"})
     if data.get("chapter_fingerprint"):
         labels.append({"tone": "positive", "label": "Chapter fingerprint match"})
+    if data.get("latest_chapter_compared"):
+        delta = str(data.get("latest_chapter_delta") or "0")
+        if data.get("latest_chapter_match"):
+            labels.append({"tone": "positive", "label": f"Latest chapters align · Δ{delta}"})
+        else:
+            labels.append({"tone": "warning", "label": f"Latest chapters differ · Δ{delta}"})
     if "manual_review" in str(data.get("policy", "")):
         labels.append({"tone": "neutral", "label": "Manual review required"})
     return labels or [{"tone": "neutral", "label": "Similarity candidate"}]
