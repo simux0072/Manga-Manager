@@ -25,6 +25,7 @@ from manga_manager.application.kavita_sync import KavitaSyncPlanner
 from manga_manager.application.library_repair import enqueue_library_repair
 from manga_manager.application.match_training import record_training_label
 from manga_manager.application.matching_score import score_candidate_set
+from manga_manager.application.provider_duplicates import equivalent_series_clusters
 from manga_manager.application.cover_evidence import (
     ensure_cover_thumbnail,
     thumbnail_relative_path,
@@ -207,23 +208,36 @@ def pending_match_proposal_index(
             )
         )
     rows = session.execute(query).all()
+    all_series_ids = {
+        series_id
+        for _decision_id, _confidence, left_series_id, right_series_id in rows
+        for series_id in (left_series_id, right_series_id)
+    }
+    equivalent_clusters = equivalent_series_clusters(session, all_series_ids)
     grouped: dict[tuple[int, int], dict[str, Any]] = {}
     for decision_id, confidence, left_series_id, right_series_id in rows:
-        if left_series_id == right_series_id:
+        left_cluster = equivalent_clusters.get(left_series_id, (left_series_id,))
+        right_cluster = equivalent_clusters.get(right_series_id, (right_series_id,))
+        left_root, right_root = left_cluster[0], right_cluster[0]
+        if left_root == right_root:
             # GET requests remain read-only. Maintenance and merge transactions close obsolete
             # source-level decisions; until then they are simply omitted from review.
             continue
-        key = tuple(sorted((left_series_id, right_series_id)))
+        key = tuple(sorted((left_root, right_root)))
+        member_series_ids = sorted(set(left_cluster) | set(right_cluster))
         proposal = grouped.get(key)
         if proposal is None:
             grouped[key] = {
                 "id": decision_id,
                 "confidence": confidence,
                 "decision_ids": [decision_id],
-                "series_ids": list(key),
+                "series_ids": member_series_ids,
             }
         else:
             proposal["decision_ids"].append(decision_id)
+            proposal["series_ids"] = sorted(
+                set(proposal["series_ids"]) | set(member_series_ids)
+            )
             if (confidence, -decision_id) > (proposal["confidence"], -proposal["id"]):
                 proposal.update(id=decision_id, confidence=confidence)
     for proposal in grouped.values():
@@ -286,11 +300,14 @@ def pending_match_proposal(
     ).one_or_none()
     if row is None or row[0] == row[1]:
         return None
-    series_pair = tuple(sorted((row[0], row[1])))
-    proposals = pending_match_proposal_index(session, series_pair=series_pair)
-    if len(proposals) != 1 or proposals[0]["id"] != representative_id:
-        return None
-    return proposals[0]
+    return next(
+        (
+            proposal
+            for proposal in pending_match_proposal_index(session)
+            if proposal["id"] == representative_id
+        ),
+        None,
+    )
 
 
 def proposal_blockers(session: Session, series_ids: list[int]) -> list[str]:
@@ -748,7 +765,11 @@ def create_api_router(
         else:
             start = 0
         rows = hydrate_match_proposals(session, proposals[start : start + limit])
-        canonical_ids = {source.series_id for row in rows for source in (row["left"], row["right"])}
+        canonical_ids = {
+            series_id
+            for row in rows
+            for series_id in row["series_ids"]
+        }
         canonical = {
             item["id"]: item
             for item in serialize_series(
@@ -795,8 +816,11 @@ def create_api_router(
             blockers = []
             if any(str(value) in active_series_keys for value in row["series_ids"]):
                 blockers.append("active jobs")
-            left_id, right_id = row["series_ids"]
-            if sources_by_series[left_id] & sources_by_series[right_id]:
+            source_counts: dict[str, int] = defaultdict(int)
+            for series_id in row["series_ids"]:
+                for source_name in sources_by_series[series_id]:
+                    source_counts[source_name] += 1
+            if any(count > 1 for count in source_counts.values()):
                 blockers.extend(
                     f"provider conflict: {value}"
                     for value in provider_merge_conflicts(session, row["series_ids"])

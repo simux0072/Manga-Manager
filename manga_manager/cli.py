@@ -213,7 +213,8 @@ def build_parser() -> argparse.ArgumentParser:
     library_repair.add_argument("series_id", type=int, nargs="?")
     library_repair.add_argument("--all-tracked", action="store_true")
     provider_repair = subcommands.add_parser(
-        "repair-provider-identities", help="audit or repair normalized provider identities"
+        "repair-provider-identities",
+        help="audit or repair normalized and strongly evidenced duplicate provider identities",
     )
     provider_repair.add_argument("--report", type=Path, required=True)
     provider_repair.add_argument("--apply", action="store_true")

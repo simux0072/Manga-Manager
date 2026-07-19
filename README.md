@@ -125,3 +125,7 @@ distinct series discovered by one provider poll, not duplicate homepage requests
 are deduplicated by provider identity and only materially newer observations are coalesced into the
 existing job. Refresh reconciliation preserves compatible v1/v2 work, regroups legacy rows, and
 rebuilds only unsupported payload versions; leased work receives one deferred replacement.
+
+Provider repair also converts strongly evidenced duplicate source IDs into alternate listings. New
+pulls apply the same title, chapter-overlap, and external-ID checks under a provider/title transaction
+lock, preventing concurrent refresh workers from recreating duplicate canonical manga.

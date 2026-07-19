@@ -25,6 +25,7 @@ from manga_manager.infrastructure.db_models import (
     ProviderPolicy,
 )
 from app.adapters.asura import split_asura_source_id
+from manga_manager.application.provider_duplicates import duplicate_identity_evidence
 
 
 def utcnow() -> datetime:
@@ -89,6 +90,21 @@ class CatalogRepository:
     ) -> CatalogSourceSeries:
         chapter_items = list(chapters)
         normalized_source_id = self._normalized_identity(item)
+        normalized_item_title = normalize_title(item.title)
+        if (
+            normalized_item_title
+            and session.bind is not None
+            and session.bind.dialect.name == "postgresql"
+        ):
+            # Separate refresh workers can discover two aliases of one provider listing at the
+            # same time. Serialize only this provider/title identity decision, not the pull.
+            session.execute(
+                text("SELECT pg_advisory_xact_lock(:namespace, hashtext(:identity_key))"),
+                {
+                    "namespace": 0x4D445550,
+                    "identity_key": f"{item.source}:{normalized_item_title}",
+                },
+            )
         source_series = session.scalar(
             select(CatalogSourceSeries).where(
                 CatalogSourceSeries.source == item.source,
@@ -106,6 +122,20 @@ class CatalogRepository:
             )
             if alternate is not None:
                 source_series = session.get(CatalogSourceSeries, alternate.primary_source_series_id)
+        if source_series is None:
+            equivalent = self._equivalent_provider_identity(session, item, chapter_items)
+            if equivalent is not None:
+                source_series, evidence = equivalent
+                alternate = CatalogAlternateSourceListing(
+                    primary_source_series_id=source_series.id,
+                    source=item.source,
+                    source_id=item.source_id,
+                    title=item.title,
+                    url=item.url,
+                    evidence_json=evidence,
+                )
+                session.add(alternate)
+                session.flush()
         if source_series is None:
             series = self._matching_series(session, item) or CatalogSeries(
                 title=item.title,
@@ -139,12 +169,14 @@ class CatalogRepository:
                 raise RuntimeError(f"canonical series {source_series.series_id} is missing")
 
         now = utcnow()
-        source_series.title = item.title
         if alternate is None:
+            source_series.title = item.title
             source_series.source_id = (
                 normalized_source_id if item.source == "asura" else item.source_id
             )
             source_series.normalized_source_id = normalized_source_id
+            source_series.normalized_title = normalized_item_title
+            source_series.url = item.url
         else:
             # Keep the selected primary identity stable while recording that this historical
             # alternate is still live and may carry fresher metadata.
@@ -154,8 +186,6 @@ class CatalogRepository:
             source_series.revision_override = str(
                 item.metadata.get("asura_revision_override") or ""
             )
-        source_series.normalized_title = normalize_title(item.title)
-        source_series.url = item.url
         source_series.description = item.description
         source_series.cover_url = item.cover_url
         source_series.popularity = item.popularity
@@ -182,6 +212,90 @@ class CatalogRepository:
         self._refresh_match_scores(session, source_series)
         session.flush()
         return source_series
+
+    @staticmethod
+    def _equivalent_provider_identity(
+        session: Session,
+        item: SeriesItem,
+        chapters: list[ChapterItem],
+    ) -> tuple[CatalogSourceSeries, dict] | None:
+        """Resolve a new provider ID as an alternate only with strong catalog evidence."""
+        normalized_title = normalize_title(item.title)
+        incoming_chapters = {
+            canonical_chapter_number(chapter.number)
+            for chapter in chapters
+            if chapter_sort_number(chapter.number) is not None
+        }
+        if not normalized_title or not incoming_chapters:
+            return None
+        candidates = session.scalars(
+            select(CatalogSourceSeries)
+            .where(
+                CatalogSourceSeries.source == item.source,
+                CatalogSourceSeries.normalized_title == normalized_title,
+            )
+            .order_by(CatalogSourceSeries.id)
+        ).all()
+        if not candidates:
+            return None
+        candidate_ids = {candidate.id for candidate in candidates}
+        candidate_chapters: dict[int, set[str]] = {
+            candidate_id: set() for candidate_id in candidate_ids
+        }
+        for identity_id, chapter_number in session.execute(
+            select(
+                CatalogChapterRelease.source_series_id,
+                CatalogChapter.canonical_number,
+            )
+            .join(CatalogChapter, CatalogChapter.id == CatalogChapterRelease.chapter_id)
+            .where(
+                CatalogChapterRelease.source_series_id.in_(candidate_ids),
+                CatalogChapter.sort_number.is_not(None),
+            )
+        ):
+            candidate_chapters[identity_id].add(chapter_number)
+        external_ids: dict[int, dict[str, str]] = {
+            candidate_id: {} for candidate_id in candidate_ids
+        }
+        for identity_id, provider, value in session.execute(
+            select(
+                CatalogExternalIdentifier.source_series_id,
+                CatalogExternalIdentifier.provider,
+                CatalogExternalIdentifier.value,
+            ).where(CatalogExternalIdentifier.source_series_id.in_(candidate_ids))
+        ):
+            external_ids[identity_id][provider] = value
+        incoming = CatalogSourceSeries(
+            series_id=0,
+            source=item.source,
+            source_id=item.source_id,
+            normalized_source_id=CatalogRepository._normalized_identity(item),
+            title=item.title,
+            normalized_title=normalized_title,
+            url=item.url,
+        )
+        matches = []
+        for candidate in candidates:
+            evidence = duplicate_identity_evidence(
+                candidate,
+                incoming,
+                left_chapters=candidate_chapters[candidate.id],
+                right_chapters=incoming_chapters,
+                left_external_ids=external_ids[candidate.id],
+                right_external_ids=item.external_ids,
+            )
+            if evidence["equivalent"]:
+                matches.append((candidate, evidence))
+        if not matches:
+            return None
+        return max(
+            matches,
+            key=lambda match: (
+                match[1]["chapter_overlap_ratio"],
+                match[1]["chapter_overlap"],
+                -match[0].id,
+            ),
+        )
 
     @staticmethod
     def _normalized_identity(item: SeriesItem) -> str:

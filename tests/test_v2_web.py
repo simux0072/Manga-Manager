@@ -19,7 +19,11 @@ from manga_manager.infrastructure.db_models import (
     WorkJob,
     WorkloadCycle,
 )
-from manga_manager.web.api import operational_error_message
+from manga_manager.web.api import (
+    operational_error_message,
+    pending_match_proposal_index,
+    proposal_component_blockers,
+)
 from manga_manager.web.app import create_app
 
 
@@ -392,6 +396,80 @@ async def test_matches_collapse_multiple_identity_decisions_per_canonical_pair()
     assert rejected.status_code == 200
     with sessions() as session:
         assert {row.decision for row in session.query(CatalogMatchDecision)} == {"rejected"}
+
+
+def test_matches_collapse_equivalent_same_provider_canonical_records() -> None:
+    _app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        asura = session.query(CatalogSourceSeries).filter_by(source="asura").one()
+        primary = session.query(CatalogSourceSeries).filter_by(source="mangafire").one()
+        primary_series = session.get(CatalogSeries, primary.series_id)
+        for number in range(2, 7):
+            chapter = CatalogChapter(
+                series_id=primary.series_id,
+                canonical_number=str(number),
+                display_number=str(number),
+                sort_number=number,
+            )
+            session.add(chapter)
+            session.flush()
+            session.add(
+                CatalogChapterRelease(
+                    chapter_id=chapter.id,
+                    source_series_id=primary.id,
+                    source="mangafire",
+                    source_release_id=str(number),
+                    url=f"https://example.test/tracked/{number}",
+                )
+            )
+        duplicate_series = CatalogSeries(
+            title=primary_series.title,
+            normalized_title=primary_series.normalized_title,
+            status="untracked",
+        )
+        session.add(duplicate_series)
+        session.flush()
+        duplicate = CatalogSourceSeries(
+            series_id=duplicate_series.id,
+            source="mangafire",
+            source_id="tracked-alternate",
+            title=primary.title,
+            normalized_title=primary.normalized_title,
+            url="https://example.test/tracked-alternate",
+        )
+        session.add(duplicate)
+        session.flush()
+        for number in range(1, 7):
+            chapter = CatalogChapter(
+                series_id=duplicate_series.id,
+                canonical_number=str(number),
+                display_number=str(number),
+                sort_number=number,
+            )
+            session.add(chapter)
+            session.flush()
+            session.add(
+                CatalogChapterRelease(
+                    chapter_id=chapter.id,
+                    source_series_id=duplicate.id,
+                    source="mangafire",
+                    source_release_id=str(number),
+                    url=f"https://example.test/tracked-alternate/{number}",
+                )
+            )
+        session.add(
+            CatalogMatchDecision(
+                left_source_series_id=min(asura.id, duplicate.id),
+                right_source_series_id=max(asura.id, duplicate.id),
+                confidence=0.91,
+            )
+        )
+    with sessions() as session:
+        proposals = pending_match_proposal_index(session)
+        assert len(proposals) == 1
+        assert len(proposals[0]["decision_ids"]) == 2
+        assert len(proposals[0]["series_ids"]) == 3
+        assert proposal_component_blockers(session, proposals[0]["series_ids"]) == []
 
 
 async def test_match_cursor_survives_reviewing_the_preceding_proposal() -> None:

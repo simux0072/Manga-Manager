@@ -6,6 +6,7 @@ from sqlalchemy import delete, func, select
 
 from app.adapters.asura import asura_series_url, split_asura_source_id
 from app.domain import title_similarity
+from manga_manager.application.provider_duplicates import provider_duplicate_groups
 from manga_manager.infrastructure.catalog_repository import CatalogRepository
 from manga_manager.infrastructure.db_models import (
     CatalogChapter,
@@ -23,6 +24,7 @@ class ProviderRepairRecord:
     identity_ids: list[int]
     action: str
     evidence: dict
+    source: str = "asura"
 
 
 class ProviderIdentityRepair:
@@ -62,6 +64,27 @@ class ProviderIdentityRepair:
                     "cover_agrees": cover_agrees,
                 },
             ))
+        for group in provider_duplicate_groups(
+            session,
+            excluded_sources={"asura"},
+            lock=lock,
+        ):
+            from manga_manager.web.api import provider_merge_conflicts
+
+            conflicts = provider_merge_conflicts(session, list(group.series_ids))
+            records.append(
+                ProviderRepairRecord(
+                    stable_id=f"{group.source}:{group.normalized_title}",
+                    identity_ids=list(group.identity_ids),
+                    action=(
+                        "consolidate_provider_duplicates"
+                        if not conflicts
+                        else "quarantine_provider_duplicates"
+                    ),
+                    evidence={**group.evidence, "provider_conflicts": conflicts},
+                    source=group.source,
+                )
+            )
         alias_query = (
             select(CatalogSeriesAlias)
             .join(
@@ -101,6 +124,38 @@ class ProviderIdentityRepair:
                     )
                 )
                 continue
+            if record.action == "consolidate_provider_duplicates":
+                rows = [session.get(CatalogSourceSeries, value) for value in record.identity_ids]
+                rows = [row for row in rows if row is not None]
+                series_ids = sorted({row.series_id for row in rows})
+                if len(series_ids) > 1:
+                    from manga_manager.web.app import merge_canonical_series
+
+                    target_id = merge_canonical_series(session, series_ids)
+                    repository._recompute_latest(session, target_id)
+                continue
+            if record.action == "quarantine_provider_duplicates":
+                existing = session.scalar(
+                    select(CatalogObservation).where(
+                        CatalogObservation.source == record.source,
+                        CatalogObservation.observation_type
+                        == "ambiguous_provider_duplicate",
+                        CatalogObservation.source_key == record.stable_id,
+                        CatalogObservation.state == "quarantined",
+                    )
+                )
+                if existing is None:
+                    session.add(
+                        CatalogObservation(
+                            source=record.source,
+                            observation_type="ambiguous_provider_duplicate",
+                            source_key=record.stable_id,
+                            state="quarantined",
+                            reason="canonical groups contain an unresolved provider conflict",
+                            payload_json={"evidence": record.evidence},
+                        )
+                    )
+                continue
             rows = [session.get(CatalogSourceSeries, value) for value in record.identity_ids]
             rows = [row for row in rows if row is not None]
             if record.action != "consolidate" or not rows:
@@ -114,7 +169,7 @@ class ProviderIdentityRepair:
                 )
                 if existing is None:
                     session.add(CatalogObservation(
-                        source="asura", observation_type="ambiguous_provider_identity",
+                        source=record.source, observation_type="ambiguous_provider_identity",
                         source_key=record.stable_id, state="quarantined",
                         reason="provider identity repair requires manual review",
                         payload_json=asdict(record),

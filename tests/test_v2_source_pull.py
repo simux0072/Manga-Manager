@@ -387,6 +387,86 @@ def test_ingest_reuses_historical_alternate_provider_identity(
         assert alternate.url == "https://mf.test/historical-new"
 
 
+def test_ingest_registers_strong_same_provider_duplicate_as_alternate(
+    sessions: TrackingSessionFactory,
+) -> None:
+    repository = CatalogRepository()
+
+    def chapters(source_id: str) -> list[ChapterItem]:
+        return [
+            ChapterItem(
+                "mangafire",
+                source_id,
+                str(number),
+                f"Chapter {number}",
+                f"https://mf.test/{source_id}/{number}",
+            )
+            for number in range(1, 11)
+        ]
+
+    with sessions() as session, session.begin():
+        primary = repository.ingest(
+            session,
+            SeriesItem(
+                "mangafire", "first-id", "Shared Manga", "https://mf.test/first-id"
+            ),
+            chapters("first-id"),
+        )
+        resolved = repository.ingest(
+            session,
+            SeriesItem(
+                "mangafire", "second-id", "Shared Manga", "https://mf.test/second-id"
+            ),
+            chapters("second-id"),
+        )
+        assert resolved.id == primary.id
+        assert resolved.source_id == "first-id"
+        assert session.query(CatalogSeries).count() == 1
+        assert session.query(CatalogSourceSeries).count() == 1
+        alternate = session.query(CatalogAlternateSourceListing).one()
+        assert alternate.source_id == "second-id"
+        assert alternate.primary_source_series_id == primary.id
+        assert alternate.evidence_json["chapter_overlap_ratio"] == 1.0
+
+
+def test_ingest_does_not_collapse_same_title_with_conflicting_external_id(
+    sessions: TrackingSessionFactory,
+) -> None:
+    repository = CatalogRepository()
+    chapters = [
+        ChapterItem(
+            "mangafire", "id", str(number), f"Chapter {number}", f"https://mf.test/{number}"
+        )
+        for number in range(1, 8)
+    ]
+    with sessions() as session, session.begin():
+        repository.ingest(
+            session,
+            SeriesItem(
+                "mangafire",
+                "first-id",
+                "Generic Shared Title",
+                "https://mf.test/first-id",
+                external_ids={"anilist": "100"},
+            ),
+            chapters,
+        )
+        repository.ingest(
+            session,
+            SeriesItem(
+                "mangafire",
+                "second-id",
+                "Generic Shared Title",
+                "https://mf.test/second-id",
+                external_ids={"anilist": "200"},
+            ),
+            chapters,
+        )
+        assert session.query(CatalogSeries).count() == 2
+        assert session.query(CatalogSourceSeries).count() == 2
+        assert session.query(CatalogAlternateSourceListing).count() == 0
+
+
 def test_asura_ingest_uses_global_revision_without_persisting_an_override(
     sessions: TrackingSessionFactory,
 ) -> None:

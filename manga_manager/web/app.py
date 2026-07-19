@@ -15,6 +15,9 @@ from manga_manager.infrastructure.db_models import (
     CatalogChapter,
     CatalogChapterReadingState,
     CatalogChapterRelease,
+    CatalogCoverAsset,
+    CatalogCoverFingerprint,
+    CatalogCoverSignature,
     ChapterReleaseAttempt,
     CatalogAlternateSourceListing,
     CatalogExternalIdentifier,
@@ -555,6 +558,35 @@ def _consolidate_overlapping_provider_identities(
             alternate.title = duplicate.title
             alternate.url = duplicate.url
             alternate.evidence_json = evidence
+        if not keeper.description and duplicate.description:
+            keeper.description = duplicate.description
+        if not keeper.cover_url and duplicate.cover_url:
+            keeper.cover_url = duplicate.cover_url
+        if not keeper.metadata_json and duplicate.metadata_json:
+            keeper.metadata_json = dict(duplicate.metadata_json)
+        keeper_cover = session.get(CatalogCoverAsset, keeper.id)
+        duplicate_cover = session.get(CatalogCoverAsset, duplicate.id)
+        if keeper_cover is None and duplicate_cover is not None:
+            duplicate_cover.source_series_id = keeper.id
+        keeper_signature = session.get(CatalogCoverSignature, keeper.id)
+        duplicate_signature = session.get(CatalogCoverSignature, duplicate.id)
+        if keeper_signature is None and duplicate_signature is not None:
+            duplicate_signature.source_series_id = keeper.id
+        for fingerprint in session.scalars(
+            select(CatalogCoverFingerprint).where(
+                CatalogCoverFingerprint.source_series_id == duplicate.id
+            )
+        ):
+            conflict = session.scalar(
+                select(CatalogCoverFingerprint.id).where(
+                    CatalogCoverFingerprint.source_series_id == keeper.id,
+                    CatalogCoverFingerprint.algorithm == fingerprint.algorithm,
+                )
+            )
+            if conflict is None:
+                fingerprint.source_series_id = keeper.id
+            else:
+                session.delete(fingerprint)
         for release in session.scalars(
             select(CatalogChapterRelease).where(
                 CatalogChapterRelease.source_series_id == duplicate.id

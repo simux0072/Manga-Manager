@@ -80,8 +80,17 @@ UV_CACHE_DIR=/tmp/uv-cache uv run manga-manager reconcile-refresh-queue \
   --report reports/refresh-queue-applied.json --apply
 ```
 
-The provider report consolidates only revision-independent Asura identities with strong title plus
-chapter/cover evidence, quarantines ambiguous pairs, rewrites release URLs, recomputes numeric latest
-chapters, and removes polluted provider aliases. Refresh reconciliation is bounded to active rows and
-does not discard frontier-discovered compatible work. Restore the database dump and its paired
-storage snapshot together if post-repair validation fails.
+The provider report consolidates revision-independent Asura identities and same-provider alternate
+listings only when the evidence is strong. Alternate listings require the same normalized title, at
+least five comparable chapters, at least 90% chapter overlap, and no conflicting shared external ID.
+The secondary source ID is retained in `alternate_source_listing_v2`, so later pulls update the
+primary identity instead of recreating a canonical manga. Ambiguous provider collisions are
+quarantined. The repair also rewrites Asura release URLs, recomputes numeric latest chapters, closes
+redundant match decisions, and removes polluted provider aliases. Refresh reconciliation is bounded
+to active rows and does not discard frontier-discovered compatible work. Restore the database dump
+and its paired storage snapshot together if post-repair validation fails.
+
+Suggested Matches applies the same equivalence policy while rendering its queue. Until the repair is
+applied, decisions involving two verified aliases are presented as one proposal and accepting it
+merges the complete connected component once. Do not replace this with title-only UI deduplication:
+unrelated works can legitimately share a translated title.
