@@ -133,8 +133,14 @@ class SourcePollScheduler:
         with self.session_factory() as session, session.begin():
             self.storage_capacity.refresh(session)
             count += self._recover_misclassified_provider_outages(session, current)
-            if self._due("download_recovery", current, timedelta(hours=6)):
-                DownloadPlanCoordinator(self.queue).bootstrap(session)
+            download_plans = DownloadPlanCoordinator(self.queue)
+            if self._due("download_bootstrap", current, timedelta(hours=6)):
+                download_plans.bootstrap(session)
+            # Successful downloads advance their plans transactionally.  This bounded sweep is
+            # the safety net for a worker crash between persistence and completion, and for a
+            # priority job whose final retry became terminal without a later successful sibling.
+            if self._due("download_reconcile", current, timedelta(minutes=1)):
+                download_plans.reconcile_active(session, limit=50)
             repair_planner = LibraryRepairPlanner(self.queue)
             if self._due("library_repair", current, timedelta(minutes=10)):
                 canonicalized, cancelled = repair_planner.reconcile_active_jobs(session)

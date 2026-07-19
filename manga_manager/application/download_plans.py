@@ -82,6 +82,19 @@ class DownloadPlanCoordinator:
         self.enqueue_preferred_upgrades(session, series_ids)
         return len(series_ids)
 
+    def reconcile_active(self, session: Session, *, limit: int = 50) -> int:
+        """Advance a bounded, oldest-first slice of active plans after crashes or failures."""
+        series_ids = session.scalars(
+            select(SeriesDownloadPlan.series_id)
+            .where(SeriesDownloadPlan.status == "active")
+            .order_by(SeriesDownloadPlan.updated_at, SeriesDownloadPlan.series_id)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        ).all()
+        for series_id in series_ids:
+            self.reconcile(session, series_id)
+        return len(series_ids)
+
     def fallback_release(
         self,
         session: Session,

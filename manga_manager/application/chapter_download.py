@@ -370,6 +370,12 @@ class ChapterDownloadHandler:
                     details_json={"artifact_id": result.artifact_id},
                 )
             )
+            # Keep the durable series plan in lockstep with the artifact transaction.  The
+            # priority wave (first two + latest two chapters) cannot release its backfill wave
+            # until these intents are marked satisfied.  Relying on the periodic recovery
+            # scheduler left otherwise successful plans stalled for hours and made their group
+            # progress counters remain at zero.
+            DownloadPlanCoordinator(self.queue).reconcile(session, snapshot.series_id)
 
     def _reroute(
         self,

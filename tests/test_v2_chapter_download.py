@@ -32,9 +32,11 @@ from manga_manager.infrastructure.db_models import (
     CatalogSourceSeries,
     CatalogSourceState,
     ChapterArtifact,
+    ChapterDownloadIntent,
     ChapterReleaseAttempt,
     JobBase,
     LibraryProjection,
+    SeriesDownloadPlan,
     WorkJob,
 )
 from manga_manager.infrastructure.job_queue import JobQueue
@@ -173,6 +175,55 @@ async def test_download_handler_keeps_database_closed_and_materializes_cbz(
         assert artifact.image_count == 2
         assert projection is not None
         assert (store.library_root / projection.relative_path).is_file()
+
+
+@pytest.mark.asyncio
+async def test_download_success_reconciles_plan_without_periodic_recovery(
+    sessions: TrackingSessions,
+    tmp_path: Path,
+) -> None:
+    _release_id, context = setup_release_and_context(sessions)
+    with sessions() as session, session.begin():
+        series = session.scalar(select(CatalogSeries))
+        chapter = session.scalar(select(CatalogChapter))
+        assert series is not None and chapter is not None
+        series.status = "interested"
+        session.add(
+            SeriesDownloadPlan(
+                series_id=series.id,
+                status="active",
+                phase="priority",
+                total_chapters=1,
+            )
+        )
+        session.add(
+            ChapterDownloadIntent(
+                series_id=series.id,
+                chapter_id=chapter.id,
+                tier="priority",
+                state="queued",
+                job_id=context.lease.id,
+            )
+        )
+        series_id = series.id
+
+    handler = ChapterDownloadHandler(
+        session_factory=sessions,
+        storage=storage(tmp_path),
+        adapter_factory=lambda _source: PageAdapter(sessions, [image_bytes("green")]),
+    )
+
+    await asyncio.wait_for(handler(context), timeout=5)
+
+    with sessions() as session:
+        plan = session.get(SeriesDownloadPlan, series_id)
+        intent = session.scalar(select(ChapterDownloadIntent))
+        assert plan is not None
+        assert plan.status == "complete"
+        assert plan.phase == "complete"
+        assert plan.total_chapters == 1
+        assert plan.satisfied_chapters == 1
+        assert intent is not None and intent.state == "satisfied"
 
 
 @pytest.mark.asyncio

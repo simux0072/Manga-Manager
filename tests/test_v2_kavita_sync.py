@@ -422,19 +422,25 @@ async def test_kavita_sync_waits_until_asynchronous_scan_exposes_chapters(
     )
     client = DelayedClient()
     context = Context()
+    progress: list[tuple[int, int]] = []
     handler = KavitaSyncHandler(
         session_factory=lambda: None,  # type: ignore[arg-type]
         library_root=tmp_path,
     )
 
     match, chapters = await handler._await_scan(
-        client, snapshot, "", context  # type: ignore[arg-type]
+        client,
+        snapshot,
+        "",
+        context,  # type: ignore[arg-type]
+        progress=lambda visible, expected: progress.append((visible, expected)),
     )
 
     assert match is not None and match.id == 2
     assert [chapter.number for chapter in chapters] == ["1"]
     assert client.detail_calls == 3
     assert context.checks == 3
+    assert progress == [(0, 1), (0, 1), (1, 1)]
 
 
 def test_kavita_match_ignores_stale_numeric_id_and_uses_current_identity(

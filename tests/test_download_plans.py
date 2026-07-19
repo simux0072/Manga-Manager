@@ -18,6 +18,7 @@ from manga_manager.infrastructure.db_models import (
     ArtifactBlob,
     ChapterArtifact,
     ChapterReleaseAttempt,
+    SeriesDownloadPlan,
 )
 
 
@@ -104,6 +105,24 @@ def test_priority_terminal_jobs_release_backfill_and_untrack_only_cancels_queued
     session.commit()
     assert leased.status == "leased"
     assert not session.scalars(select(WorkJob).where(WorkJob.status == "queued")).all()
+
+
+def test_bounded_recovery_advances_terminal_priority_plan() -> None:
+    session, series_id = populated_session()
+    coordinator = DownloadPlanCoordinator(rolling_window=2)
+    with session.begin():
+        coordinator.track(session, series_id)
+    with session.begin():
+        for job in session.scalars(select(WorkJob)).all():
+            job.status = "failed"
+        assert coordinator.reconcile_active(session, limit=1) == 1
+
+    plan = session.get(SeriesDownloadPlan, series_id)
+    backfill = session.scalars(
+        select(ChapterDownloadIntent).where(ChapterDownloadIntent.tier == "backfill")
+    ).all()
+    assert plan is not None and plan.phase == "backfill"
+    assert sum(row.state == "queued" for row in backfill) == 2
 
 
 def test_fallback_artifact_is_queued_for_preferred_source_upgrade() -> None:

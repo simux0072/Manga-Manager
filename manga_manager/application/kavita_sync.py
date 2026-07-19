@@ -257,10 +257,22 @@ class KavitaSyncHandler:
                 client, snapshot, str(kavita_folder)
             )
             if match is None:
-                self._progress(context, 0, "requesting Kavita library scan")
+                self._progress(context, 1, "requesting Kavita library scan")
                 await client.scan_folder_or_all(snapshot.folder_path)
                 match, chapters = await self._await_scan(
-                    client, snapshot, str(kavita_folder), context
+                    client,
+                    snapshot,
+                    str(kavita_folder),
+                    context,
+                    progress=lambda visible, expected: self._progress(
+                        context,
+                        1,
+                        (
+                            f"waiting for Kavita to index {visible} of {expected} chapters"
+                            if expected
+                            else "waiting for Kavita to index the series"
+                        ),
+                    ),
                 )
             if match is None:
                 self._invalidate_kavita_mapping(
@@ -699,8 +711,10 @@ class KavitaSyncHandler:
         snapshot: KavitaSnapshot,
         kavita_folder: str,
         context: JobContext,
+        progress: Callable[[int, int], None] | None = None,
     ) -> tuple[KavitaSeries | None, list[KavitaChapter]]:
         delay = 1.0
+        expected = set(snapshot.expected_chapters)
         for _ in range(60):
             context.ensure_lease()
             candidates = await client.list_series()
@@ -708,8 +722,12 @@ class KavitaSyncHandler:
             if match is not None:
                 chapters = await client.series_detail(match.id)
                 available = {canonical_chapter_number(chapter.number) for chapter in chapters}
-                if not snapshot.tracked or set(snapshot.expected_chapters).issubset(available):
+                if progress is not None:
+                    progress(len(expected & available), len(expected))
+                if not snapshot.tracked or expected.issubset(available):
                     return match, chapters
+            elif progress is not None:
+                progress(0, len(expected))
             await asyncio.sleep(delay)
             delay = min(delay * 1.35, 15.0)
         return None, []
