@@ -4,9 +4,22 @@ Normal starting limits are Asura 1 job/1 page, MangaFire 2 jobs/4 pages, and Kin
 pages, with one chapter per canonical series and eight chapter jobs globally. Source pulls use one
 independent pool per provider, so all three may pull concurrently.
 
-A source pull only reads a bounded recent listing and persists its frontier. Changed series become
+A source pull reads the provider's update-ordered feed and persists its frontier. Asura is scoped to
+the `Latest Updates` section (not the preceding trending shelf), KingOfShojo uses
+`/manga/?order=update`, and MangaFire uses its chapter-update JSON ordering. Every row on a fetched
+page is inspected; following pages are fetched until three saved series/chapter sentinels agree, the
+listing ends, or the configured recent-page safety window is reached. Changed series become
 deduplicated `source_refresh` jobs in the same provider pool, preventing one malformed or slow series
 from restarting an entire site scan.
+
+This is an incremental update scan, not a complete hourly catalog recrawl. If a provider batch-touches
+enough entries to fill the safety window before the frontier is found, Manga Manager additionally
+queues a direct refresh for every tracked series omitted from that window. The same fallback applies
+when Asura's finite Latest Updates feed no longer contains the saved frontier. This preserves tracked
+updates without repeatedly walking MangaFire's tens of thousands of titles. Operations reports
+`Caught up`, `Feed end`, `Feed window + tracked fallback`, or `Window limit` together with the pages
+and titles inspected. A persistent `Window limit` means the configured `*_RECENT_PAGES` value should
+be reviewed.
 
 Every HTTP request records status, latency, bytes, host, `Retry-After`, and whether it was origin or
 CDN traffic. PostgreSQL-backed endpoint schedules make pacing global across worker processes.

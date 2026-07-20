@@ -248,6 +248,75 @@ async def test_source_pull_reads_persisted_frontier(sessions: TrackingSessionFac
 
 
 @pytest.mark.asyncio
+async def test_source_pull_refreshes_tracked_series_outside_truncated_safety_window(
+    sessions: TrackingSessionFactory,
+) -> None:
+    with sessions() as session, session.begin():
+        tracked = CatalogSeries(
+            title="Tracked Outside Window",
+            normalized_title="tracked outside window",
+            status="reading",
+        )
+        untracked = CatalogSeries(
+            title="Untracked Outside Window",
+            normalized_title="untracked outside window",
+            status="untracked",
+        )
+        session.add_all([tracked, untracked])
+        session.flush()
+        session.add_all(
+            [
+                CatalogSourceSeries(
+                    series_id=tracked.id,
+                    source="fake",
+                    source_id="tracked-missing",
+                    title=tracked.title,
+                    normalized_title=tracked.normalized_title,
+                    url="https://example.test/tracked-missing",
+                ),
+                CatalogSourceSeries(
+                    series_id=untracked.id,
+                    source="fake",
+                    source_id="untracked-missing",
+                    title=untracked.title,
+                    normalized_title=untracked.normalized_title,
+                    url="https://example.test/untracked-missing",
+                ),
+            ]
+        )
+
+    adapter = FakeAdapter(sessions)
+    adapter.listing_diagnostics = {
+        "pages_fetched": 20,
+        "frontier_reached": False,
+        "listing_exhausted": False,
+        "safety_limit_reached": True,
+    }
+    await SourcePullHandler(
+        session_factory=sessions,
+        adapter_factory=lambda _source: adapter,
+    )(claimed_context(sessions))
+
+    with sessions() as session:
+        refreshes = list(
+            session.scalars(
+                select(WorkJob)
+                .where(WorkJob.kind == JobKind.SOURCE_REFRESH.value)
+                .order_by(WorkJob.id)
+            )
+        )
+        assert {job.payload["source_id"] for job in refreshes} == {
+            "series-1",
+            "tracked-missing",
+        }
+        state = session.get(CatalogSourceState, "fake")
+        assert state is not None
+        assert state.cursor_json["last_pull"]["candidates"] == 1
+        assert state.cursor_json["last_pull"]["refresh_candidates"] == 2
+        assert state.cursor_json["last_pull"]["tracked_safety_refreshes"] == 1
+
+
+@pytest.mark.asyncio
 async def test_source_pull_classifies_empty_protocol_error_as_network_failure(
     sessions: TrackingSessionFactory,
 ) -> None:

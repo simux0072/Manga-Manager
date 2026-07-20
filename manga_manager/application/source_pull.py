@@ -33,6 +33,7 @@ from manga_manager.infrastructure.catalog_repository import (
 from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.infrastructure.db_models import (
     CatalogAlternateSourceListing,
+    CatalogSeries,
     CatalogSourceSeries,
     CatalogSourceState,
     WorkJob,
@@ -151,7 +152,25 @@ class SourcePullHandler:
                 root_job.group_key = workflow_key
             if source == "asura":
                 listed_items = self._apply_asura_revision_consensus(session, listed_items)
-            candidates = self._changed_catalog_items(session, source, listed_items)
+            changed_candidates = self._changed_catalog_items(session, source, listed_items)
+            candidates = list(changed_candidates)
+            tracked_recovery = self._tracked_safety_recovery(
+                session,
+                source,
+                listed_items,
+                recovery_required=bool(
+                    getattr(adapter, "listing_diagnostics", {}).get(
+                        "safety_limit_reached", False
+                    )
+                    or getattr(adapter, "listing_diagnostics", {}).get(
+                        "tracked_fallback_required", False
+                    )
+                ),
+            )
+            candidate_ids = {item.source_id for item in candidates}
+            candidates.extend(
+                item for item in tracked_recovery if item.source_id not in candidate_ids
+            )
             self.queue.progress(
                 session,
                 job_id=context.lease.id,
@@ -181,9 +200,12 @@ class SourcePullHandler:
                 partial_failures=0,
                 metrics={
                     "listed": len(listed_items),
-                    "candidates": len(candidates),
+                    "candidates": len(changed_candidates),
+                    "refresh_candidates": len(candidates),
                     "refresh_jobs_created": created,
+                    "tracked_safety_refreshes": len(tracked_recovery),
                     "stable_sentinels_required": min(3, len(frontier)),
+                    **dict(getattr(adapter, "listing_diagnostics", {})),
                 },
             )
             self.queue.progress(
@@ -193,6 +215,47 @@ class SourcePullHandler:
                 message=f"queued {created} refresh jobs",
                 details={"phase": "enqueue", "processed": 2, "total": 2, "unit": "phases"},
             )
+
+    @staticmethod
+    def _tracked_safety_recovery(
+        session,
+        source: str,
+        listed_items: list[SeriesItem],
+        *,
+        recovery_required: bool,
+    ) -> list[SeriesItem]:
+        """Refresh tracked identities omitted by a truncated update-feed scan.
+
+        A provider can batch-touch enough catalog rows to push the saved frontier
+        beyond the configured page window.  Crawling the provider's entire catalog
+        is neither polite nor useful, but user-tracked manga must not miss updates.
+        """
+        if not recovery_required:
+            return []
+        observed_ids = {item.source_id for item in listed_items}
+        rows = session.scalars(
+            select(CatalogSourceSeries)
+            .join(CatalogSeries, CatalogSeries.id == CatalogSourceSeries.series_id)
+            .where(
+                CatalogSourceSeries.source == source,
+                CatalogSeries.status.in_(("interested", "reading", "caught_up", "paused")),
+                CatalogSourceSeries.source_id.not_in(observed_ids or {""}),
+            )
+            .order_by(CatalogSourceSeries.id)
+        )
+        return [
+            SeriesItem(
+                source=row.source,
+                source_id=row.source_id,
+                title=row.title,
+                url=row.url,
+                description=row.description,
+                cover_url=row.cover_url,
+                popularity=row.popularity,
+                metadata=dict(row.metadata_json or {}),
+            )
+            for row in rows
+        ]
 
     @staticmethod
     def _changed_catalog_items(session, source: str, items: list[SeriesItem]) -> list[SeriesItem]:

@@ -1,4 +1,6 @@
 import asyncio
+import html
+import json
 
 import pytest
 import httpx
@@ -644,11 +646,16 @@ async def test_asura_second_page_404_is_normal_pagination_end(monkeypatch):
     requested = []
 
     async def handler(request):
-        requested.append(request.url.path)
-        if request.url.path == "/":
+        page = request.url.params.get("page", "1")
+        requested.append(page)
+        if page == "1":
             return httpx.Response(
                 200,
-                text='<a href="/comics/one"><img src="/cover.jpg">One</a>',
+                text=(
+                    '<section><h2>Latest Updates</h2>'
+                    '<a href="/comics/one"><img src="/cover.jpg">One</a>'
+                    '</section><a href="/?page=2">2</a>'
+                ),
                 request=request,
             )
         return httpx.Response(404, request=request)
@@ -659,12 +666,199 @@ async def test_asura_second_page_404_is_normal_pagination_end(monkeypatch):
         "https://asurascans.com", transport=httpx.MockTransport(handler)
     )
     try:
+        items = await adapter.list_recent_frontier([FrontierSentinel("comics/older", "9")])
+    finally:
+        await adapter.aclose()
+
+    assert requested == ["1", "2"]
+    assert [item.title for item in items] == ["One"]
+    assert adapter.listing_diagnostics["tracked_fallback_required"] is True
+
+
+async def test_asura_follows_query_pagination_and_scopes_every_page(monkeypatch):
+    requested_pages = []
+
+    async def handler(request):
+        page = int(request.url.params.get("page", "1"))
+        requested_pages.append(page)
+        source_id = "known" if page == 4 else f"fresh-{page}"
+        chapter = "10" if page == 4 else str(20 - page)
+        return httpx.Response(
+            200,
+            text=f"""
+            <section><h2>Trending Comics</h2>
+              <a href="/comics/noise-{page}">Trending noise {page}</a>
+            </section>
+            <section><h2>Latest Updates</h2><div>
+              <a href="/comics/{source_id}">Series {page}</a>
+              <a href="/comics/{source_id}/chapter/{chapter}">Chapter {chapter}</a>
+            </div></section>
+            {f'<button aria-label="Page {page + 1}">{page + 1}</button>' if page < 4 else ''}
+            """,
+            request=request,
+        )
+
+    monkeypatch.setattr("app.adapters.asura.settings.asura_recent_pages", 5)
+    monkeypatch.setattr("app.adapters.asura.settings.source_frontier_required_hits", 1)
+    adapter = AsuraAdapter()
+    adapter.client = HttpSourceClient(
+        "https://asurascans.com", transport=httpx.MockTransport(handler)
+    )
+    try:
+        items = await adapter.list_recent_frontier([FrontierSentinel("comics/known", "10")])
+    finally:
+        await adapter.aclose()
+
+    assert requested_pages == [1, 2, 3, 4]
+    assert [item.source_id for item in items] == [
+        "comics/fresh-1",
+        "comics/fresh-2",
+        "comics/fresh-3",
+        "comics/known",
+    ]
+    assert all("noise" not in item.source_id for item in items)
+    assert adapter.listing_diagnostics["frontier_reached"] is True
+
+
+async def test_asura_homepage_prefers_chronological_card_over_trending_duplicate(monkeypatch):
+    async def handler(request):
+        return httpx.Response(
+            200,
+            text="""
+            <section>
+              <h2>Trending Comics</h2>
+              <div><a href="/comics/goblin-inc-1d35e5bd"><img src="/old.jpg">Goblin Inc</a></div>
+            </section>
+            <section>
+              <h2>Latest Updates</h2>
+              <div>
+                <a href="/comics/goblin-inc-1d35e5bd"><img src="/new.jpg">Goblin Inc</a>
+                <a href="/comics/goblin-inc-1d35e5bd/chapter/5">Chapter 5 just now</a>
+              </div>
+            </section>
+            """,
+            request=request,
+        )
+
+    monkeypatch.setattr("app.adapters.asura.settings.asura_recent_pages", 1)
+    adapter = AsuraAdapter()
+    adapter.client = HttpSourceClient(
+        "https://asurascans.com", transport=httpx.MockTransport(handler)
+    )
+    try:
         items = await adapter.list_recent_frontier([])
     finally:
         await adapter.aclose()
 
-    assert requested == ["/", "/page/2/"]
-    assert [item.title for item in items] == ["One"]
+    assert [item.title for item in items] == ["Goblin Inc"]
+    assert items[0].cover_url == "https://asurascans.com/new.jpg"
+    assert items[0].metadata["recent_chapters"][0]["number"] == "5"
+    assert adapter.listing_diagnostics["listing_exhausted"] is True
+
+
+async def test_asura_reads_every_embedded_latest_update_not_only_rendered_first_page(
+    monkeypatch,
+):
+    chapters = [
+        [
+            0,
+            {
+                "name": [0, str(index)],
+                "number": [0, index],
+                "title": [0],
+                "comic_name": [0, f"Series {index}"],
+                "comic_public_url": [0, f"/comics/series-{index}-1d35e5bd"],
+                "comic_cover": [0, f"https://cdn.test/series-{index}.webp"],
+            },
+        ]
+        for index in range(1, 26)
+    ]
+    props = html.escape(json.dumps({"chapters": [1, chapters]}), quote=True)
+
+    async def handler(request):
+        return httpx.Response(
+            200,
+            text=f"""
+            <section><h2>Latest Updates</h2>
+              <a href="/comics/series-1-1d35e5bd">Series 1</a>
+            </section>
+            <astro-island component-url="/_astro/LatestUpdates.hash.js" props="{props}">
+            </astro-island>
+            """,
+            request=request,
+        )
+
+    monkeypatch.setattr("app.adapters.asura.settings.asura_recent_pages", 20)
+    adapter = AsuraAdapter()
+    adapter.client = HttpSourceClient(
+        "https://asurascans.com", transport=httpx.MockTransport(handler)
+    )
+    try:
+        items = await adapter.list_recent_frontier([])
+    finally:
+        await adapter.aclose()
+
+    assert len(items) == 25
+    assert items[-1].source_id == "comics/series-25"
+    assert items[-1].metadata["recent_chapters"][0]["number"] == "25"
+    assert adapter.listing_diagnostics["pages_fetched"] == 1
+    assert adapter.listing_diagnostics["listing_exhausted"] is True
+
+
+async def test_kingofshojo_follows_ordered_catalog_query_beyond_three_pages(monkeypatch):
+    requested_pages = []
+
+    async def handler(request):
+        page = int(request.url.params["page"])
+        requested_pages.append(page)
+        source_id = "known" if page == 4 else f"fresh-{page}"
+        chapter = "10" if page == 4 else str(20 - page)
+        return httpx.Response(
+            200,
+            text=f"""
+            <aside><a href="/manga/sidebar-noise/" title="Sidebar noise">Noise</a></aside>
+            <div class="postbody"><div class="listupd"><div class="bsx">
+              <a href="/manga/{source_id}/" title="Series {page}">
+                <img src="/cover-{page}.jpg">
+                <div class="epxs">Chapter {chapter}</div>
+              </a>
+            </div></div></div>
+            {('<div class="pagination"><a href="?page=' + str(page + 1) + '&order=update">Next</a></div>') if page < 4 else ''}
+            """,
+            request=request,
+        )
+
+    monkeypatch.setattr("app.adapters.kingofshojo.settings.kingofshojo_recent_pages", 5)
+    monkeypatch.setattr("app.adapters.kingofshojo.settings.source_frontier_required_hits", 1)
+    adapter = KingOfShojoAdapter()
+    adapter.client = HttpSourceClient(
+        "https://kingofshojo.com", transport=httpx.MockTransport(handler)
+    )
+    try:
+        items = await adapter.list_recent_frontier([FrontierSentinel("manga/known", "10")])
+    finally:
+        await adapter.aclose()
+
+    assert requested_pages == [1, 2, 3, 4]
+    assert adapter.listing_diagnostics == {
+        "pages_fetched": 4,
+        "frontier_reached": True,
+        "listing_exhausted": False,
+        "safety_limit_reached": False,
+    }
+    assert [item.source_id for item in items] == [
+        "manga/fresh-1",
+        "manga/fresh-2",
+        "manga/fresh-3",
+        "manga/known",
+    ]
+    assert all(item.title != "Sidebar noise" for item in items)
+    assert [item.metadata["recent_chapters"][0]["number"] for item in items] == [
+        "19",
+        "18",
+        "17",
+        "10",
+    ]
 
 
 async def test_mangafire_recent_frontier_imports_api_rows_when_homepage_is_js_shell(monkeypatch):
@@ -752,6 +946,52 @@ async def test_mangafire_recent_frontier_stops_after_api_sentinel_hits(monkeypat
 
     assert pages == ["1", "2"]
     assert [item.source_id for item in items] == ["fresh", "known"]
+
+
+async def test_mangafire_frontier_honors_configured_window_beyond_three_pages(monkeypatch):
+    pages = []
+
+    async def handler(request):
+        page = int(request.url.params["page"])
+        pages.append(page)
+        source_id = "known" if page == 4 else f"fresh-{page}"
+        chapter = 10 if page == 4 else 20 - page
+        return httpx.Response(
+            200,
+            json={
+                "items": [
+                    {
+                        "hid": source_id,
+                        "title": f"Series {page}",
+                        "url": f"/title/{source_id}-series-{page}",
+                        "latestChapter": chapter,
+                    }
+                ],
+                "meta": {"hasNext": True},
+            },
+            request=request,
+        )
+
+    monkeypatch.setattr("app.adapters.mangafire.settings.mangafire_recent_pages", 5)
+    monkeypatch.setattr("app.adapters.mangafire.settings.source_frontier_required_hits", 1)
+    adapter = MangaFireAdapter()
+    adapter.client = HttpSourceClient(
+        "https://mangafire.to", transport=httpx.MockTransport(handler)
+    )
+    try:
+        items = await adapter.list_recent_frontier([FrontierSentinel("known", "10")])
+    finally:
+        await adapter.aclose()
+
+    assert pages == [1, 2, 3, 4]
+    assert adapter.listing_diagnostics["frontier_reached"] is True
+    assert adapter.listing_diagnostics["safety_limit_reached"] is False
+    assert [item.source_id for item in items] == [
+        "fresh-1",
+        "fresh-2",
+        "fresh-3",
+        "known",
+    ]
 
 
 async def test_mangafire_recent_frontier_falls_back_to_html_when_api_fails(monkeypatch):

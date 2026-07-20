@@ -310,7 +310,7 @@ class CatalogRepository:
         source: str,
         frontier: list[dict[str, str]],
         partial_failures: int = 0,
-        metrics: dict[str, int] | None = None,
+        metrics: dict[str, int | bool] | None = None,
     ) -> None:
         state = self._source_state(session, source)
         state.health_status = "degraded" if partial_failures else "healthy"

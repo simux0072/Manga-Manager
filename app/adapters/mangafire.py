@@ -8,7 +8,7 @@ from urllib.parse import urlencode, urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
-from app.adapters.asura import dedupe_chapters, dedupe_series
+from app.adapters.asura import dedupe_chapters, dedupe_series, listing_diagnostics
 from app.adapters.base import FrontierSentinel, SourceAdapter
 from app.adapters.http import (
     HttpSourceClient,
@@ -34,6 +34,7 @@ class MangaFireAdapter(SourceAdapter):
     base_url = "https://mangafire.to"
 
     def __init__(self) -> None:
+        self.listing_diagnostics: dict[str, int | bool] = {}
         self.client = HttpSourceClient(
             self.base_url,
             throttle_seconds=settings.mangafire_request_interval_seconds,
@@ -61,19 +62,30 @@ class MangaFireAdapter(SourceAdapter):
         sentinel_map = {sentinel.source_id: sentinel.latest_chapter for sentinel in sentinels}
         required_hits = min(settings.source_frontier_required_hits, len(sentinel_map))
         hits = 0
-        max_pages = min(3, settings.mangafire_recent_pages)
+        max_pages = settings.mangafire_recent_pages
+        pages_fetched = 0
+        frontier_reached = False
+        exhausted = False
         for page in range(1, max_pages + 1):
-            parsed = self.parse_recent_series(
-                await self.fetch_recent_titles_page(
-                    page=page, limit=settings.mangafire_recent_limit
-                )
+            payload = await self.fetch_recent_titles_page(
+                page=page, limit=settings.mangafire_recent_limit
             )
+            pages_fetched = page
+            parsed = self.parse_recent_series(payload)
             if not parsed:
+                exhausted = True
                 break
             items.extend(parsed)
             hits += frontier_hits(parsed, sentinel_map)
             if required_hits and hits >= required_hits:
+                frontier_reached = True
                 break
+            if api_meta(payload).get("hasNext") is False:
+                exhausted = True
+                break
+        self.listing_diagnostics = listing_diagnostics(
+            pages_fetched, max_pages, frontier_reached, exhausted
+        )
         return dedupe_series(items)
 
     async def list_recent_frontier_html(
@@ -83,16 +95,25 @@ class MangaFireAdapter(SourceAdapter):
         sentinel_map = {sentinel.source_id: sentinel.latest_chapter for sentinel in sentinels}
         required_hits = min(settings.source_frontier_required_hits, len(sentinel_map))
         hits = 0
-        max_pages = min(3, settings.mangafire_recent_pages)
+        max_pages = settings.mangafire_recent_pages
+        pages_fetched = 0
+        frontier_reached = False
+        exhausted = False
         for page in range(1, max_pages + 1):
             path = "/" if page == 1 else f"/latest-updates?page={page}"
             parsed = self.parse_updated_page(await self.client.get_soup(path))
+            pages_fetched = page
             if not parsed:
+                exhausted = True
                 break
             items.extend(parsed)
             hits += frontier_hits(parsed, sentinel_map)
             if required_hits and hits >= required_hits:
+                frontier_reached = True
                 break
+        self.listing_diagnostics = listing_diagnostics(
+            pages_fetched, max_pages, frontier_reached, exhausted
+        )
         return dedupe_series(items)
 
     async def fetch_recent_titles_page(self, *, page: int, limit: int):

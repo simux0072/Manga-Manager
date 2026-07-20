@@ -4,7 +4,12 @@ from collections.abc import AsyncIterator
 import re
 from urllib.parse import unquote, urljoin, urlparse
 
-from app.adapters.asura import clean_series_title, dedupe_chapters, dedupe_series
+from app.adapters.asura import (
+    clean_series_title,
+    dedupe_chapters,
+    dedupe_series,
+    listing_diagnostics,
+)
 from app.adapters.base import FrontierSentinel, SourceAdapter
 from app.adapters.http import (
     HttpSourceClient,
@@ -15,6 +20,7 @@ from app.adapters.http import (
 from app.adapters.parsing import (
     clean_chapter_title,
     extract_image_urls,
+    image_attr,
     nearby_cover_attr,
     parse_source_date,
 )
@@ -27,6 +33,7 @@ class KingOfShojoAdapter(SourceAdapter):
     base_url = "https://kingofshojo.com"
 
     def __init__(self) -> None:
+        self.listing_diagnostics: dict[str, int | bool] = {}
         self.client = HttpSourceClient(
             self.base_url,
             timeout=settings.kingofshojo_timeout_seconds,
@@ -45,20 +52,41 @@ class KingOfShojoAdapter(SourceAdapter):
         sentinel_map = {sentinel.source_id: sentinel.latest_chapter for sentinel in sentinels}
         required_hits = min(settings.source_frontier_required_hits, len(sentinel_map))
         hits = 0
-        max_pages = min(3, settings.kingofshojo_recent_pages)
+        max_pages = settings.kingofshojo_recent_pages
+        pages_fetched = 0
+        frontier_reached = False
+        exhausted = False
         for page in range(1, max_pages + 1):
-            path = "/" if page == 1 else f"/page/{page}/"
+            # The homepage mixes featured/popular cards into the update feed.  KingOfShojo's
+            # canonical ordered catalog uses a query-string page parameter; /page/N/ is a
+            # different WordPress listing and repeats or skips chronological updates.
+            path = f"/manga/?page={page}&order=update"
             soup = await self.client.get_soup(path)
-            parsed = self.parse_recent_series(soup)
+            pages_fetched = page
+            parsed = self.parse_recent_series(ordered_listing_scope(soup))
             if not parsed:
+                exhausted = True
                 break
             items.extend(parsed)
             hits += frontier_hits(parsed, sentinel_map)
             if required_hits and hits >= required_hits:
+                frontier_reached = True
                 break
+            if not has_next_ordered_page(soup):
+                exhausted = True
+                break
+        self.listing_diagnostics = listing_diagnostics(
+            pages_fetched, max_pages, frontier_reached, exhausted
+        )
         return dedupe_series(items)
 
     def parse_recent_series(self, soup) -> list[SeriesItem]:
+        cards = soup.select(".bsx")
+        if cards:
+            return dedupe_series(
+                item for card in cards[:120] if (item := self.parse_recent_card(card)) is not None
+            )
+
         items: list[SeriesItem] = []
         for link in soup.select("a[href*='/manga/']")[:120]:
             title = link.get("title") or link.get_text(" ", strip=True)
@@ -91,6 +119,47 @@ class KingOfShojoAdapter(SourceAdapter):
             )
         return dedupe_series(items)
 
+    def parse_recent_card(self, card) -> SeriesItem | None:
+        link = card.select_one(".tt a[href*='/manga/']") or card.select_one(
+            "a[href*='/manga/'][title]"
+        )
+        if link is None:
+            return None
+        title = link.get("title") or link.get_text(" ", strip=True)
+        href = link.get("href", "")
+        if not title or not href:
+            return None
+        url = urljoin(self.base_url, href)
+        if is_non_series_link(url, title):
+            return None
+        source_id = urlparse(url).path.strip("/")
+        cover_image = card.select_one("img")
+        cover = image_attr(cover_image) if cover_image else ""
+        source = SeriesItem(self.source, source_id, title, url)
+        recent_chapters = self.parse_chapters(card, source)
+        recent_metadata = [
+            {"number": chapter.number, "title": chapter.title, "url": chapter.url}
+            for chapter in recent_chapters
+        ]
+        if not recent_metadata:
+            # The ordered /manga feed currently renders its latest chapter as plain text
+            # (`.epxs`) inside the series link.  It is sufficient for frontier comparison;
+            # the subsequently queued detail refresh resolves the real chapter URL.
+            latest_label = card.select_one(".epxs")
+            latest_title = latest_label.get_text(" ", strip=True) if latest_label else ""
+            latest_number = normalize_chapter_number(latest_title)
+            if latest_number:
+                recent_metadata.append(
+                    {"number": latest_number, "title": latest_title, "url": url}
+                )
+        return SeriesItem(
+            source=self.source,
+            source_id=source_id,
+            title=title,
+            url=url,
+            cover_url=urljoin(self.base_url, cover) if valid_kingofshojo_cover(cover) else "",
+            metadata={"recent_chapters": recent_metadata} if recent_metadata else {},
+        )
     def parse_card_chapters(self, link, source_id: str, series_url: str) -> list[ChapterItem]:
         container = link
         for parent in link.parents:
@@ -236,6 +305,18 @@ def is_template_or_empty_link(href: str, title: str) -> bool:
         return True
     path = urlparse(urljoin(KingOfShojoAdapter.base_url, href)).path.strip("/")
     return not path or "chapter" not in path
+
+
+def ordered_listing_scope(soup):
+    """Exclude navigation and sidebar manga links from the ordered catalog result grid."""
+    return soup.select_one(".postbody .listupd") or soup.select_one(".listupd") or soup
+
+
+def has_next_ordered_page(soup) -> bool:
+    return any(
+        "next" in link.get_text(" ", strip=True).lower()
+        for link in soup.select(".pagination a, .hpage a, a.page-numbers")
+    )
 
 
 def valid_kingofshojo_cover(url: str) -> bool:

@@ -91,6 +91,22 @@ describe('media library frontend',()=>{
     expect(screen.getByText('cover unavailable')).toBeInTheDocument()
   })
 
+  it('shows whether a provider poll reached its saved frontier',async()=>{
+    vi.stubGlobal('fetch',vi.fn((input:string|URL|Request)=>{
+      const url=String(input)
+      if(url.includes('/api/v2/operations'))return response({
+        job_counts:{},active_groups:0,
+        health:{series:1,chapters:1,active_artifacts:0,missing_projections:0,storage_free_bytes:0},
+        sources:[{source:'mangafire',status:'healthy',failures:0,last_error:'',last_poll_at:'2026-07-20T08:00:00Z',cooldown_until:null,enabled:true,frontier_metrics:{listed:1000,pages_fetched:20,frontier_reached:false,safety_limit_reached:true}}],
+        workers:[],permits:{},provider_policies:[],provider_endpoints:[],recent_benchmarks:[],
+      })
+      if(url.includes('/api/v2/jobs'))return response({items:[],next_cursor:null})
+      return response({items:[],next_cursor:null})
+    }))
+    renderApp('/operations')
+    expect(await screen.findByText('Window limit · 20 pages / 1000 titles')).toBeInTheDocument()
+  })
+
   it('previews and confirms a manual cross-provider merge',async()=>{
     vi.stubGlobal('fetch',vi.fn((input:string|URL|Request,init?:RequestInit)=>{
       const url=String(input)

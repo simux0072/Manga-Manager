@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import json
 import re
 import httpx
 from collections.abc import AsyncIterator
 from datetime import datetime, timedelta, timezone
-from urllib.parse import urljoin, urlparse
+from urllib.parse import parse_qs, urljoin, urlparse
 
 from app.adapters.base import ChapterTemporarilyUnavailable, FrontierSentinel, SourceAdapter
 from app.adapters.http import (
@@ -28,6 +29,7 @@ class AsuraAdapter(SourceAdapter):
     base_url = "https://asurascans.com"
 
     def __init__(self) -> None:
+        self.listing_diagnostics: dict[str, int | bool] = {}
         self.client = HttpSourceClient(
             self.base_url,
             throttle_seconds=settings.asura_request_interval_seconds,
@@ -45,9 +47,12 @@ class AsuraAdapter(SourceAdapter):
         sentinel_map = {sentinel.source_id: sentinel.latest_chapter for sentinel in sentinels}
         required_hits = min(settings.source_frontier_required_hits, len(sentinel_map))
         hits = 0
-        max_pages = min(3, settings.asura_recent_pages)
+        max_pages = settings.asura_recent_pages
+        pages_fetched = 0
+        frontier_reached = False
+        exhausted = False
         for page in range(1, max_pages + 1):
-            path = "/" if page == 1 else f"/page/{page}/"
+            path = "/" if page == 1 else f"/?page={page}"
             try:
                 soup = await self.client.get_soup(path)
             except httpx.HTTPStatusError as exc:
@@ -55,15 +60,46 @@ class AsuraAdapter(SourceAdapter):
                 # successful first page followed by that response is pagination
                 # exhaustion, not provider degradation.
                 if page > 1 and exc.response.status_code == 404:
+                    exhausted = True
                     break
                 raise
-            parsed = self.parse_recent_series(soup)
+            pages_fetched = page
+            if page == 1:
+                embedded = parse_embedded_latest_updates(soup)
+                if embedded:
+                    hits = frontier_hits(embedded, sentinel_map)
+                    frontier_reached = bool(required_hits and hits >= required_hits)
+                    self.listing_diagnostics = listing_diagnostics(
+                        pages_fetched, max_pages, frontier_reached, True
+                    )
+                    self.listing_diagnostics["tracked_fallback_required"] = bool(
+                        sentinel_map and not frontier_reached
+                    )
+                    return dedupe_series(embedded)
+            # The homepage places Trending Comics before Latest Updates and repeats many
+            # identities in both sections.  Parsing the whole page makes the first, chapterless
+            # trending card win de-duplication and hides a newly published chapter.  Restrict the
+            # first page to the chronological listing when the current layout exposes it.
+            parsed = self.parse_recent_series(latest_updates_scope(soup))
             if not parsed:
+                exhausted = True
                 break
             items.extend(parsed)
             hits += frontier_hits(parsed, sentinel_map)
             if required_hits and hits >= required_hits:
+                frontier_reached = True
                 break
+            if not has_next_listing_page(soup, page):
+                exhausted = True
+                break
+        self.listing_diagnostics = listing_diagnostics(
+            pages_fetched, max_pages, frontier_reached, exhausted
+        )
+        # If none of the saved sentinels remains in Asura's finite Latest Updates
+        # feed, a busy or interrupted interval may have displaced tracked updates.
+        self.listing_diagnostics["tracked_fallback_required"] = bool(
+            sentinel_map and not frontier_reached and exhausted
+        )
         return dedupe_series(items)
 
     def parse_recent_series(self, soup) -> list[SeriesItem]:
@@ -255,6 +291,119 @@ def dedupe_series(items: list[SeriesItem]) -> list[SeriesItem]:
             seen.add(item.source_id)
             result.append(item)
     return result
+
+
+def latest_updates_scope(soup):
+    """Return Asura's chronological update section, with fixture/old-layout fallback."""
+    heading = soup.find(
+        lambda tag: getattr(tag, "name", None) in {"h1", "h2", "h3"}
+        and "latest update" in tag.get_text(" ", strip=True).lower()
+    )
+    if heading is None:
+        return soup
+    return heading.find_parent("section") or soup
+
+
+def parse_embedded_latest_updates(soup) -> list[SeriesItem]:
+    """Decode every chapter embedded in Asura's hydrated LatestUpdates island."""
+    island = next(
+        (
+            tag
+            for tag in soup.select("astro-island[component-url][props]")
+            if "LatestUpdates" in str(tag.get("component-url") or "")
+        ),
+        None,
+    )
+    if island is None:
+        return []
+    try:
+        payload = json.loads(str(island.get("props") or "{}"))
+        encoded_rows = payload.get("chapters", [1, []])
+        rows = encoded_rows[1] if encoded_rows[0] == 1 else []
+    except (TypeError, ValueError, IndexError, KeyError):
+        return []
+
+    grouped: dict[str, dict[str, object]] = {}
+    for encoded in rows:
+        if not isinstance(encoded, list) or len(encoded) < 2 or not isinstance(encoded[1], dict):
+            continue
+        row = {key: astro_scalar(value) for key, value in encoded[1].items()}
+        public_url = str(row.get("comic_public_url") or "")
+        observed_id = urlparse(public_url).path.strip("/")
+        source_id, revision = split_asura_source_id(observed_id)
+        title = str(row.get("comic_name") or "").strip()
+        number = normalize_chapter_number(str(row.get("name") or row.get("number") or ""))
+        if not source_id or not title or not number:
+            continue
+        group = grouped.setdefault(
+            source_id,
+            {
+                "title": title,
+                "url": urljoin(AsuraAdapter.base_url, public_url),
+                "cover": str(row.get("comic_cover") or ""),
+                "revision": revision,
+                "chapters": [],
+            },
+        )
+        chapter_title = f"Chapter {number}"
+        subtitle = str(row.get("title") or "").strip()
+        if subtitle:
+            chapter_title = f"{chapter_title} - {subtitle}"
+        group["chapters"].append(
+            {
+                "number": number,
+                "title": chapter_title,
+                "url": f"{str(group['url']).rstrip('/')}/chapter/{number}",
+            }
+        )
+    return [
+        SeriesItem(
+            source="asura",
+            source_id=source_id,
+            title=str(group["title"]),
+            url=str(group["url"]),
+            cover_url=str(group["cover"]),
+            metadata={
+                "asura_revision": str(group["revision"]),
+                "recent_chapters": group["chapters"],
+            },
+        )
+        for source_id, group in grouped.items()
+    ]
+
+
+def astro_scalar(value):
+    if isinstance(value, list) and len(value) >= 2 and value[0] == 0:
+        return value[1]
+    return None
+
+
+def has_next_listing_page(soup, current_page: int) -> bool:
+    # The current client-rendered paginator uses buttons, while older/fixture
+    # layouts expose ordinary query links.
+    if soup.select_one(f'button[aria-label="Page {current_page + 1}"]') is not None:
+        return True
+    next_button = soup.select_one('button[aria-label="Next page"]')
+    if next_button is not None and not next_button.has_attr("disabled"):
+        return True
+    for link in soup.select("a[href]"):
+        values = parse_qs(urlparse(str(link.get("href") or "")).query).get("page", [])
+        if any(value.isdigit() and int(value) == current_page + 1 for value in values):
+            return True
+    return False
+
+
+def listing_diagnostics(
+    pages_fetched: int, max_pages: int, frontier_reached: bool, exhausted: bool
+) -> dict[str, int | bool]:
+    return {
+        "pages_fetched": pages_fetched,
+        "frontier_reached": frontier_reached,
+        "listing_exhausted": exhausted,
+        "safety_limit_reached": bool(
+            pages_fetched >= max_pages and not frontier_reached and not exhausted
+        ),
+    }
 
 
 ASURA_REVISION_RE = re.compile(r"^(?P<stable>comics/.+)-(?P<revision>[0-9a-fA-F]{8})$")
