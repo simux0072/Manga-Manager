@@ -66,7 +66,12 @@ ACTIVE_JOB_STATES = ("queued", "leased", "retry_wait")
 
 
 def job_state_predicate(states: list[str]):
-    """Filter failed jobs to failures not resolved by a later successful equivalent job."""
+    """Show only the latest failed outcome for each logical job.
+
+    A retry is represented by a new row with the same kind/dedupe key. Once that row exists the
+    earlier failure is historical, regardless of whether the retry is queued, running, or has
+    reached another terminal state.
+    """
     if not states:
         return None
     non_failed = [state for state in states if state != "failed"]
@@ -79,7 +84,6 @@ def job_state_predicate(states: list[str]):
             later.kind == WorkJob.kind,
             later.dedupe_key == WorkJob.dedupe_key,
             later.id > WorkJob.id,
-            later.status == "succeeded",
         )
         .exists()
     )
@@ -779,7 +783,63 @@ def create_api_router(
                 ).all(),
             )
         }
-        source_identity_ids = {source.id for row in rows for source in (row["left"], row["right"])}
+        matched_cover_identity_ids = {
+            int(identity_id)
+            for row in rows
+            for key in (
+                "cover_left_source_series_id",
+                "cover_right_source_series_id",
+            )
+            for identity_id in [row["evidence_json"].get(key)]
+            if identity_id
+        }
+        source_identity_ids = {
+            source.id for row in rows for source in (row["left"], row["right"])
+        } | matched_cover_identity_ids
+        matched_identities = {
+            identity.id: identity
+            for identity in session.scalars(
+                select(CatalogSourceSeries).where(
+                    CatalogSourceSeries.id.in_(matched_cover_identity_ids or {-1})
+                )
+            )
+        }
+        cover_urls_by_identity = {
+            source_series_id: f"/api/v2/covers/{series_id}/{checksum}.webp"
+            for source_series_id, series_id, checksum in session.execute(
+                select(
+                    CatalogCoverAsset.source_series_id,
+                    CatalogSourceSeries.series_id,
+                    CatalogCoverAsset.content_checksum,
+                )
+                .join(
+                    CatalogSourceSeries,
+                    CatalogSourceSeries.id == CatalogCoverAsset.source_series_id,
+                )
+                .where(CatalogCoverAsset.source_series_id.in_(source_identity_ids or {-1}))
+            )
+        }
+
+        def matched_identity(row: dict[str, Any], series_id: int, fallback: CatalogSourceSeries):
+            for key in (
+                "cover_left_source_series_id",
+                "cover_right_source_series_id",
+            ):
+                identity = matched_identities.get(int(row["evidence_json"].get(key) or 0))
+                if identity is not None and identity.series_id == series_id:
+                    return identity
+            return fallback
+
+        def row_matched_cover_ids(row: dict[str, Any]) -> set[int]:
+            return {
+                int(row["evidence_json"].get(key) or 0)
+                for key in (
+                    "cover_left_source_series_id",
+                    "cover_right_source_series_id",
+                )
+                if row["evidence_json"].get(key)
+            }
+
         latest_by_identity: dict[int, str] = {}
         for source_series_id, display_number in session.execute(
             select(
@@ -826,6 +886,13 @@ def create_api_router(
                     for value in provider_merge_conflicts(session, row["series_ids"])
                 )
             blockers_by_proposal[row["id"]] = blockers
+        display_identities = {
+            row["id"]: (
+                matched_identity(row, row["left"].series_id, row["left"]),
+                matched_identity(row, row["right"].series_id, row["right"]),
+            )
+            for row in rows
+        }
         return {
             "items": [
                 {
@@ -836,17 +903,37 @@ def create_api_router(
                     "blocked_reasons": blockers_by_proposal[row["id"]],
                     "left": {
                         **canonical[row["left"].series_id],
-                        "source_title": row["left"].title,
-                        "source": row["left"].source,
-                        "url": row["left"].url,
-                        "latest_chapter": latest_by_identity.get(row["left"].id, ""),
+                        "source_title": display_identities[row["id"]][0].title,
+                        "source": display_identities[row["id"]][0].source,
+                        "url": display_identities[row["id"]][0].url,
+                        "cover_url": cover_urls_by_identity.get(
+                            display_identities[row["id"]][0].id,
+                            display_identities[row["id"]][0].cover_url,
+                        ),
+                        "latest_chapter": latest_by_identity.get(
+                            display_identities[row["id"]][0].id, ""
+                        ),
+                        "cover_evidence_used": (
+                            display_identities[row["id"]][0].id
+                            in row_matched_cover_ids(row)
+                        ),
                     },
                     "right": {
                         **canonical[row["right"].series_id],
-                        "source_title": row["right"].title,
-                        "source": row["right"].source,
-                        "url": row["right"].url,
-                        "latest_chapter": latest_by_identity.get(row["right"].id, ""),
+                        "source_title": display_identities[row["id"]][1].title,
+                        "source": display_identities[row["id"]][1].source,
+                        "url": display_identities[row["id"]][1].url,
+                        "cover_url": cover_urls_by_identity.get(
+                            display_identities[row["id"]][1].id,
+                            display_identities[row["id"]][1].cover_url,
+                        ),
+                        "latest_chapter": latest_by_identity.get(
+                            display_identities[row["id"]][1].id, ""
+                        ),
+                        "cover_evidence_used": (
+                            display_identities[row["id"]][1].id
+                            in row_matched_cover_ids(row)
+                        ),
                     },
                 }
                 for row in rows
@@ -1816,6 +1903,56 @@ def create_api_router(
                 pool=job.pool,
                 workflow_key=job.workflow_key,
                 group_key=job.group_key,
+            )
+        return {"job": serialize_jobs(session, [job])[0]}
+
+    @router.post("/jobs/failures/dismiss")
+    def dismiss_failed_jobs(session: SessionDep):
+        with session.begin():
+            jobs = session.scalars(
+                select(WorkJob)
+                .where(job_state_predicate(["failed"]))
+                .order_by(WorkJob.id)
+                .with_for_update(skip_locked=True)
+            ).all()
+            changed_at = utcnow()
+            for job in jobs:
+                job.status = "cancelled"
+                job.updated_at = changed_at
+                job.completed_at = job.completed_at or changed_at
+                session.add(
+                    JobEvent(
+                        job_id=job.id,
+                        event_type="cancelled",
+                        status="cancelled",
+                        message="failure dismissed from the live job center",
+                        created_at=changed_at,
+                    )
+                )
+        return {"dismissed": len(jobs)}
+
+    @router.post("/jobs/{job_id}/dismiss")
+    def dismiss_failed_job(job_id: int, session: SessionDep):
+        with session.begin():
+            job = session.scalar(
+                select(WorkJob)
+                .where(WorkJob.id == job_id, WorkJob.status == "failed")
+                .with_for_update()
+            )
+            if job is None:
+                raise HTTPException(409, "failed job cannot be dismissed")
+            changed_at = utcnow()
+            job.status = "cancelled"
+            job.updated_at = changed_at
+            job.completed_at = job.completed_at or changed_at
+            session.add(
+                JobEvent(
+                    job_id=job.id,
+                    event_type="cancelled",
+                    status="cancelled",
+                    message="failure dismissed from the live job center",
+                    created_at=changed_at,
+                )
             )
         return {"job": serialize_jobs(session, [job])[0]}
 

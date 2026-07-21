@@ -335,7 +335,7 @@ function ManualMerge({providers}: {providers: string[]}) {
 }
 
 function Side({side}: {side: MatchSide}) {
-  return <section className="match-side"><Cover series={side} /><div><span className="source-badge">{side.source}</span><h2>{side.source_title}</h2><p>{side.description || 'No description available.'}</p><div className="match-meta"><span>Latest {side.latest_chapter || 'unknown'}</span><a href={side.url} target="_blank" rel="noreferrer">Open source <ExternalLink /></a></div></div></section>
+  return <section className="match-side"><div className="match-cover-evidence"><Cover series={side} />{side.cover_evidence_used&&<span>Cover used for comparison</span>}</div><div><span className="source-badge">{side.source}</span><h2>{side.source_title}</h2><p>{side.description || 'No description available.'}</p><div className="match-meta"><span>Latest {side.latest_chapter || 'unknown'}</span><a href={side.url} target="_blank" rel="noreferrer">Open source <ExternalLink /></a></div></div></section>
 }
 
 function Cover({series}: {series: Pick<Series, 'title' | 'cover_url'>}) {

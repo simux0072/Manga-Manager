@@ -89,6 +89,29 @@ describe('media library frontend',()=>{
     renderApp('/operations')
     expect(await screen.findByText('Synchronize Example with Kavita')).toBeInTheDocument()
     expect(screen.getByText('cover unavailable')).toBeInTheDocument()
+    await userEvent.click(screen.getByRole('button',{name:'Dismiss'}))
+    expect(fetch).toHaveBeenCalledWith('/api/v2/jobs/77/dismiss',expect.objectContaining({method:'POST'}))
+  })
+
+  it('dismisses all unresolved failures from the Job Center',async()=>{
+    const failedJob={id:78,kind:'maintenance',description:'Probe storage',source:'',pool:'health',cycle_id:1,workflow_key:'',group_key:'probe',status:'failed',queue_position:null,attempt:3,max_attempts:3,error_code:'probe_failed',error_message:'disk unavailable',available_at:'2026-07-15T00:00:00Z',created_at:'2026-07-15T00:00:00Z',updated_at:'2026-07-15T00:00:00Z',completed_at:'2026-07-15T00:00:00Z',progress:{phase:'',current:0,total:0,unit:'',bytes:0,message:'',updated_at:null,percent:null},context:{}}
+    vi.stubGlobal('fetch',vi.fn((input:string|URL|Request)=>{
+      const url=String(input)
+      if(url.includes('/api/v2/operations'))return response({job_counts:{failed:1},active_groups:0,health:{series:1,chapters:1,active_artifacts:0,missing_projections:0},sources:[],workers:[],permits:{}})
+      if(url.includes('/api/v2/workload-cycle'))return response({id:1,status:'settled',total:1,successful:0,failed:1,cancelled:0,superseded:0,remaining:0,added:1})
+      if(url.includes('/api/v2/discovery'))return response({items:[series],next_cursor:null})
+      if(url.includes('/api/v2/job-groups')&&url.includes('state=failed'))return response({items:[{key:'probe',kind:'maintenance',source:'',title:'Probe storage',cover_url:'',task_count:1,status_counts:{failed:1},progress:{current:1,total:1,percent:100,successful:0,failed:1,cancelled:0},representative:failedJob,single:true}],next_cursor:null})
+      if(url.endsWith('/api/v2/jobs/failures/dismiss'))return response({dismissed:1})
+      if(url.includes('/api/v2/job-groups'))return response({items:[],next_cursor:null})
+      if(url.includes('/api/v2/jobs'))return response({items:[],next_cursor:null})
+      return response({items:[],next_cursor:null})
+    }))
+    renderApp()
+    await screen.findByText(series.title)
+    await userEvent.click(screen.getByRole('button',{name:/active/i}))
+    await userEvent.click(screen.getByRole('button',{name:'failed'}))
+    await userEvent.click(await screen.findByRole('button',{name:/Dismiss all unresolved failures/i}))
+    expect(fetch).toHaveBeenCalledWith('/api/v2/jobs/failures/dismiss',expect.objectContaining({method:'POST'}))
   })
 
   it('shows whether a provider poll reached its saved frontier',async()=>{
@@ -131,8 +154,8 @@ describe('media library frontend',()=>{
   it('reviews deep suggestions without resetting or refetching loaded pages',async()=>{
     const match={
       id:41,decision_ids:[41],confidence:.92,evidence:[],blocked_reasons:[],
-      left:{...series,source_title:series.title,source:'asura',url:'https://asura.test/painter'},
-      right:{...matchingSeries,source_title:matchingSeries.title,source:'mangafire',url:'https://mangafire.test/painter'},
+      left:{...series,source_title:series.title,source:'asura',url:'https://asura.test/painter',cover_evidence_used:true},
+      right:{...matchingSeries,source_title:matchingSeries.title,source:'mangafire',url:'https://mangafire.test/painter',cover_evidence_used:true},
     }
     const secondMatch={
       ...match,id:42,decision_ids:[42],confidence:.88,
@@ -150,6 +173,7 @@ describe('media library frontend',()=>{
     }))
     renderApp('/matches')
     await waitFor(()=>expect(document.querySelectorAll('.match-card')).toHaveLength(2))
+    expect(screen.getAllByText('Cover used for comparison')).toHaveLength(4)
     const keepSeparate=(await screen.findAllByRole('button',{name:'Keep separate'})).find(button=>!button.hasAttribute('disabled'))!
     const requestsBefore=(fetch as ReturnType<typeof vi.fn>).mock.calls.filter(([input,init])=>
       String(input).includes('/api/v2/matches?')&&(!init||!(init as RequestInit).method),
@@ -170,8 +194,8 @@ describe('media library frontend',()=>{
   it('deduplicates match pairs and previews only the explicit batch selection',async()=>{
     const match={
       id:51,decision_ids:[51],confidence:.91,evidence:[],blocked_reasons:[],
-      left:{...series,source_title:series.title,source:'asura',url:'https://asura.test/painter'},
-      right:{...matchingSeries,source_title:matchingSeries.title,source:'mangafire',url:'https://mangafire.test/painter'},
+      left:{...series,source_title:series.title,source:'asura',url:'https://asura.test/painter',cover_evidence_used:true},
+      right:{...matchingSeries,source_title:matchingSeries.title,source:'mangafire',url:'https://mangafire.test/painter',cover_evidence_used:true},
     }
     const duplicate={...match,id:52,decision_ids:[52],confidence:.89}
     const other={

@@ -13,7 +13,10 @@ class JobRetention:
     def prune(self, session, *, now: datetime | None = None, batch: int = 250) -> int:
         current = now or datetime.now(timezone.utc)
         success_cutoff = current - timedelta(days=14)
-        failure_cutoff = current - timedelta(days=90)
+        # Daily aggregates and the event timeline retain the audit trail. Raw failures only need
+        # the same two-week diagnostic window as other terminal work; otherwise transient
+        # provider outages permanently inflate the live operations tables.
+        failure_cutoff = current - timedelta(days=14)
         rows = session.scalars(
             select(WorkJob)
             .where(

@@ -59,5 +59,7 @@ manga. Metadata repair, Kavita synchronization, cover evidence, and health work 
 the current workload cycle, while a single task remains a normal job card. Group progress includes
 terminal siblings even when the selected tab shows only active children. Group and child feeds use
 keyset cursors so live SSE invalidations cannot shift offset pages.
-Succeeded/cancelled rows are rolled into daily aggregates after 14 days and failures after 90 days;
-active rows are never pruned and aggregate history is retained for 365 days.
+Succeeded, cancelled, and failed rows are rolled into daily aggregates after 14 days; active rows
+are never pruned and aggregate history is retained for 365 days. Only the newest unresolved attempt
+for a logical job appears in the Failed tab. Operators can dismiss one failure or all unresolved
+failures from the live view without deleting its activity/event audit trail.

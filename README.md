@@ -26,6 +26,8 @@ scripts/kavita-local.sh down
 ```
 
 `kavita-local.sh up` starts both services; do not run `stage-local.sh serve` concurrently.
+After changing application code, use `KAVITA_BUILD=true scripts/kavita-local.sh up` to rebuild the
+shared image before both services start.
 
 For fast, deterministic development without downloading a real catalog:
 
@@ -92,7 +94,9 @@ storage by default. Local staging uses 1 GiB (`STAGE_MIN_FREE_BYTES` overrides i
 - Matches are review-only; scores never merge records automatically. Suggested matches prioritize
   normalized local ORB/hash cover evidence, then stricter title/alias evidence, descriptions,
   chapter overlap, and latest numeric chapters with a two-chapter provider-delay tolerance. Manual
-  merge accepts two or more provider-distinct records (up to the configured provider count).
+  merge accepts two or more provider-distinct records (up to the configured provider count). When
+  a canonical manga has several providers, every cached provider cover is compared and Suggested
+  displays the exact winning cover pair instead of the canonical display covers.
   Reviewed labels can be exported with `export-match-training` without requiring a model.
 - `manga-manager diagnostic-bundle --output diagnostics.json` writes a bounded, credential-redacted
   database/provider/worker/storage snapshot suitable for issue reports.

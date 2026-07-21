@@ -6,7 +6,7 @@ export type Page<T,C=string> = {items:T[];next_cursor:C|null}
 export type Job = {id:number;kind:string;description:string;source:string;pool:string;cycle_id:number|null;workflow_key:string;group_key:string;status:string;queue_position:number|null;attempt:number;max_attempts:number;error_code:string;error_message:string;available_at:string;created_at:string;updated_at:string;completed_at:string|null;progress:{phase:string;current:number;total:number;unit:string;bytes:number;message:string;updated_at:string|null;percent:number|null};context:{series_id?:number;title?:string;cover_url?:string;chapter?:string}}
 export type JobGroup = {key:string;kind:string;source:string;title:string;cover_url:string;task_count:number;status_counts:Record<string,number>;progress:{current:number;total:number;percent:number|null;successful:number;failed:number;cancelled:number};representative:Job;single:boolean}
 export type WorkloadCycle = {id:number|null;status:string;total:number;successful:number;failed:number;cancelled:number;superseded:number;remaining:number;added:number;started_at?:string;updated_at?:string}
-export type MatchSide = Series & {source_title:string;source:string;url:string}
+export type MatchSide = Series & {source_title:string;source:string;url:string;cover_evidence_used:boolean}
 export type Match = {id:number;decision_ids:number[];confidence:number;evidence:{tone:string;label:string}[];blocked_reasons:string[];left:MatchSide;right:MatchSide}
 export type ScoreBreakdown = {score:number;title:number;cover:number;description:number;chapter_overlap:number;matched_selected_id?:number}
 export type MergeCandidate = Series & {similarity:number;compatible:boolean;conflicting_sources:string[];score_breakdown:ScoreBreakdown}

@@ -9,6 +9,8 @@ from manga_manager.infrastructure.db_models import (
     CatalogChapter,
     CatalogChapterReadingState,
     CatalogChapterRelease,
+    CatalogCoverAsset,
+    CatalogCoverSignature,
     CatalogMatchDecision,
     CatalogSeries,
     CatalogSourceSeries,
@@ -414,6 +416,153 @@ async def test_matches_collapse_multiple_identity_decisions_per_canonical_pair()
     assert rejected.status_code == 200
     with sessions() as session:
         assert {row.decision for row in session.query(CatalogMatchDecision)} == {"rejected"}
+
+
+async def test_matches_show_the_provider_covers_used_by_the_scorer() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        left, right = session.query(CatalogSourceSeries).order_by(CatalogSourceSeries.id).all()
+        compared_left = CatalogSourceSeries(
+            series_id=left.series_id,
+            source="kingofshojo",
+            source_id="compared-left",
+            title="Compared left title",
+            normalized_title="compared left title",
+            url="https://kingofshojo.test/compared-left",
+            cover_url="https://images.test/compared-left.jpg",
+        )
+        session.add(compared_left)
+        session.flush()
+        left_checksum = "a" * 64
+        right_checksum = "b" * 64
+        session.add_all(
+            [
+                CatalogCoverAsset(
+                    source_series_id=compared_left.id,
+                    content_checksum=left_checksum,
+                    relative_path=f"covers/{left_checksum}.jpg",
+                    source_url=compared_left.cover_url,
+                ),
+                CatalogCoverAsset(
+                    source_series_id=right.id,
+                    content_checksum=right_checksum,
+                    relative_path=f"covers/{right_checksum}.jpg",
+                    source_url=right.cover_url,
+                ),
+            ]
+        )
+        decision = session.query(CatalogMatchDecision).one()
+        decision.evidence_json = {
+            "cover_match": True,
+            "cover_evidence_state": "match",
+            "cover_left_source_series_id": compared_left.id,
+            "cover_right_source_series_id": right.id,
+        }
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/api/v2/matches")
+
+    item = response.json()["items"][0]
+    assert item["left"]["source"] == "kingofshojo"
+    assert item["left"]["source_title"] == "Compared left title"
+    assert item["left"]["cover_url"].endswith(f"/{left_checksum}.webp")
+    assert item["right"]["cover_url"].endswith(f"/{right_checksum}.webp")
+    assert item["left"]["cover_evidence_used"] is True
+    assert item["right"]["cover_evidence_used"] is True
+
+
+def test_matches_collapse_alternate_same_provider_titles_with_cover_and_chapters() -> None:
+    _app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        anchor = session.query(CatalogSourceSeries).filter_by(source="asura").one()
+        primary = session.query(CatalogSourceSeries).filter_by(source="mangafire").one()
+        primary.title = "The Regressed Mercenary's Machinations"
+        primary.normalized_title = "regressed mercenary s machinations"
+        for number in range(2, 8):
+            chapter = CatalogChapter(
+                series_id=primary.series_id,
+                canonical_number=str(number),
+                display_number=str(number),
+                sort_number=number,
+            )
+            session.add(chapter)
+            session.flush()
+            session.add(
+                CatalogChapterRelease(
+                    chapter_id=chapter.id,
+                    source_series_id=primary.id,
+                    source="mangafire",
+                    source_release_id=str(number),
+                    url=f"https://mangafire.test/primary/{number}",
+                )
+            )
+        duplicate_series = CatalogSeries(
+            title="The Regressed Mercenary Has a Plan",
+            normalized_title="regressed mercenary has a plan",
+        )
+        session.add(duplicate_series)
+        session.flush()
+        duplicate = CatalogSourceSeries(
+            series_id=duplicate_series.id,
+            source="mangafire",
+            source_id="alternate-provider-record",
+            title=duplicate_series.title,
+            normalized_title=duplicate_series.normalized_title,
+            url="https://mangafire.test/alternate-provider-record",
+        )
+        session.add(duplicate)
+        session.flush()
+        for number in range(1, 8):
+            chapter = CatalogChapter(
+                series_id=duplicate_series.id,
+                canonical_number=str(number),
+                display_number=str(number),
+                sort_number=number,
+            )
+            session.add(chapter)
+            session.flush()
+            session.add(
+                CatalogChapterRelease(
+                    chapter_id=chapter.id,
+                    source_series_id=duplicate.id,
+                    source="mangafire",
+                    source_release_id=str(number),
+                    url=f"https://mangafire.test/alternate/{number}",
+                )
+            )
+        session.add_all(
+            [
+                CatalogCoverSignature(
+                    source_series_id=primary.id,
+                    algorithm_version="test",
+                    feature_json={"hashes": ["0000000000000000"]},
+                    keypoints_blob=b"",
+                    descriptors_blob=b"",
+                ),
+                CatalogCoverSignature(
+                    source_series_id=duplicate.id,
+                    algorithm_version="test",
+                    # One bit in each old 16-bit band differs. The nine-band candidate index
+                    # must still find this Hamming-distance-four duplicate.
+                    feature_json={"hashes": ["0001000100010001"]},
+                    keypoints_blob=b"",
+                    descriptors_blob=b"",
+                ),
+                CatalogMatchDecision(
+                    left_source_series_id=min(anchor.id, duplicate.id),
+                    right_source_series_id=max(anchor.id, duplicate.id),
+                    confidence=0.88,
+                ),
+            ]
+        )
+
+    with sessions() as session:
+        proposals = pending_match_proposal_index(session)
+        assert len(proposals) == 1
+        assert len(proposals[0]["decision_ids"]) == 2
+        assert len(proposals[0]["series_ids"]) == 3
 
 
 def test_matches_collapse_equivalent_same_provider_canonical_records() -> None:
@@ -843,6 +992,80 @@ async def test_failed_views_exclude_failures_resolved_by_a_later_success() -> No
     assert [row["kind"] for row in jobs.json()["items"]] == ["cover_backfill"]
     assert [row["kind"] for row in groups.json()["items"]] == ["cover_backfill"]
     assert operations.json()["job_counts"]["failed"] == 1
+
+
+async def test_failed_views_only_show_latest_attempt_and_allow_dismissal() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        session.add_all(
+            [
+                WorkJob(
+                    kind="cover_backfill",
+                    dedupe_key="cover:repeated",
+                    payload={"version": 1, "source_series_id": 1},
+                    status="failed",
+                ),
+                WorkJob(
+                    kind="cover_backfill",
+                    dedupe_key="cover:repeated",
+                    payload={"version": 1, "source_series_id": 1},
+                    status="failed",
+                ),
+                WorkJob(
+                    kind="kavita_sync",
+                    dedupe_key="series:retrying",
+                    payload={"version": 1, "series_id": 2, "folder_path": ""},
+                    status="failed",
+                ),
+                WorkJob(
+                    kind="kavita_sync",
+                    dedupe_key="series:retrying",
+                    payload={"version": 1, "series_id": 2, "folder_path": ""},
+                    status="queued",
+                ),
+            ]
+        )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        before = await client.get("/api/v2/jobs", params={"state": "failed"})
+        failed_id = before.json()["items"][0]["id"]
+        dismissed = await client.post(f"/api/v2/jobs/{failed_id}/dismiss")
+        after = await client.get("/api/v2/jobs", params={"state": "failed"})
+        activity = await client.get("/api/v2/activity")
+
+    assert len(before.json()["items"]) == 1
+    assert dismissed.status_code == 200
+    assert dismissed.json()["job"]["status"] == "cancelled"
+    assert after.json()["items"] == []
+    assert any(
+        row["type"] == "cancelled" and "dismissed" in row["message"]
+        for row in activity.json()["items"]
+    )
+
+
+async def test_all_unresolved_failures_can_be_dismissed_without_deleting_audit() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        session.add_all(
+            WorkJob(
+                kind="maintenance",
+                dedupe_key=f"failed:{number}",
+                payload={"version": 1, "action": "stage_probe"},
+                status="failed",
+            )
+            for number in range(3)
+        )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        dismissed = await client.post("/api/v2/jobs/failures/dismiss")
+        remaining = await client.get("/api/v2/jobs", params={"state": "failed"})
+        activity = await client.get("/api/v2/activity")
+
+    assert dismissed.json() == {"dismissed": 3}
+    assert remaining.json()["items"] == []
+    assert sum(row["type"] == "cancelled" for row in activity.json()["items"]) == 3
 
 
 async def test_workload_cycle_uses_live_active_units_when_counters_lag() -> None:

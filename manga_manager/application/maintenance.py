@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -46,12 +47,26 @@ class MaintenanceHandler:
         if payload.action.startswith("provider_probe_"):
             await self._provider_probe(payload.action.removeprefix("provider_probe_"), context)
             return
+        if payload.action == "rescore_matches":
+            if payload.series_id <= 0:
+                raise PermanentJobError("invalid_series", "rescore requires a series id")
+            await asyncio.to_thread(self._rescore_matches, payload.series_id)
+            context.ensure_lease()
+            return
         if payload.action != "stage_probe":
             raise PermanentJobError("unknown_maintenance_action", payload.action)
         context.ensure_lease()
         with self.session_factory() as session:
             session.execute(select(1))
         context.ensure_lease()
+
+    def _rescore_matches(self, series_id: int) -> None:
+        from manga_manager.application.matching_score import (
+            rescore_pending_decisions_for_series,
+        )
+
+        with self.session_factory() as session, session.begin():
+            rescore_pending_decisions_for_series(session, series_id)
 
     async def _provider_probe(self, source: str, context: JobContext) -> None:
         adapter = self.adapter_factory(source)

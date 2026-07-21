@@ -28,6 +28,8 @@ export const api={
   activity:(types:string[]=[],sources:string[]=[],cursor?:number,signal?:AbortSignal)=>request<Page<ActivityEvent,number>>(`/api/v2/activity?${params({event_type:types,source:sources,cursor})}`,{signal}),
   operations:(signal?:AbortSignal)=>request<Operations>('/api/v2/operations',{signal}),
   retryJob:(id:number)=>request(`/api/v2/jobs/${id}/retry`,{method:'POST'}),
+  dismissJob:(id:number)=>request(`/api/v2/jobs/${id}/dismiss`,{method:'POST'}),
+  dismissFailures:()=>request<{dismissed:number}>('/api/v2/jobs/failures/dismiss',{method:'POST'}),
   pullSource:(source:string)=>request(`/api/v2/sources/${source}/pull`,{method:'POST'}),
   probe:()=>request('/api/v2/probe',{method:'POST'}),
   syncKavita:()=>request<{pending:number;created:number}>('/api/v2/operations/kavita-sync',{method:'POST'})

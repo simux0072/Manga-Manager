@@ -91,6 +91,7 @@ class LibraryRepairPayload(JobPayload):
 
 class MaintenancePayload(JobPayload):
     action: str = Field(min_length=1, max_length=100, pattern=r"^[a-z0-9_-]+$")
+    series_id: int = Field(default=0, ge=0)
 
 
 class NotificationPayload(JobPayload):

@@ -20,7 +20,7 @@ from manga_manager.infrastructure.db_models import (
 )
 
 
-SCORER_VERSION = "cover-primary-v2"
+SCORER_VERSION = "cover-primary-v3"
 
 TITLE_WEIGHT = 0.20
 COVER_WEIGHT = 0.55
@@ -89,16 +89,6 @@ def rescore_pending_decisions_for_series(session: Session, series_id: int) -> in
 def score_series_pair(session: Session, left_id: int, right_id: int) -> dict[str, object]:
     external = _external_ids(session, (left_id, right_id))
     shared_external = sorted(external[left_id] & external[right_id])
-    if shared_external:
-        return {
-            "score": 0.99,
-            "scorer_version": SCORER_VERSION,
-            "shared_external_id": shared_external,
-            "title": 1.0,
-            "cover": 1.0,
-            "description": 1.0,
-            "chapter_overlap": 1.0,
-        }
     titles = _titles(session, (left_id, right_id))
     title = max(
         (_matching_title_similarity(a, b) for a in titles[left_id] for b in titles[right_id]),
@@ -117,8 +107,8 @@ def score_series_pair(session: Session, left_id: int, right_id: int) -> dict[str
     latest = _latest_chapter_evidence(session, left_id, right_id)
     cover, cover_evidence = _cover_score(session, left_id, right_id)
     score = _combined_score(title, cover, description, chapter, latest, cover_evidence)
-    return {
-        "score": round(min(score, 0.98), 6),
+    result = {
+        "score": 0.99 if shared_external else round(min(score, 0.98), 6),
         "scorer_version": SCORER_VERSION,
         "title": round(title, 6),
         "title_match": title >= 0.75,
@@ -128,6 +118,9 @@ def score_series_pair(session: Session, left_id: int, right_id: int) -> dict[str
         **latest,
         **cover_evidence,
     }
+    if shared_external:
+        result["shared_external_id"] = shared_external
+    return result
 
 
 def strongest_candidate_score(
@@ -204,16 +197,6 @@ def score_candidate_set(
 
     def score_pair(left_id: int, right_id: int) -> dict[str, object]:
         shared_external = sorted(external[left_id] & external[right_id])
-        if shared_external:
-            return {
-                "score": 0.99,
-                "scorer_version": SCORER_VERSION,
-                "shared_external_id": shared_external,
-                "title": 1.0,
-                "cover": 1.0,
-                "description": 1.0,
-                "chapter_overlap": 1.0,
-            }
         title_score = max(
             (
                 _matching_title_similarity(left, right)
@@ -249,7 +232,11 @@ def score_candidate_set(
                 candidate_cover = _cover_similarity(evidence)
                 if candidate_cover > cover or not cover_evidence.get("cover_compared"):
                     cover = candidate_cover
-                    cover_evidence = evidence
+                    cover_evidence = {
+                        **evidence,
+                        "cover_left_source_series_id": left_identity,
+                        "cover_right_source_series_id": right_identity,
+                    }
         score = _combined_score(
             title_score,
             cover,
@@ -258,8 +245,8 @@ def score_candidate_set(
             latest,
             cover_evidence,
         )
-        return {
-            "score": round(min(score, 0.98), 6),
+        result = {
+            "score": 0.99 if shared_external else round(min(score, 0.98), 6),
             "scorer_version": SCORER_VERSION,
             "title": round(title_score, 6),
             "title_match": title_score >= 0.75,
@@ -269,6 +256,9 @@ def score_candidate_set(
             **latest,
             **cover_evidence,
         }
+        if shared_external:
+            result["shared_external_id"] = shared_external
+        return result
 
     result: dict[int, dict[str, object]] = {}
     for candidate_id in candidate_ids:
@@ -386,7 +376,12 @@ def _cover_score(session: Session, left_id: int, right_id: int) -> tuple[float, 
             evidence = compare_signatures(left_signature, right_signature)
             score = _cover_similarity(evidence)
             if score > best_score or not best_evidence.get("cover_compared"):
-                best_score, best_evidence = score, evidence
+                best_score = score
+                best_evidence = {
+                    **evidence,
+                    "cover_left_source_series_id": left_identity.id,
+                    "cover_right_source_series_id": right_identity.id,
+                }
     return min(best_score, 1.0), best_evidence
 
 

@@ -31,18 +31,30 @@ def test_retention_rolls_up_old_terminal_jobs_and_preserves_recent_and_active() 
             ),
             WorkJob(
                 kind=JobKind.MAINTENANCE.value,
+                dedupe_key="old-failure",
+                status="failed",
+                completed_at=now - timedelta(days=20),
+            ),
+            WorkJob(
+                kind=JobKind.MAINTENANCE.value,
+                dedupe_key="recent-failure",
+                status="failed",
+                completed_at=now - timedelta(days=2),
+            ),
+            WorkJob(
+                kind=JobKind.MAINTENANCE.value,
                 dedupe_key="active",
                 status="queued",
             ),
         ])
     with Session(engine) as session, session.begin():
-        assert JobRetention().prune(session, now=now) == 1
+        assert JobRetention().prune(session, now=now) == 2
     with Session(engine) as session:
         assert {row.dedupe_key for row in session.scalars(select(WorkJob))} == {
-            "recent-success", "active"
+            "recent-success", "recent-failure", "active"
         }
-        aggregate = session.scalar(select(JobDailyAggregate))
-        assert aggregate is not None
-        assert aggregate.job_count == 1
-        assert aggregate.attempt_count == 2
-        assert aggregate.duration_seconds == 300
+        aggregates = session.scalars(select(JobDailyAggregate)).all()
+        assert sum(row.job_count for row in aggregates) == 2
+        success = next(row for row in aggregates if row.status == "succeeded")
+        assert success.attempt_count == 2
+        assert success.duration_seconds == 300

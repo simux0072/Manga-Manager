@@ -13,6 +13,7 @@ from manga_manager.application.download_plans import DownloadPlanCoordinator
 from manga_manager.application.cover_backfill import CoverBackfillPlanner
 from manga_manager.application.kavita_sync import KavitaSyncPlanner
 from manga_manager.application.library_repair import LibraryRepairPlanner
+from manga_manager.application.match_rescore import MatchRescorePlanner
 from manga_manager.application.provider_health import contains_cloudflare_origin_error
 from manga_manager.application.job_retention import JobRetention
 from manga_manager.domain.jobs import JobKind, MaintenancePayload, SourcePullPayload
@@ -153,6 +154,8 @@ class SourcePollScheduler:
                 repair_planner.enqueue_pending(session, limit=25)
             if self._due("cover_backfill", current, timedelta(minutes=5)):
                 count += CoverBackfillPlanner(self.queue).enqueue_pending(session, limit=10)
+            if self._due("match_rescore", current, timedelta(minutes=5)):
+                count += MatchRescorePlanner(self.queue).enqueue_pending(session, limit=10)
             if self._due("job_retention", current, timedelta(minutes=10)):
                 JobRetention().prune(session, now=current, batch=250)
             if self._due("lease_cleanup", current, timedelta(minutes=10)):

@@ -65,6 +65,15 @@ evidence when providers differ by no more than two chapters. Every proposal rema
 regardless of score. Pending decisions are rescored after a signature is created or replaced, and
 accepted/rejected labels are snapshotted before identities are merged or deleted.
 
+Scoring evaluates every provider cover attached to either canonical manga and stores the exact
+source-identity pair that produced the strongest evidence. Suggested Matches renders that pair with
+a provenance label, so the visible images always correspond to the displayed cover result. Distinct
+same-provider catalog records are collapsed in review only when provider identity agrees, or when
+close cached hashes, shared title tokens, and at least five strongly overlapping numeric chapters
+agree. This collapse never performs an automatic catalog merge. A bounded, low-priority maintenance
+job upgrades older pending decisions to the current scorer so existing suggestions gain the same
+cover provenance without doing image work in an HTTP request.
+
 ## PostgreSQL provider identity repair
 
 Do not run identity repair against an unbacked-up catalog. Capture a PostgreSQL backup and paired

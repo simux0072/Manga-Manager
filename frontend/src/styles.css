@@ -33,3 +33,6 @@ html{scrollbar-gutter:stable}html.drawer-open{overflow:hidden}
 .drawer-body{overscroll-behavior:contain;scrollbar-gutter:stable;scrollbar-color:#50627d transparent;scrollbar-width:thin}
 .cycle-legend{display:flex;flex-wrap:wrap;gap:.35rem .8rem;margin-top:.6rem;color:var(--muted);font-size:.72rem}.cycle-legend span:first-child{color:var(--text);font-weight:700}.danger-text{color:var(--red)!important}
 @media(min-width:641px){.discovery-grid .discovery-card{display:flex;flex-direction:column}.discovery-card .card-content{flex:1;grid-template-rows:auto 1fr auto auto auto}}
+.job-actions{display:flex!important;grid-auto-flow:column;justify-content:start;gap:8px;margin-top:10px}.job-actions .secondary{min-height:36px;padding:7px 10px;font-size:.78rem}.job-table-row>.job-actions{margin-top:0;justify-content:end}
+.match-cover-evidence{display:grid;align-content:start;gap:7px}.match-cover-evidence>span{color:var(--green);font-size:.68rem;line-height:1.25;text-align:center}.match-cover-evidence>.cover{width:150px}
+.drawer-tools{display:flex;justify-content:flex-end;padding:10px 16px 0}.drawer-tools button{min-height:36px;padding:7px 10px;font-size:.78rem}.drawer-tools svg{width:15px;height:15px}

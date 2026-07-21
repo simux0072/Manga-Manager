@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session
 
 from manga_manager.application import matching_score
 from manga_manager.application.matching_score import (
+    SCORER_VERSION,
     rescore_pending_decisions_for_series,
     score_series_pair,
 )
@@ -123,8 +124,18 @@ def test_shared_external_identifier_is_capped_at_ninety_nine_percent(monkeypatch
     engine = create_engine("sqlite:///:memory:")
     JobBase.metadata.create_all(engine)
     with Session(engine) as session, session.begin():
-        left, _left_identity = make_series(session, "Left", "asura")
-        right, _right_identity = make_series(session, "Right", "mangafire")
+        left, left_identity = make_series(session, "Left", "asura")
+        right, right_identity = make_series(session, "Right", "mangafire")
+        for identity in (left_identity, right_identity):
+            session.add(
+                CatalogCoverSignature(
+                    source_series_id=identity.id,
+                    algorithm_version="test",
+                    feature_json={"hashes": ["0" * 16]},
+                    keypoints_blob=b"",
+                    descriptors_blob=b"",
+                )
+            )
         monkeypatch.setattr(
             matching_score,
             "_external_ids",
@@ -133,7 +144,23 @@ def test_shared_external_identifier_is_capped_at_ninety_nine_percent(monkeypatch
                 right.id: {"anilist:42"},
             },
         )
-        assert score_series_pair(session, left.id, right.id)["score"] == 0.99
+        monkeypatch.setattr(
+            matching_score,
+            "compare_signatures",
+            lambda _left, _right: {
+                "cover_compared": True,
+                "cover_match": True,
+                "cover_evidence_state": "match",
+                "cover_hash_distance": 0,
+                "cover_inlier_ratio": 1.0,
+            },
+        )
+
+        score = score_series_pair(session, left.id, right.id)
+
+        assert score["score"] == 0.99
+        assert score["cover_left_source_series_id"] == left_identity.id
+        assert score["cover_right_source_series_id"] == right_identity.id
 
 
 def test_title_similarity_requires_more_than_one_generic_shared_word() -> None:
@@ -215,6 +242,58 @@ def test_cover_evidence_outranks_exact_title_without_cover(monkeypatch) -> None:
 
         assert cover_score["score"] > title_score["score"]
         assert cover_score["score"] >= 0.86
+        assert cover_score["cover_left_source_series_id"] == cover_left_identity.id
+        assert cover_score["cover_right_source_series_id"] == cover_right_identity.id
+
+
+def test_cover_score_checks_every_provider_cover_and_records_the_winning_pair(
+    monkeypatch,
+) -> None:
+    engine = create_engine("sqlite:///:memory:")
+    JobBase.metadata.create_all(engine)
+    with Session(engine) as session, session.begin():
+        left, left_asura = make_series(session, "Left", "asura")
+        right, right_mangafire = make_series(session, "Right", "mangafire")
+        left_king = CatalogSourceSeries(
+            series_id=left.id,
+            source="kingofshojo",
+            source_id="left-king",
+            title="Left alternate",
+            normalized_title="left alternate",
+            url="https://example/left-king",
+        )
+        session.add(left_king)
+        session.flush()
+        for identity in (left_asura, left_king, right_mangafire):
+            session.add(
+                CatalogCoverSignature(
+                    source_series_id=identity.id,
+                    algorithm_version="test",
+                    feature_json={"hashes": [f"{identity.id:016x}"]},
+                    keypoints_blob=b"",
+                    descriptors_blob=b"",
+                )
+            )
+
+        def compare(left_signature, right_signature):
+            winning = {
+                left_signature.source_series_id,
+                right_signature.source_series_id,
+            } == {left_king.id, right_mangafire.id}
+            return {
+                "cover_compared": True,
+                "cover_match": winning,
+                "cover_evidence_state": "match" if winning else "different",
+                "cover_hash_distance": 0 if winning else 32,
+                "cover_inlier_ratio": 0.95 if winning else 0.0,
+            }
+
+        monkeypatch.setattr(matching_score, "compare_signatures", compare)
+        score = score_series_pair(session, left.id, right.id)
+
+        assert score["cover_match"] is True
+        assert score["cover_left_source_series_id"] == left_king.id
+        assert score["cover_right_source_series_id"] == right_mangafire.id
 
 
 def test_rescore_updates_evidence_but_never_accepts_pending_match(monkeypatch) -> None:
@@ -258,4 +337,4 @@ def test_rescore_updates_evidence_but_never_accepts_pending_match(monkeypatch) -
         assert decision.decision == "pending"
         assert decision.confidence >= 0.86
         assert decision.evidence_json["cover_evidence_state"] == "match"
-        assert decision.scorer_version == "cover-primary-v2"
+        assert decision.scorer_version == SCORER_VERSION
