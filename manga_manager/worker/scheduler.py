@@ -154,8 +154,10 @@ class SourcePollScheduler:
                 repair_planner.enqueue_pending(session, limit=25)
             if self._due("cover_backfill", current, timedelta(minutes=5)):
                 count += CoverBackfillPlanner(self.queue).enqueue_pending(session, limit=10)
-            if self._due("match_rescore", current, timedelta(minutes=5)):
-                count += MatchRescorePlanner(self.queue).enqueue_pending(session, limit=10)
+            if self._due("match_rescore", current, timedelta(minutes=1)):
+                match_rescore = MatchRescorePlanner(self.queue)
+                match_rescore.reconcile_active(session, limit=10)
+                count += match_rescore.enqueue_pending(session, limit=10)
             if self._due("job_retention", current, timedelta(minutes=10)):
                 JobRetention().prune(session, now=current, batch=250)
             if self._due("lease_cleanup", current, timedelta(minutes=10)):

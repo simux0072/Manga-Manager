@@ -2,6 +2,10 @@ import {defineConfig} from '@playwright/test'
 
 export default defineConfig({
   testDir:'./e2e',
+  // Keep generated traces outside the source tree.  Test containers may write as a
+  // different UID, which previously left frontend/test-results impossible for the
+  // host Playwright process to replace on the next run.
+  outputDir:process.env.PLAYWRIGHT_OUTPUT_DIR||'../.local/playwright-results',
   timeout:30_000,
   // Four concurrent Firefox processes exhaust the older staging host before navigation starts.
   // Run viewports sequentially; this also makes full-page screenshot output deterministic.

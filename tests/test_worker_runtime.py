@@ -189,3 +189,23 @@ def test_source_pull_workers_are_partitioned_by_provider(
     )
     pools = [pool for _slot, pool, _kinds in service._pool_specs()]
     assert pools == ["pull:asura", "pull:mangafire", "pull:kingofshojo"]
+
+
+def test_maintenance_worker_claims_repairs_and_catalog_rescores(
+    sessions: TrackingSessionFactory,
+) -> None:
+    async def handler(_context) -> None:
+        return None
+
+    service = WorkerService(
+        session_factory=sessions,
+        handlers={JobKind.LIBRARY_REPAIR: handler, JobKind.MAINTENANCE: handler},
+        settings=V2Settings(),
+        pools={"maintenance"},
+    )
+    specs = service._pool_specs()
+    assert len(specs) == 1
+    assert specs[0][1:] == (
+        "maintenance",
+        {JobKind.LIBRARY_REPAIR, JobKind.MAINTENANCE},
+    )

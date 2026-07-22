@@ -3,8 +3,9 @@ set -eu
 
 project="${STAGE_PROJECT:-manga-manager-stage}"
 state_dir="${STAGE_STATE_DIR:-$PWD/.local}"
-mkdir -p "$state_dir"
-exec 9>"$state_dir/$project-stage.lock"
+lock_dir="${STAGE_LOCK_DIR:-$state_dir}"
+mkdir -p "$state_dir" "$lock_dir"
+exec 9>"$lock_dir/$project-stage.lock"
 if ! flock -n 9; then
   echo "another $project startup or teardown is already running" >&2
   exit 75

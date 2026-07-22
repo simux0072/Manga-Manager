@@ -72,7 +72,9 @@ same-provider catalog records are collapsed in review only when provider identit
 close cached hashes, shared title tokens, and at least five strongly overlapping numeric chapters
 agree. This collapse never performs an automatic catalog merge. A bounded, low-priority maintenance
 job upgrades older pending decisions to the current scorer so existing suggestions gain the same
-cover provenance without doing image work in an HTTP request.
+cover provenance without doing image work in an HTTP request. Rescoring is read-only, never blocks
+a manual merge, and is admitted through a rolling ten-job maintenance window so a scorer-version
+change cannot flood the live queue.
 
 ## PostgreSQL provider identity repair
 

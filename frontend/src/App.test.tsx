@@ -110,7 +110,7 @@ describe('media library frontend',()=>{
     await screen.findByText(series.title)
     await userEvent.click(screen.getByRole('button',{name:/active/i}))
     await userEvent.click(screen.getByRole('button',{name:'failed'}))
-    await userEvent.click(await screen.findByRole('button',{name:/Dismiss all unresolved failures/i}))
+    await userEvent.click(await screen.findByRole('button',{name:/Clear failures/i}))
     expect(fetch).toHaveBeenCalledWith('/api/v2/jobs/failures/dismiss',expect.objectContaining({method:'POST'}))
   })
 

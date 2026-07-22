@@ -3,6 +3,7 @@ set -eu
 
 command="${1:-status}"
 root="${TEST_ENV_ROOT:-$PWD/.local/test-environment}"
+lock_dir="${TEST_ENV_LOCK_DIR:-$PWD/.local/test-locks}"
 project="${TEST_ENV_PROJECT:-manga-manager-test}"
 storage="$root/storage"
 state="$root/state"
@@ -27,6 +28,7 @@ safe_test_path() {
 }
 
 root=$(safe_test_path "$root")
+lock_dir=$(safe_test_path "$lock_dir")
 
 remove_test_root() {
   # Worker and seed containers deliberately run as root, so generated bind-mounted files can be
@@ -41,6 +43,7 @@ remove_test_root() {
 export STAGE_PROJECT="$project"
 export STAGE_STORAGE_ROOT="$storage"
 export STAGE_STATE_DIR="$state"
+export STAGE_LOCK_DIR="$lock_dir"
 export STAGE_PORT="$port"
 export STAGE_ENABLE_SOURCES=false
 export STAGE_MIN_FREE_BYTES=0
@@ -175,7 +178,15 @@ EOF
       "SELECT version_num FROM alembic_version"
     docker exec "$postgres" dropdb -U manga manga_manager_test_restore
     if [ "${TEST_ENV_SKIP_BROWSER:-false}" != true ]; then
-      (cd frontend && PLAYWRIGHT_BASE_URL="http://127.0.0.1:$port" npm run test:browser)
+      browser_results="$root/browser-results"
+      if [ -d "$browser_results" ] && docker image inspect "$image" >/dev/null 2>&1; then
+        docker run --rm -v "$browser_results:/cleanup" "$image" sh -c \
+          'rm -rf /cleanup/* /cleanup/.[!.]* /cleanup/..?*'
+      fi
+      rmdir "$browser_results" 2>/dev/null || true
+      mkdir -p "$browser_results"
+      (cd frontend && PLAYWRIGHT_BASE_URL="http://127.0.0.1:$port" \
+        PLAYWRIGHT_OUTPUT_DIR="$browser_results" npm run test:browser)
     fi
     worker_limit=$(docker inspect -f '{{.HostConfig.Memory}}' "$worker")
     [ "$worker_limit" -eq 1073741824 ] || {
@@ -191,6 +202,10 @@ EOF
       STAGE_PROJECT="$scale_project" STAGE_STORAGE_ROOT="$scale_root/storage" \
         STAGE_STATE_DIR="$scale_root/state" scripts/stage-local.sh down --volumes \
         >/dev/null 2>&1 || true
+      if [ -d "$scale_root" ] && docker image inspect "$scale_project:local" >/dev/null 2>&1; then
+        docker run --rm -v "$scale_root:/cleanup" "$scale_project:local" sh -c \
+          'rm -rf /cleanup/* /cleanup/.[!.]* /cleanup/..?*' >/dev/null 2>&1 || true
+      fi
       rm -rf -- "$scale_root"
     }
     trap cleanup_scale EXIT INT TERM
@@ -225,6 +240,12 @@ EOF
       "$0" scale-check
     ;;
   validate)
+    mkdir -p "$lock_dir"
+    exec 7>"$lock_dir/$project-validation.lock"
+    if ! flock -n 7; then
+      echo "another $project validation is already running" >&2
+      exit 75
+    fi
     self=$(realpath "$0")
     cleanup_validation() {
       "$self" down >/dev/null 2>&1 || true

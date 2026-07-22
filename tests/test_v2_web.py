@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 import httpx
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from manga_manager.infrastructure.db_models import (
@@ -25,7 +25,9 @@ from manga_manager.web.api import (
     human_evidence,
     operational_error_message,
     pending_match_proposal_index,
+    proposal_blockers,
     proposal_component_blockers,
+    workload_cycle_summary,
 )
 from manga_manager.web.app import create_app
 
@@ -708,6 +710,28 @@ async def test_entire_match_queue_preview_keeps_active_job_blockers_visible() ->
     assert result.json()["ids"] == [] and result.json()["blocked"]
 
 
+def test_match_rescore_jobs_do_not_block_catalog_merges() -> None:
+    _app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        series_ids = list(session.scalars(select(CatalogSeries.id).order_by(CatalogSeries.id)))
+        session.add(
+            WorkJob(
+                kind="maintenance",
+                dedupe_key="rescore-does-not-block",
+                payload={
+                    "version": 1,
+                    "action": "rescore_matches",
+                    "series_id": series_ids[0],
+                },
+                series_key=str(series_ids[0]),
+                pool="maintenance",
+                status="queued",
+            )
+        )
+        session.flush()
+        assert "active jobs" not in proposal_blockers(session, series_ids)
+
+
 async def test_connected_batch_matches_merge_once() -> None:
     app, sessions = app_with_catalog()
     with sessions() as session, session.begin():
@@ -1096,6 +1120,51 @@ async def test_workload_cycle_uses_live_active_units_when_counters_lag() -> None
     assert response.status_code == 200
     assert response.json()["remaining"] == 1
     assert response.json()["total"] == 4
+
+
+def test_workload_cycle_reclassifies_dismissed_and_superseded_failures() -> None:
+    _app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        cycle = WorkloadCycle(
+            status="settled",
+            total_units=2,
+            failed_units=2,
+            added_units=2,
+        )
+        session.add(cycle)
+        session.flush()
+        old = WorkJob(
+            kind="maintenance",
+            dedupe_key="failed-then-dismissed",
+            payload={"version": 1, "action": "stage_probe"},
+            status="failed",
+            cycle_id=cycle.id,
+            logical_units=1,
+        )
+        current = WorkJob(
+            kind="maintenance",
+            dedupe_key="failed-then-dismissed",
+            payload={"version": 1, "action": "stage_probe"},
+            status="cancelled",
+            cycle_id=cycle.id,
+            logical_units=1,
+        )
+        session.add_all([old, current])
+        session.flush()
+        session.add(
+            JobEvent(
+                job_id=current.id,
+                event_type="cancelled",
+                status="cancelled",
+                message="failure dismissed from the live job center",
+            )
+        )
+    with sessions() as session:
+        summary = workload_cycle_summary(session, session.get(WorkloadCycle, cycle.id))
+    assert summary["failed"] == 0
+    assert summary["cancelled"] == 1
+    assert summary["superseded"] == 1
+    assert summary["remaining"] == 0
 
 
 async def test_job_group_and_child_keyset_cursors_do_not_repeat_rows() -> None:

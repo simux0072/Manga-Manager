@@ -7,6 +7,7 @@ network="${STAGE_NETWORK:-$project-net}"
 container="${KAVITA_CONTAINER:-$project-kavita}"
 volume="${KAVITA_CONFIG_VOLUME:-$project-kavita-config}"
 state_dir="${STAGE_STATE_DIR:-$PWD/.local}"
+lock_dir="${STAGE_LOCK_DIR:-$state_dir}"
 legacy_env_file="$state_dir/kavita.env"
 if [ -n "${KAVITA_ENV_FILE:-}" ]; then
   env_file="$KAVITA_ENV_FILE"
@@ -53,9 +54,9 @@ case "$command" in
   *) echo "usage: scripts/kavita-local.sh up|down|status|credentials|reset-config --yes" >&2; exit 2 ;;
 esac
 
-mkdir -p "$state_dir" "$env_dir" "$storage/kavita-library"
+mkdir -p "$state_dir" "$lock_dir" "$env_dir" "$storage/kavita-library"
 chmod 700 "$state_dir"
-exec 8>"$state_dir/$project-kavita-local.lock"
+exec 8>"$lock_dir/$project-kavita-local.lock"
 if ! flock -n 8; then
   echo "another Kavita provisioning operation is already running" >&2
   exit 75

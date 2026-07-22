@@ -70,6 +70,7 @@ class WorkJob(JobBase):
         Index("ix_job_lease_expiry", "status", "lease_expires_at"),
         Index("ix_job_pool_claim", "pool", "status", "available_at", "priority"),
         Index("ix_job_source_status", "source", "status"),
+        Index("ix_job_logical_attempt", "kind", "dedupe_key", "id"),
         Index("ix_job_cycle_group_status", "cycle_id", "group_key", "status"),
         Index("ix_job_workflow_status", "workflow_key", "status"),
         Index(

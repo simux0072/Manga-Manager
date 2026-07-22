@@ -89,7 +89,11 @@ class WorkerService:
                 {JobKind.CHAPTER_DOWNLOAD},
             ),
             ("kavita", 1, {JobKind.KAVITA_SYNC}),
-            ("maintenance", 1, {JobKind.LIBRARY_REPAIR}),
+            # Catalog rescoring is a maintenance job routed to this pool.  Keeping
+            # LIBRARY_REPAIR and MAINTENANCE in one single-slot lane protects the
+            # storage-heavy repair work while still allowing queued catalog work
+            # to make progress.
+            ("maintenance", 1, {JobKind.LIBRARY_REPAIR, JobKind.MAINTENANCE}),
             ("health", 1, {JobKind.MAINTENANCE}),
             ("cover_backfill", 1, {JobKind.COVER_BACKFILL}),
         ]

@@ -31,7 +31,10 @@ scripts/test-environment.sh reset --yes
 
 Run the entire fresh small-stack, Kavita/browser, backup/restore, and disposable scale acceptance
 sequence unattended with `scripts/test-environment.sh validate`. It always stops its isolated
-services afterward, including when a check fails.
+services afterward, including when a check fails. Orchestration locks live under
+`.local/test-locks`, outside the disposable state tree, and Playwright artifacts live under the
+test environment root. A container UID therefore cannot make a later host-side validation fail to
+open a lock or replace `frontend/test-results`.
 
 On the Raspberry Pi, run `scripts/test-environment.sh performance-check` once before production
 rollout. It uses the same disposable scale project but expands it to 2,000 series, 100,000 synthetic

@@ -91,6 +91,19 @@ def job_state_predicate(states: list[str]):
     return or_(WorkJob.status.in_(non_failed), failed) if non_failed else failed
 
 
+def merge_blocking_job_predicate():
+    """Return active work that can make a catalog merge unsafe.
+
+    Match rescoring only reads evidence.  Treating those low-priority jobs as
+    writers made a scorer upgrade lock the entire review queue.
+    """
+    action = func.coalesce(WorkJob.payload["action"].as_string(), "")
+    return and_(
+        WorkJob.status.in_(ACTIVE_JOB_STATES),
+        or_(WorkJob.kind != JobKind.MAINTENANCE.value, action != "rescore_matches"),
+    )
+
+
 class SeriesStateChange(BaseModel):
     status: str
 
@@ -169,6 +182,75 @@ def storage_health(session: Session) -> dict[str, int]:
         "storage_paused": int(state.paused),
         "storage_reserved_bytes": state.reserved_bytes,
         "storage_min_free_bytes": state.min_free_bytes,
+    }
+
+
+def workload_cycle_summary(session: Session, cycle: WorkloadCycle) -> dict[str, Any]:
+    active_units = int(
+        session.scalar(
+            select(func.coalesce(func.sum(WorkJob.logical_units), 0)).where(
+                WorkJob.cycle_id == cycle.id,
+                WorkJob.status.in_(ACTIVE_JOB_STATES),
+            )
+        )
+        or 0
+    )
+    coalesced = int(
+        session.scalar(
+            select(func.coalesce(func.sum(WorkJob.logical_units), 0)).where(
+                WorkJob.cycle_id == cycle.id,
+                WorkJob.status == "cancelled",
+                WorkJob.error_message.like("coalesced into library repair job %"),
+            )
+        )
+        or 0
+    )
+    # A retry is a separate durable attempt, so the cycle's historical failed counter
+    # intentionally never decreases.  In the live UI, however, an older failed attempt is
+    # superseded once a later attempt exists, and a dismissed latest failure is a
+    # cancellation.  Reclassify those units without rewriting audit history.
+    unresolved_failed = int(
+        session.scalar(
+            select(func.coalesce(func.sum(WorkJob.logical_units), 0)).where(
+                WorkJob.cycle_id == cycle.id,
+                job_state_predicate(["failed"]),
+            )
+        )
+        or 0
+    )
+    dismissed = int(
+        session.scalar(
+            select(func.coalesce(func.sum(WorkJob.logical_units), 0)).where(
+                WorkJob.cycle_id == cycle.id,
+                WorkJob.status == "cancelled",
+                select(JobEvent.id)
+                .where(
+                    JobEvent.job_id == WorkJob.id,
+                    JobEvent.event_type == "cancelled",
+                    JobEvent.message == "failure dismissed from the live job center",
+                )
+                .exists(),
+            )
+        )
+        or 0
+    )
+    superseded_failures = max(cycle.failed_units - unresolved_failed - dismissed, 0)
+    cancelled = max(cycle.cancelled_units - coalesced, 0) + dismissed
+    superseded = coalesced + superseded_failures
+    settled = cycle.successful_units + unresolved_failed + cancelled + superseded
+    effective_total = max(cycle.total_units, settled + active_units)
+    return {
+        "id": cycle.id,
+        "status": cycle.status,
+        "total": effective_total,
+        "successful": cycle.successful_units,
+        "failed": unresolved_failed,
+        "cancelled": cancelled,
+        "superseded": superseded,
+        "remaining": active_units,
+        "added": cycle.added_units,
+        "started_at": cycle.started_at.isoformat(),
+        "updated_at": cycle.updated_at.isoformat(),
     }
 
 
@@ -322,7 +404,7 @@ def proposal_blockers(session: Session, series_ids: list[int]) -> list[str]:
         select(WorkJob.id)
         .where(
             WorkJob.series_key.in_([str(value) for value in series_ids]),
-            WorkJob.status.in_(ACTIVE_JOB_STATES),
+            merge_blocking_job_predicate(),
         )
         .limit(1)
     )
@@ -867,7 +949,7 @@ def create_api_router(
             session.scalars(
                 select(WorkJob.series_key).where(
                     WorkJob.series_key.in_([str(value) for value in canonical_ids] or ["-"]),
-                    WorkJob.status.in_(ACTIVE_JOB_STATES),
+                    merge_blocking_job_predicate(),
                 )
             )
         )
@@ -1377,41 +1459,7 @@ def create_api_router(
                 "remaining": 0,
                 "added": 0,
             }
-        active_units = int(
-            session.scalar(
-                select(func.coalesce(func.sum(WorkJob.logical_units), 0)).where(
-                    WorkJob.cycle_id == cycle.id,
-                    WorkJob.status.in_(ACTIVE_JOB_STATES),
-                )
-            )
-            or 0
-        )
-        superseded = int(
-            session.scalar(
-                select(func.coalesce(func.sum(WorkJob.logical_units), 0)).where(
-                    WorkJob.cycle_id == cycle.id,
-                    WorkJob.status == "cancelled",
-                    WorkJob.error_message.like("coalesced into library repair job %"),
-                )
-            )
-            or 0
-        )
-        cancelled = max(cycle.cancelled_units - superseded, 0)
-        settled = cycle.successful_units + cycle.failed_units + cycle.cancelled_units
-        effective_total = max(cycle.total_units, settled + active_units)
-        return {
-            "id": cycle.id,
-            "status": cycle.status,
-            "total": effective_total,
-            "successful": cycle.successful_units,
-            "failed": cycle.failed_units,
-            "cancelled": cancelled,
-            "superseded": superseded,
-            "remaining": active_units,
-            "added": cycle.added_units,
-            "started_at": cycle.started_at.isoformat(),
-            "updated_at": cycle.updated_at.isoformat(),
-        }
+        return workload_cycle_summary(session, cycle)
 
     @router.get("/job-groups")
     def job_groups(
@@ -1690,7 +1738,11 @@ def create_api_router(
     @router.get("/operations")
     def operations(session: SessionDep):
         counts = dict(
-            session.execute(select(WorkJob.status, func.count()).group_by(WorkJob.status)).all()
+            session.execute(
+                select(WorkJob.status, func.count())
+                .where(WorkJob.status.in_(ACTIVE_JOB_STATES))
+                .group_by(WorkJob.status)
+            ).all()
         )
         counts["failed"] = int(
             session.scalar(
@@ -1729,11 +1781,10 @@ def create_api_router(
             disk = shutil.disk_usage(settings.storage_root)
         except OSError:
             disk = shutil.disk_usage(".")
+        # pg_database_size walks relation files and can stall this frequently refreshed endpoint
+        # for seconds while a mechanical disk is flushing a large import.  Exact database size
+        # remains available from `database-audit`; the interactive page does not consume it.
         database_bytes = 0
-        if session.bind is not None and session.bind.dialect.name == "postgresql":
-            database_bytes = int(
-                session.scalar(select(func.pg_database_size(func.current_database()))) or 0
-            )
         policies = session.scalars(select(ProviderPolicy).order_by(ProviderPolicy.source)).all()
         endpoint_states = session.scalars(
             select(ProviderEndpointState).order_by(
@@ -2205,6 +2256,8 @@ def serialize_jobs(session: Session, rows: list[WorkJob]) -> list[dict[str, Any]
             if action.startswith("provider_probe_"):
                 source = action.removeprefix("provider_probe_").replace("_", " ").title()
                 description = f"Probe {source} provider recovery"
+            elif action == "rescore_matches":
+                description = "Refresh manga matching evidence"
             else:
                 description = "Run storage and database health probe"
         else:
