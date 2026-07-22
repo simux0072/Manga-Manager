@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from sqlalchemy import delete, func, select, text, tuple_
 from sqlalchemy.orm import Session
 
-from app.domain import ChapterItem, SeriesItem
+from app.domain import ChapterItem, SeriesItem, chapter_quality_rank
 from manga_manager.domain.catalog import (
     canonical_chapter_number,
     chapter_sort_number,
@@ -602,11 +602,13 @@ class CatalogRepository:
                     source_release_id=canonical,
                     title=item.title,
                     url=item.url,
+                    quality_rank=chapter_quality_rank(item),
                 )
                 session.add(release)
             release.title = item.title
             release.url = item.url
             release.published_at = item.published_at
+            release.quality_rank = chapter_quality_rank(item)
         # Runtime sessions intentionally disable autoflush. Latest-release queries must see
         # releases created above, otherwise new series remain blank and existing series lag one
         # observation behind.

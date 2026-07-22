@@ -11,7 +11,8 @@ The supported local workflow uses Docker directly and does not require the Compo
 
 ```bash
 scripts/stage-local.sh serve --build
-# Manga Manager: http://127.0.0.1:18000
+# This computer: http://127.0.0.1:18000
+# Other LAN devices: http://<host-ip>:18000
 scripts/stage-local.sh down
 ```
 
@@ -19,8 +20,8 @@ To run Manga Manager with a locally provisioned Kavita instance:
 
 ```bash
 scripts/kavita-local.sh up
-# Manga Manager: http://127.0.0.1:18000
-# Kavita: http://127.0.0.1:15000
+# Manga Manager on the LAN: http://<host-ip>:18000
+# Kavita on the LAN: http://<host-ip>:15000
 scripts/kavita-local.sh credentials
 scripts/kavita-local.sh down
 ```
@@ -28,6 +29,10 @@ scripts/kavita-local.sh down
 `kavita-local.sh up` starts both services; do not run `stage-local.sh serve` concurrently.
 After changing application code, use `KAVITA_BUILD=true scripts/kavita-local.sh up` to rebuild the
 shared image before both services start.
+Both launchers bind their web ports to all local interfaces. Use `hostname -I` to find the host
+address and allow TCP ports 18000 and 15000 through the host firewall for trusted LAN clients.
+Set `STAGE_BIND_ADDRESS=127.0.0.1` and `KAVITA_BIND_ADDRESS=127.0.0.1` to restore host-only access.
+The application has no local authentication, so never expose these staging ports to the internet.
 
 For fast, deterministic development without downloading a real catalog:
 
@@ -81,6 +86,9 @@ storage by default. Local staging uses 1 GiB (`STAGE_MIN_FREE_BYTES` overrides i
 - Chapter jobs reserve shared storage before network work. A low-space pause does not consume an
   attempt and clears automatically when storage recovers.
 - Provider request limits, cooldowns, fallbacks, and leased permits are global across workers.
+- Chapter selection is ordered Asura, MangaFire, then KingOfShojo. Within MangaFire, the
+  green-check `official` release wins over an unverified duplicate chapter; its quality is stored
+  with the artifact so an older unverified download can be upgraded exactly once.
 - `manga-manager enqueue-kavita-pending --limit 100` queues downloaded tracked series missing a
   current Kavita mapping.
 - `manga-manager enqueue-library-repair --all-tracked` queues a resumable canonical metadata and

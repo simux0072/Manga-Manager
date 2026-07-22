@@ -297,7 +297,20 @@ def test_mangafire_uses_api_payloads_for_titles_chapters_and_pages():
         {
             "data": {
                 "items": [
-                    {"id": 156, "number": 60, "name": "Love & Clover", "language": "en"},
+                    {
+                        "id": 154,
+                        "number": 60,
+                        "name": "Love & Clover",
+                        "language": "en",
+                        "type": "unofficial",
+                    },
+                    {
+                        "id": 156,
+                        "number": 60,
+                        "name": "Love & Clover",
+                        "language": "en",
+                        "type": "official",
+                    },
                     {"id": 155, "number": 60, "name": "Spanish", "language": "es"},
                 ]
             }
@@ -307,6 +320,11 @@ def test_mangafire_uses_api_payloads_for_titles_chapters_and_pages():
 
     assert len(chapters) == 1
     assert chapters[0].url == "https://mangafire.to/title/gl3-gun-x-clover/chapter/156"
+    assert chapters[0].metadata == {
+        "release_type": "official",
+        "verified": True,
+        "quality_rank": 100,
+    }
     assert adapter.parse_chapter_image_urls(
         {"data": {"pages": [{"url": "https://m3z.mfcdn3.xyz/mf/page.jpg"}]}}
     ) == ["https://m3z.mfcdn3.xyz/mf/page.jpg"]

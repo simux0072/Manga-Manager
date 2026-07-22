@@ -20,7 +20,7 @@ from app.adapters.parsing import (
     nearby_cover_attr,
     parse_source_date,
 )
-from app.domain import ChapterItem, SeriesItem, normalize_chapter_number
+from app.domain import ChapterItem, SeriesItem, chapter_quality_rank, normalize_chapter_number
 from app.settings import settings
 
 
@@ -426,12 +426,19 @@ def asura_series_url(source_id: str, revision: str = "") -> str:
 
 
 def dedupe_chapters(items: list[ChapterItem]) -> list[ChapterItem]:
-    seen: set[str] = set()
+    positions: dict[str, int] = {}
     result: list[ChapterItem] = []
     for item in items:
-        if item.number not in seen:
-            seen.add(item.number)
+        position = positions.get(item.number)
+        if position is None:
+            positions[item.number] = len(result)
             result.append(item)
+            continue
+        # Some providers publish several translations for the same chapter. Preserve
+        # the original order, but replace the selected variant when the provider gives
+        # us an explicit quality signal (for example MangaFire's green-check release).
+        if chapter_quality_rank(item) > chapter_quality_rank(result[position]):
+            result[position] = item
     return result
 
 

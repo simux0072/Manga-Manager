@@ -600,6 +600,7 @@ class CatalogChapterRelease(JobBase):
     downloadable_after: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    quality_rank: Mapped[int] = mapped_column(Integer, default=0)
 
 
 class ChapterReleaseAttempt(JobBase):
@@ -863,6 +864,7 @@ class ChapterArtifact(JobBase):
     state: Mapped[str] = mapped_column(String(20), default="active", index=True)
     provenance: Mapped[str] = mapped_column(String(50), default="download")
     source: Mapped[str] = mapped_column(String(50), default="")
+    quality_rank: Mapped[int] = mapped_column(Integer, default=0)
     image_count: Mapped[int] = mapped_column(Integer, default=0)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     deactivated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

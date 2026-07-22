@@ -74,6 +74,7 @@ class DownloadSnapshot:
     release_title: str
     release_url: str
     published_at: datetime | None
+    quality_rank: int
 
 
 class ChapterDownloadHandler:
@@ -343,6 +344,7 @@ class ChapterDownloadHandler:
                 projection_relative_path=projection_relative,
                 provenance=provenance,
                 source=snapshot.source,
+                quality_rank=snapshot.quality_rank,
                 replace=True,
             )
             # Publish the projection before making repair work claimable. Otherwise a fast
@@ -521,6 +523,7 @@ def load_snapshot(session: Session, release_id: int) -> DownloadSnapshot | None:
         release_title=release.title,
         release_url=release.url,
         published_at=release.published_at,
+        quality_rank=release.quality_rank,
     )
 
 

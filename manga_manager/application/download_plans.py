@@ -115,7 +115,7 @@ class DownloadPlanCoordinator:
         ).all()
         return max(
             rows,
-            key=lambda row: (SOURCE_PRIORITY.get(row.source, 0), row.id),
+            key=self._release_preference,
             default=None,
         )
 
@@ -272,14 +272,19 @@ class DownloadPlanCoordinator:
             .where(
                 CatalogChapter.series_id.in_(series_ids),
                 ChapterArtifact.state == "active",
-                ChapterArtifact.provenance == "fallback",
+                # Fallbacks may be replaced by a preferred provider. MangaFire
+                # artifacts are also reconsidered so pre-migration unofficial
+                # chapters are upgraded once to a verified official release.
+                (ChapterArtifact.provenance == "fallback")
+                | (ChapterArtifact.source == "mangafire"),
             )
         ).all()
         created = 0
         for artifact in artifacts:
             release = self._best_release(session, artifact.chapter_id)
-            if release is None or SOURCE_PRIORITY.get(release.source, 0) <= SOURCE_PRIORITY.get(
-                artifact.source, 0
+            if release is None or self._release_preference(release)[:2] <= (
+                SOURCE_PRIORITY.get(artifact.source, 0),
+                artifact.quality_rank or 0,
             ):
                 continue
             chapter = session.get(CatalogChapter, artifact.chapter_id)
@@ -443,7 +448,13 @@ class DownloadPlanCoordinator:
                 | (CatalogChapterRelease.downloadable_after <= now),
             )
         ).all()
-        return max(rows, key=lambda row: (SOURCE_PRIORITY.get(row.source, 0), row.id), default=None)
+        return max(rows, key=DownloadPlanCoordinator._release_preference, default=None)
+
+    @staticmethod
+    def _release_preference(release: CatalogChapterRelease) -> tuple[int, int, int]:
+        # Provider preference is intentionally decisive. Quality ranks choose the
+        # best release variant only within the same provider.
+        return (SOURCE_PRIORITY.get(release.source, 0), release.quality_rank or 0, release.id)
 
     @staticmethod
     def _has_active_artifact(session: Session, chapter_id: int) -> bool:

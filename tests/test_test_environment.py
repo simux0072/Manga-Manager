@@ -102,12 +102,14 @@ def test_runtime_entrypoints_do_not_reinvoke_uv() -> None:
     assert "max-size: 10m" in compose
     assert 'docker stop --time "${STAGE_POSTGRES_STOP_SECONDS:-300}"' in stage
     assert 'docker rm -f "$postgres"' not in stage
+    assert 'STAGE_BIND_ADDRESS:-0.0.0.0' in stage
     kavita = (ROOT / "scripts" / "kavita-local.sh").read_text()
     assert "jvmilazz0/kavita:0.8.9" in kavita
     assert "jvmilazz0/kavita:0.9.0.2" not in kavita
     assert "jvmilazz0/kavita:latest" not in kavita
     assert 'current_image=$(docker inspect' in kavita
     assert '[ "$current_image" != "$image" ]' in kavita
+    assert '[ "$current_bind" != "$kavita_bind_address" ]' in kavita
     assert kavita.index('docker build -t "$app_image" .') < kavita.index("expected_mount=")
     docker_ignore = (ROOT / ".dockerignore").read_text().splitlines()
     assert "local-archives" in docker_ignore
@@ -209,6 +211,7 @@ def test_kavita_launcher_preserves_pending_password() -> None:
     assert '[ "$provision_status" -eq 42 ] && [ "$had_credentials" = false ]' in launcher
     assert 'docker volume rm "$volume"' in launcher
     assert 'KAVITA_BUILD:-false' in launcher
+    assert 'KAVITA_BIND_ADDRESS:-${STAGE_BIND_ADDRESS:-0.0.0.0}' in launcher
 
 
 def test_isolated_environment_rebuilds_the_test_image_by_default() -> None:
@@ -216,6 +219,8 @@ def test_isolated_environment_rebuilds_the_test_image_by_default() -> None:
 
     assert 'KAVITA_BUILD="${TEST_ENV_BUILD:-true}" scripts/kavita-local.sh up' in launcher
     assert "remove_test_root" in launcher
+    assert "export STAGE_BIND_ADDRESS=127.0.0.1" in launcher
+    assert "export KAVITA_BIND_ADDRESS=127.0.0.1" in launcher
     assert 'docker run --rm -v "$root:/cleanup" "$image"' in launcher
 
 

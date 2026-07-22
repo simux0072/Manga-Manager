@@ -168,6 +168,88 @@ def test_fallback_artifact_is_queued_for_preferred_source_upgrade() -> None:
     assert upgrade is not None and upgrade.source == "asura" and upgrade.priority == 250
 
 
+def test_mangafire_official_release_upgrades_an_unranked_existing_artifact() -> None:
+    session, series_id = populated_session(chapter_count=1)
+    chapter = session.scalar(select(CatalogChapter))
+    release = session.scalar(select(CatalogChapterRelease))
+    assert chapter is not None and release is not None
+    release.quality_rank = 100
+    session.add(ArtifactBlob(checksum="b" * 64, relative_path="blobs/b.cbz", byte_count=1))
+    session.add(
+        ChapterArtifact(
+            chapter_id=chapter.id,
+            chapter_release_id=release.id,
+            blob_checksum="b" * 64,
+            state="active",
+            provenance="download",
+            source="mangafire",
+            quality_rank=0,
+            image_count=10,
+        )
+    )
+    session.commit()
+
+    with session.begin():
+        created = DownloadPlanCoordinator().enqueue_preferred_upgrades(session, [series_id])
+
+    assert created == 1
+    upgrade = session.scalar(select(WorkJob).where(WorkJob.dedupe_key.like("upgrade:%")))
+    assert upgrade is not None and upgrade.source == "mangafire"
+
+
+def test_fallback_prefers_mangafire_over_kingofshojo() -> None:
+    session, series_id = populated_session(chapter_count=1)
+    chapter = session.scalar(select(CatalogChapter))
+    mangafire = session.scalar(select(CatalogChapterRelease))
+    assert chapter is not None and mangafire is not None
+    session.commit()
+    with session.begin():
+        king = CatalogSourceSeries(
+            series_id=series_id,
+            source="kingofshojo",
+            source_id="king-example",
+            title="Example",
+            normalized_title="example",
+            url="https://king.test/example",
+        )
+        asura = CatalogSourceSeries(
+            series_id=series_id,
+            source="asura",
+            source_id="asura-example",
+            title="Example",
+            normalized_title="example",
+            url="https://asura.test/example",
+        )
+        session.add_all([king, asura])
+        session.flush()
+        king_release = CatalogChapterRelease(
+            chapter_id=chapter.id,
+            source_series_id=king.id,
+            source="kingofshojo",
+            source_release_id="king-1",
+            url="https://king.test/example/1",
+        )
+        asura_release = CatalogChapterRelease(
+            chapter_id=chapter.id,
+            source_series_id=asura.id,
+            source="asura",
+            source_release_id="asura-1",
+            url="https://asura.test/example/1",
+        )
+        session.add_all([king_release, asura_release])
+        session.flush()
+
+        selected = DownloadPlanCoordinator().fallback_release(
+            session,
+            chapter.id,
+            asura_release.id,
+        )
+
+    assert selected is not None
+    assert selected.id == mangafire.id
+    assert selected.source == "mangafire"
+
+
 def test_cooling_provider_reroutes_all_waiting_chapters_to_alternates() -> None:
     session, series_id = populated_session(chapter_count=2)
     chapters = session.scalars(select(CatalogChapter).order_by(CatalogChapter.id)).all()

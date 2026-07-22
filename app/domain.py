@@ -38,6 +38,13 @@ class ChapterItem:
     title: str
     url: str
     published_at: datetime | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
+
+
+def chapter_quality_rank(item: ChapterItem) -> int:
+    """Return a provider-supplied quality rank without trusting arbitrary types."""
+    value = item.metadata.get("quality_rank", 0)
+    return int(value) if isinstance(value, (int, float)) else 0
 
 
 def normalize_title(title: str) -> str:

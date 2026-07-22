@@ -36,6 +36,7 @@ class ArtifactRepository:
         projection_relative_path: str,
         provenance: str,
         source: str = "",
+        quality_rank: int = 0,
         replace: bool = False,
     ) -> ActivationResult:
         stored_blob = session.get(ArtifactBlob, blob.checksum)
@@ -53,6 +54,9 @@ class ArtifactRepository:
             )
         )
         if active is not None and active.blob_checksum == blob.checksum:
+            active.chapter_release_id = chapter_release_id or active.chapter_release_id
+            active.source = source or active.source
+            active.quality_rank = max(active.quality_rank or 0, quality_rank)
             projection = self._upsert_projection(
                 session, chapter_id, active.id, projection_relative_path
             )
@@ -65,6 +69,7 @@ class ArtifactRepository:
                 state="quarantined",
                 provenance=provenance,
                 source=source,
+                quality_rank=quality_rank,
                 image_count=blob.image_count,
             )
             session.add(quarantined)
@@ -80,6 +85,7 @@ class ArtifactRepository:
             blob_checksum=blob.checksum,
             provenance=provenance,
             source=source,
+            quality_rank=quality_rank,
             image_count=blob.image_count,
         )
         session.add(artifact)

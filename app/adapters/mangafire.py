@@ -395,6 +395,8 @@ class MangaFireAdapter(SourceAdapter):
                 or entry.get("uploadedAt")
                 or entry.get("publishedAt")
             )
+            release_type = str(entry.get("type") or "").strip().lower()
+            is_official = release_type == "official"
             chapters.append(
                 ChapterItem(
                     source=self.source,
@@ -403,6 +405,11 @@ class MangaFireAdapter(SourceAdapter):
                     title=title,
                     url=f"{source_series.url.rstrip('/')}/chapter/{chapter_id}",
                     published_at=created_at,
+                    metadata={
+                        "release_type": release_type or "unknown",
+                        "verified": is_official,
+                        "quality_rank": 100 if is_official else 0,
+                    },
                 )
             )
         return dedupe_chapters(chapters)

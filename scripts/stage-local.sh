@@ -19,6 +19,7 @@ data_dir="${STAGE_STORAGE_ROOT:-$PWD/storage-v2-stage}"
 db_volume="$project-db"
 database_url="postgresql+psycopg://manga:manga@$postgres:5432/manga_manager"
 stage_min_free_bytes="${STAGE_MIN_FREE_BYTES:-1073741824}"
+stage_bind_address="${STAGE_BIND_ADDRESS:-0.0.0.0}"
 mode="${1:-rehearse}"
 build_requested=false
 if [ "$mode" = "serve" ] && [ "${2:-}" = "--build" ]; then build_requested=true; fi
@@ -204,7 +205,8 @@ if [ "$run_repairs" = true ]; then
     -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" manga-manager \
     reconcile-refresh-queue --report /data/refresh-queue-applied.json --apply
 fi
-docker run -d --name "$web" --network "$network" --restart unless-stopped --memory 384m -p "${STAGE_PORT:-18000}:8000" \
+docker run -d --name "$web" --network "$network" --restart unless-stopped --memory 384m \
+  -p "$stage_bind_address:${STAGE_PORT:-18000}:8000" \
   --log-opt max-size=10m --log-opt max-file=3 \
   -e "V2_DATABASE_URL=$database_url" -e V2_STORAGE_ROOT=/data \
   -e "V2_ENABLE_ASURA=$sources_enabled" -e "V2_ENABLE_MANGAFIRE=$sources_enabled" \
@@ -236,7 +238,10 @@ until docker exec "$web" python -c "import json,urllib.request; assert json.load
   sleep 1
 done
 if [ "$mode" = "serve" ]; then
-  printf '%s\n' "Manga Manager: http://127.0.0.1:${STAGE_PORT:-18000}" \
+  lan_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
+  [ -n "$lan_ip" ] || lan_ip='<host-ip>'
+  printf '%s\n' "Manga Manager (this computer): http://127.0.0.1:${STAGE_PORT:-18000}" \
+    "Manga Manager (local network): http://$lan_ip:${STAGE_PORT:-18000}" \
     "Stop: scripts/stage-local.sh down"
   exit 0
 fi
@@ -286,4 +291,8 @@ recovery_output=$(docker run --rm --network "$network" -e "V2_DATABASE_URL=$data
   manga-manager enqueue-probe)
 recovery_id=$(printf '%s\n' "$recovery_output" | sed -n 's/^job_id=\([0-9][0-9]*\).*/\1/p')
 [ -n "$recovery_id" ] && wait_for_job "$recovery_id"
-printf '%s\n' "staging ready: http://127.0.0.1:${STAGE_PORT:-18000}" "teardown: scripts/stage-local.sh down"
+lan_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
+[ -n "$lan_ip" ] || lan_ip='<host-ip>'
+printf '%s\n' "staging ready: http://127.0.0.1:${STAGE_PORT:-18000}" \
+  "local network: http://$lan_ip:${STAGE_PORT:-18000}" \
+  "teardown: scripts/stage-local.sh down"

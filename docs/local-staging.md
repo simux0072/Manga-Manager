@@ -81,7 +81,13 @@ content-addressed blobs, and both manga projection trees. When a credentials fil
 authentication failure remains non-destructive; explicitly reset test metadata with
 `scripts/kavita-local.sh reset-config --yes` before running `up` again.
 
-Manga Manager is exposed on port 18000 and Kavita on port 15000. Kavita reads only
+Manga Manager is exposed on port 18000 and Kavita on port 15000. Both default to `0.0.0.0`, so a
+trusted device on the same network can use `http://<host-ip>:18000` and
+`http://<host-ip>:15000`. The launcher prints the detected address. Open those TCP ports in the
+host firewall if needed, but do not forward them from the router: this staging stack has no
+application authentication. Set `STAGE_BIND_ADDRESS=127.0.0.1` and
+`KAVITA_BIND_ADDRESS=127.0.0.1` for host-only access. The isolated automated test environment
+always uses loopback regardless of these staging defaults. Kavita reads only
 `kavita-library/`; untracked series are removed from that projection while content-addressed blobs
 remain intact. `STAGE_MIN_FREE_BYTES` overrides the 1 GiB staging reserve. Web readiness retries
 quietly for 120 seconds; set `STAGE_WEB_WAIT_ATTEMPTS` to a larger number on unusually slow storage.

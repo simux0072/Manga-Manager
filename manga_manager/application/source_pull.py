@@ -19,6 +19,7 @@ from manga_manager.application.job_handlers import (
     exception_message,
 )
 from manga_manager.application.cover_evidence import CoverEvidenceService
+from manga_manager.application.download_plans import DownloadPlanCoordinator, TRACKED_STATES
 from manga_manager.application.provider_health import (
     is_cloudflare_origin_error,
     is_transient_provider_status,
@@ -374,11 +375,13 @@ class SourceRefreshHandler:
         session_factory: SessionFactory,
         adapter_factory: AdapterFactory = adapter_for_source,
         catalog: CatalogRepository | None = None,
+        queue: JobQueue | None = None,
         close_adapter: bool = True,
     ) -> None:
         self.session_factory = session_factory
         self.adapter_factory = adapter_factory
         self.catalog = catalog or CatalogRepository()
+        self.queue = queue or JobQueue()
         self.close_adapter = close_adapter
 
     async def __call__(self, context: JobContext) -> None:
@@ -482,6 +485,14 @@ class SourceRefreshHandler:
         with self.session_factory() as session, session.begin():
             source_series = self.catalog.ingest(session, enriched, chapters)
             source_series_id = source_series.id
+            # Apply a newly observed preferred provider or an official MangaFire
+            # variant immediately. Waiting for the six-hour bootstrap made an
+            # already-downloaded unofficial artifact appear permanently complete.
+            canonical = session.get(CatalogSeries, source_series.series_id)
+            if canonical is not None and canonical.status in TRACKED_STATES:
+                plans = DownloadPlanCoordinator(self.queue)
+                plans.reconcile(session, source_series.series_id)
+                plans.enqueue_preferred_upgrades(session, [source_series.series_id])
         await CoverEvidenceService(self.session_factory).refresh_for_source_series(source_series_id)
         with self.session_factory() as progress_session, progress_session.begin():
             JobQueue().progress(

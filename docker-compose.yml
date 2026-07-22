@@ -43,7 +43,7 @@ services:
       V2_STORAGE_ROOT: /data
       V2_MIN_FREE_BYTES: ${V2_MIN_FREE_BYTES:-5368709120}
     command: ["uvicorn", "manga_manager.web.app:app", "--host", "0.0.0.0", "--port", "8000"]
-    ports: ["${MANGA_MANAGER_PORT:-8000}:8000"]
+    ports: ["${MANGA_MANAGER_BIND_ADDRESS:-0.0.0.0}:${MANGA_MANAGER_PORT:-8000}:8000"]
     volumes: ["${MANGA_STORAGE_ROOT:-./storage-v2}:/data"]
     depends_on:
       migrate:

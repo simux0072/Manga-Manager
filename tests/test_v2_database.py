@@ -83,11 +83,17 @@ def test_v2_migration_builds_job_constraints_and_indexes(tmp_path: Path) -> None
         "ck_job_lease_fields",
         "ck_job_max_attempts_positive",
     } <= checks
+    assert "quality_rank" in {
+        column["name"] for column in inspector.get_columns("chapter_release_v2")
+    }
+    assert "quality_rank" in {
+        column["name"] for column in inspector.get_columns("chapter_artifact")
+    }
 
     sessions = create_session_factory(engine)
     with sessions() as session:
         version = session.scalar(text("SELECT version_num FROM alembic_version"))
-    assert version == "0021_job_logical_attempt_index"
+    assert version == "0022_chapter_release_quality"
 
 
 def test_catalog_recovery_migration_downgrades_and_reapplies_on_sqlite(tmp_path: Path) -> None:
@@ -103,5 +109,5 @@ def test_catalog_recovery_migration_downgrades_and_reapplies_on_sqlite(tmp_path:
 
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0021_job_logical_attempt_index"
+            "0022_chapter_release_quality"
         )

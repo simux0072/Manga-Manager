@@ -24,6 +24,7 @@ pending_env="$state_dir/$project-kavita-pending.env"
 storage="${STAGE_STORAGE_ROOT:-$PWD/storage-v2-stage}"
 # Temporary test-only pin: 0.9.0.2 cannot initialize an empty database reliably.
 image="${KAVITA_IMAGE:-jvmilazz0/kavita:0.8.9}"
+kavita_bind_address="${KAVITA_BIND_ADDRESS:-${STAGE_BIND_ADDRESS:-0.0.0.0}}"
 
 case "$command" in
   down)
@@ -76,14 +77,19 @@ start_kavita() {
       '{{range .Mounts}}{{if eq .Destination "/manga"}}{{.Source}}{{end}}{{end}}' \
       "$container")
     current_image=$(docker inspect -f '{{.Config.Image}}' "$container")
-    if [ "$current_mount" != "$expected_mount" ] || [ "$current_image" != "$image" ]; then
+    current_bind=$(docker inspect -f \
+      '{{(index (index .HostConfig.PortBindings "5000/tcp") 0).HostIp}}' "$container")
+    [ -n "$current_bind" ] || current_bind=0.0.0.0
+    if [ "$current_mount" != "$expected_mount" ] || [ "$current_image" != "$image" ] || \
+      [ "$current_bind" != "$kavita_bind_address" ]; then
       docker rm -f "$container" >/dev/null
     else
       docker start "$container" >/dev/null
     fi
   fi
   if ! docker container inspect "$container" >/dev/null 2>&1; then
-    docker run -d --name "$container" --network "$network" -p "${KAVITA_PORT:-15000}:5000" \
+    docker run -d --name "$container" --network "$network" \
+      -p "$kavita_bind_address:${KAVITA_PORT:-15000}:5000" \
       --log-opt max-size=10m --log-opt max-file=3 \
       -e "TZ=${TZ:-UTC}" -v "$volume:/kavita/config" -v "$storage/kavita-library:/manga:ro" \
       --restart unless-stopped "$image" >/dev/null
@@ -140,6 +146,10 @@ set +a
 export KAVITA_URL="http://$container:5000"
 export KAVITA_LIBRARY_ROOT=/manga
 scripts/stage-local.sh serve
-printf '%s\n' "Manga Manager: http://127.0.0.1:${STAGE_PORT:-18000}" \
-  "Kavita: http://127.0.0.1:${KAVITA_PORT:-15000}" \
+lan_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
+[ -n "$lan_ip" ] || lan_ip='<host-ip>'
+printf '%s\n' "Manga Manager (this computer): http://127.0.0.1:${STAGE_PORT:-18000}" \
+  "Manga Manager (local network): http://$lan_ip:${STAGE_PORT:-18000}" \
+  "Kavita (this computer): http://127.0.0.1:${KAVITA_PORT:-15000}" \
+  "Kavita (local network): http://$lan_ip:${KAVITA_PORT:-15000}" \
   "Credentials: scripts/kavita-local.sh credentials"
