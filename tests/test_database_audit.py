@@ -22,7 +22,7 @@ def test_database_audit_is_read_only_and_reports_latest_mismatch(tmp_path: Path)
 
     report = tmp_path / "audit.json"
     write_database_audit(report, payload)
-    assert json.loads(report.read_text())["migration"] == "0023_mangadex_provider"
+    assert json.loads(report.read_text())["migration"] == "0024_elastic_network_workers"
 
 
 def test_database_audit_writes_markdown(tmp_path: Path) -> None:

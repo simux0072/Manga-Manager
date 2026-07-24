@@ -6,7 +6,11 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from sqlalchemy import inspect, text
+from datetime import datetime, timedelta, timezone
 
+from sqlalchemy.orm import Session
+
+from manga_manager.infrastructure.db_models import WorkJob
 from manga_manager.infrastructure.database import (
     create_database_engine,
     create_session_factory,
@@ -93,7 +97,7 @@ def test_v2_migration_builds_job_constraints_and_indexes(tmp_path: Path) -> None
     sessions = create_session_factory(engine)
     with sessions() as session:
         version = session.scalar(text("SELECT version_num FROM alembic_version"))
-    assert version == "0023_mangadex_provider"
+    assert version == "0024_elastic_network_workers"
 
 
 def test_catalog_recovery_migration_downgrades_and_reapplies_on_sqlite(tmp_path: Path) -> None:
@@ -109,5 +113,81 @@ def test_catalog_recovery_migration_downgrades_and_reapplies_on_sqlite(tmp_path:
 
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0023_mangadex_provider"
+            "0024_elastic_network_workers"
         )
+
+
+def test_elastic_worker_migration_reroutes_ready_refresh_jobs(tmp_path: Path) -> None:
+    database_url = f"sqlite:///{tmp_path / 'elastic-workers.db'}"
+    run_migrations(database_url)
+    config = Config(str(DEFAULT_ALEMBIC_CONFIG))
+    config.set_main_option("sqlalchemy.url", database_url)
+    command.downgrade(config, "0023_mangadex_provider")
+    engine = create_database_engine(database_url, allow_sqlite_for_tests=True)
+    with Session(engine) as session, session.begin():
+        session.add_all(
+            [
+                WorkJob(
+                    kind="source_refresh",
+                    dedupe_key="refresh:mangafire:example",
+                    payload={
+                        "version": 3,
+                        "source": "mangafire",
+                        "source_id": "example",
+                        "title": "Example",
+                        "url": "https://mangafire.to/title/example",
+                    },
+                    source="mangafire",
+                    pool="pull:mangafire",
+                ),
+                WorkJob(
+                    kind="source_refresh",
+                    dedupe_key="refresh:mangadex:retry",
+                    payload={
+                        "version": 3,
+                        "source": "mangadex",
+                        "source_id": "retry",
+                        "title": "Retry",
+                        "url": "https://mangadex.org/title/retry",
+                    },
+                    source="mangadex",
+                    pool="pull:mangadex",
+                    status="retry_wait",
+                ),
+                WorkJob(
+                    kind="source_refresh",
+                    dedupe_key="refresh:asura:leased",
+                    payload={
+                        "version": 3,
+                        "source": "asura",
+                        "source_id": "leased",
+                        "title": "Leased",
+                        "url": "https://asurascans.com/comics/leased",
+                    },
+                    source="asura",
+                    pool="pull:asura",
+                    status="leased",
+                    lease_owner="old-worker",
+                    lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+                ),
+            ]
+        )
+
+    command.upgrade(config, "head")
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT pool FROM job WHERE dedupe_key='refresh:mangafire:example'")
+        ) == "refresh:mangafire"
+        assert connection.scalar(
+            text("SELECT pool FROM job WHERE dedupe_key='refresh:mangadex:retry'")
+        ) == "refresh:mangadex"
+        assert connection.scalar(
+            text("SELECT pool FROM job WHERE dedupe_key='refresh:asura:leased'")
+        ) == "pull:asura"
+
+    command.downgrade(config, "0023_mangadex_provider")
+    with engine.connect() as connection:
+        assert connection.scalar(
+            text("SELECT pool FROM job WHERE dedupe_key='refresh:mangafire:example'")
+        ) == "pull:mangafire"
+    command.upgrade(config, "head")

@@ -17,6 +17,10 @@ scripts/stage-local.sh down
 
 The persistent web and worker containers use `unless-stopped` restart policies. A transient process
 failure is recovered automatically; `stage-local.sh down` still stops and removes them explicitly.
+The worker uses one elastic network pool rather than permanently reserving processes for each
+provider. Operations reports the shared network capacity, current permit use, and work by logical
+pool. Downloads take strict priority without interrupting already-running requests; provider
+cooldowns return their slots to unrelated work.
 
 For normal feature work, prefer the small deterministic environment so provider traffic and a large
 archive tree do not slow builds:
@@ -147,9 +151,14 @@ docker exec manga-manager-stage-worker uv run --frozen manga-manager database-au
   --json --report /tmp/database-audit.json
 ```
 
-It checks migration `0019` aggregates, provider uniqueness, projections, reading state, leases,
+It checks current migration aggregates, provider uniqueness, projections, reading state, leases,
 permits, reservations, workload cycles, source hygiene, and PostgreSQL table/index/dead-tuple
 statistics under a short statement timeout.
+
+Migration `0024` moves queued and retrying per-series refresh jobs from legacy `pull:<provider>`
+lanes into `refresh:<provider>` lanes. Leased work is left untouched and is recovered normally,
+so deployment does not require deleting or recreating the queue. After migration, Operations
+should show the configured shared network capacity and no active network permit count above it.
 
 Before deleting a staging catalog, use the preview-first reset workflow:
 

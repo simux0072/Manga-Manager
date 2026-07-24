@@ -102,9 +102,11 @@ React UI <-> /api/v2 <-> PostgreSQL jobs/catalog <-> SSE job events
 
 PostgreSQL is also the inter-process coordinator. Partial unique indexes enforce active job
 deduplication and one leased mutation per series. Leased permits enforce provider and global
-capacity. The worker currently creates one pull slot per provider, one Asura download slot, two
-MangaDex slots, two MangaFire slots, two KingOfShojo slots, and one slot each for Kavita, repair,
-health, and cover backfill.
+capacity. Network slots now share all pull, refresh, download, and provider-probe lanes. Durable
+priority tiers give downloads first access to every eligible slot, followed by acquisition-critical
+refreshes, overdue listing pulls, ordinary refreshes, and background network work. Provider,
+traffic-class, per-series, storage, memory, and global network permits remain hard limits.
+Kavita, repair, health, and cover backfill retain independent low-concurrency lanes.
 
 ## Data and contract reference
 
@@ -421,23 +423,19 @@ same inode. Run one bounded storage executor and coalesce series metadata rewrit
 
 ### P1: queue and scheduler efficiency
 
-The worker has roughly twelve independent slots. When idle, each opens a claim transaction every
-second. Every claim also expires permits and scans exhausted leases before selecting work, and may
-retry up to fifty candidates when permits reject the front of a queue.
+The elastic scheduler is now implemented. Shared network slots listen to every eligible durable
+lane, `NOTIFY job_ready` wakes all affected slot conditions, saturated provider lanes are excluded
+before candidate selection, and global/provider/per-series permits remain PostgreSQL-atomic. This
+removed fixed provider reservations without introducing in-memory ownership or bespoke queues.
 
-Recommended sequence:
+Remaining profiling work:
 
-1. Add `NOTIFY job_ready` on newly claimable work and one process-level listener that wakes relevant
-   pool conditions; retain a 15–30 second recovery poll.
-2. Move lease/permit cleanup to the scheduler rather than every claim.
-3. Replace the fifty-candidate loop with a permit-aware SQL candidate query or claim a small locked
-   candidate batch once.
-4. If profiling still shows contention, use one process dispatcher to claim and feed bounded
-   in-memory pool queues. PostgreSQL remains the authority; the dispatcher never acknowledges before
-   the durable lease exists.
-
-This is preferable to three bespoke queue implementations: the existing `pool` column already
-provides independent lanes and preserves atomic recovery/fairness.
+1. Move expired lease/permit cleanup fully into scheduler leadership if claim latency shows it is
+   still material.
+2. Record claim-query and permit-rejection histograms before considering a process-local dispatcher.
+3. Retain the recovery poll even when LISTEN/NOTIFY is healthy.
+4. Keep PostgreSQL as the authority: no future dispatcher may acknowledge work before a durable
+   lease exists.
 
 ### P2: Kavita efficiency
 

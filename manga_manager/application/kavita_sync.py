@@ -12,7 +12,7 @@ from typing import Protocol
 
 import httpx
 from PIL import Image, ImageChops, ImageOps, ImageStat
-from sqlalchemy import exists, or_, select
+from sqlalchemy import exists, func, or_, select
 
 from app.kavita import (
     KavitaChapter,
@@ -39,6 +39,7 @@ from manga_manager.infrastructure.db_models import (
     CatalogSeriesAlias,
     CatalogSourceSeries,
     KavitaProjection,
+    WorkJob,
 )
 from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.worker.runtime import SessionFactory
@@ -89,6 +90,16 @@ class KavitaSyncPlanner:
         reading_refresh_after: timedelta | None = None,
         batch: bool = False,
     ) -> tuple[int, int]:
+        active_downloads = session.scalar(
+            select(func.count())
+            .select_from(WorkJob)
+            .where(
+                WorkJob.kind == JobKind.CHAPTER_DOWNLOAD.value,
+                WorkJob.status.in_(("queued", "leased", "retry_wait")),
+            )
+        )
+        if int(active_downloads or 0):
+            return 0, 0
         tracked = {"interested", "reading", "caught_up", "paused"}
         stale_reading = (
             CatalogSeries.kavita_synced_at < datetime.now(timezone.utc) - reading_refresh_after

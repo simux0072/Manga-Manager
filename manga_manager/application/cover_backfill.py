@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import timedelta
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import or_, select
 
 from manga_manager.application.cover_evidence import ALGORITHM, CoverEvidenceService
-from manga_manager.application.job_handlers import JobContext, RetryableJobError
+from manga_manager.application.download_activity import has_runnable_or_leased_downloads
+from manga_manager.application.job_handlers import (
+    DeferredJobError,
+    JobContext,
+    RetryableJobError,
+)
 from manga_manager.domain.jobs import CoverBackfillPayload, JobKind
 from manga_manager.infrastructure.db_models import (
     CatalogCoverSignature,
@@ -24,6 +30,14 @@ class CoverBackfillHandler:
         payload = context.lease.payload
         if not isinstance(payload, CoverBackfillPayload):
             raise RuntimeError("cover backfill handler received the wrong payload")
+        with self.service.session_factory() as session:
+            downloads_active = has_runnable_or_leased_downloads(session)
+        if downloads_active:
+            raise DeferredJobError(
+                "downloads_active",
+                "background cover processing is paused while downloads are active",
+                retry_after=timedelta(minutes=1),
+            )
         context.ensure_lease()
         with self.service.session_factory() as session, session.begin():
             JobQueue().progress(
@@ -55,19 +69,8 @@ class CoverBackfillPlanner:
     def __init__(self, queue: JobQueue | None = None) -> None:
         self.queue = queue or JobQueue()
 
-    def enqueue_pending(self, session, *, limit: int = 10, chapter_threshold: int = 25) -> int:
-        active_chapters = int(
-            session.scalar(
-                select(func.count())
-                .select_from(WorkJob)
-                .where(
-                    WorkJob.kind == JobKind.CHAPTER_DOWNLOAD.value,
-                    WorkJob.status.in_(("queued", "leased", "retry_wait")),
-                )
-            )
-            or 0
-        )
-        if active_chapters >= chapter_threshold:
+    def enqueue_pending(self, session, *, limit: int = 10, chapter_threshold: int = 1) -> int:
+        if chapter_threshold > 0 and has_runnable_or_leased_downloads(session):
             return 0
         rows = session.execute(
             select(CatalogSourceSeries, CatalogCoverSignature)

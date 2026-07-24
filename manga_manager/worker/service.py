@@ -4,12 +4,14 @@ import asyncio
 import logging
 from collections.abc import Mapping
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import timedelta
 
 import psycopg
 
 from manga_manager.application.job_handlers import JobHandler
 from manga_manager.domain.jobs import JobKind
+from manga_manager.domain.providers import provider_names
 from manga_manager.infrastructure.worker_registry import WorkerRegistry
 from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.settings import V2Settings
@@ -17,6 +19,14 @@ from manga_manager.worker.runtime import JobWorker, SessionFactory, WorkerSettin
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True, slots=True)
+class WorkerSlotSpec:
+    slot: int
+    name: str
+    claim_pools: frozenset[str]
+    kinds: frozenset[JobKind]
 
 
 class WorkerService:
@@ -38,12 +48,16 @@ class WorkerService:
 
     async def run(self, stop: asyncio.Event) -> None:
         specs = self._pool_specs()
-        wakeups = {pool: asyncio.Event() for _slot, pool, _kinds in specs}
+        slot_wakeups = {spec.slot: asyncio.Event() for spec in specs}
+        pool_wakeups: dict[str, list[asyncio.Event]] = {}
+        for spec in specs:
+            for pool in spec.claim_pools:
+                pool_wakeups.setdefault(pool, []).append(slot_wakeups[spec.slot])
         tasks = [
-            asyncio.create_task(self._run_slot(slot, pool, kinds, stop, wakeups[pool]))
-            for slot, pool, kinds in specs
+            asyncio.create_task(self._run_slot(spec, stop, slot_wakeups[spec.slot]))
+            for spec in specs
         ]
-        listener = asyncio.create_task(self._listen_for_jobs(stop, wakeups))
+        listener = asyncio.create_task(self._listen_for_jobs(stop, pool_wakeups))
         await stop.wait()
         grace = self.settings.worker_shutdown_grace_seconds
         try:
@@ -56,48 +70,45 @@ class WorkerService:
         listener.cancel()
         await asyncio.gather(listener, return_exceptions=True)
 
-    def _pool_specs(self) -> list[tuple[int, str, set[JobKind]]]:
+    def _pool_specs(self) -> list[WorkerSlotSpec]:
+        network_kinds = frozenset(
+            {
+                JobKind.SOURCE_PULL,
+                JobKind.SOURCE_REFRESH,
+                JobKind.CHAPTER_DOWNLOAD,
+                # Provider recovery probes are maintenance jobs deliberately
+                # routed into a provider pull pool.
+                JobKind.MAINTENANCE,
+            }
+        ).intersection(self.handlers)
+        enabled_sources = set(self.settings.source_intervals())
+        network_pools = frozenset(
+            f"{traffic}:{source}"
+            for source in provider_names()
+            if source in enabled_sources
+            for traffic in ("download", "pull", "refresh")
+        )
+        if self.pools is not None:
+            network_pools = network_pools.intersection(self.pools)
+
+        specs: list[WorkerSlotSpec] = []
+        if network_kinds and network_pools:
+            if self.pools is None or len(network_pools) > 1:
+                count = self.settings.network_worker_concurrency
+            else:
+                only_pool = next(iter(network_pools))
+                count = self.settings.pool_limits().get(only_pool, 1)
+            for _ in range(count):
+                specs.append(
+                    WorkerSlotSpec(
+                        slot=len(specs) + 1,
+                        name="network",
+                        claim_pools=network_pools,
+                        kinds=frozenset(network_kinds),
+                    )
+                )
+
         requested = [
-            (
-                "pull:asura",
-                1,
-                {JobKind.SOURCE_PULL, JobKind.SOURCE_REFRESH, JobKind.MAINTENANCE},
-            ),
-            (
-                "pull:mangadex",
-                1,
-                {JobKind.SOURCE_PULL, JobKind.SOURCE_REFRESH, JobKind.MAINTENANCE},
-            ),
-            (
-                "pull:mangafire",
-                1,
-                {JobKind.SOURCE_PULL, JobKind.SOURCE_REFRESH, JobKind.MAINTENANCE},
-            ),
-            (
-                "pull:kingofshojo",
-                1,
-                {JobKind.SOURCE_PULL, JobKind.SOURCE_REFRESH, JobKind.MAINTENANCE},
-            ),
-            (
-                "download:asura",
-                self.settings.asura_download_concurrency,
-                {JobKind.CHAPTER_DOWNLOAD},
-            ),
-            (
-                "download:mangadex",
-                self.settings.mangadex_download_concurrency,
-                {JobKind.CHAPTER_DOWNLOAD},
-            ),
-            (
-                "download:mangafire",
-                self.settings.mangafire_download_concurrency,
-                {JobKind.CHAPTER_DOWNLOAD},
-            ),
-            (
-                "download:kingofshojo",
-                self.settings.kingofshojo_download_concurrency,
-                {JobKind.CHAPTER_DOWNLOAD},
-            ),
             ("kavita", 1, {JobKind.KAVITA_SYNC}),
             # Catalog rescoring is a maintenance job routed to this pool.  Keeping
             # LIBRARY_REPAIR and MAINTENANCE in one single-slot lane protects the
@@ -107,30 +118,41 @@ class WorkerService:
             ("health", 1, {JobKind.MAINTENANCE}),
             ("cover_backfill", 1, {JobKind.COVER_BACKFILL}),
         ]
-        specs: list[tuple[int, str, set[JobKind]]] = []
         for pool, count, kinds in requested:
             if self.pools is not None and pool not in self.pools:
                 continue
             if not kinds.intersection(self.handlers):
                 continue
             for _ in range(count):
-                specs.append((len(specs) + 1, pool, kinds))
+                specs.append(
+                    WorkerSlotSpec(
+                        slot=len(specs) + 1,
+                        name=pool,
+                        claim_pools=frozenset({pool}),
+                        kinds=frozenset(kinds),
+                    )
+                )
         return specs
 
     async def _run_slot(
         self,
-        slot: int,
-        pool: str,
-        kinds: set[JobKind],
+        spec: WorkerSlotSpec,
         stop: asyncio.Event,
         wakeup: asyncio.Event,
     ) -> None:
-        worker_id = f"{self.settings.worker_id}-{pool.replace(':', '-')}-{slot}"
+        worker_id = (
+            f"{self.settings.worker_id}-{spec.name.replace(':', '-')}-{spec.slot}"
+        )
         with self.session_factory() as session, session.begin():
             self.registry.register(
                 session,
                 worker_id=worker_id,
-                metadata={"slot": slot, "pool": pool, "pool_limits": self.settings.pool_limits()},
+                metadata={
+                    "slot": spec.slot,
+                    "pool": spec.name,
+                    "claim_pools": sorted(spec.claim_pools),
+                    "pool_limits": self.settings.pool_limits(),
+                },
             )
         heartbeat = asyncio.create_task(self._heartbeat(worker_id, stop))
         runtime = JobWorker(
@@ -138,8 +160,8 @@ class WorkerService:
             session_factory=self.session_factory,
             handlers=self.handlers,
             queue=self.queue,
-            claim_kinds=kinds.intersection(self.handlers),
-            claim_pools={pool},
+            claim_kinds=spec.kinds.intersection(self.handlers),
+            claim_pools=spec.claim_pools,
             settings=WorkerSettings(
                 lease_for=self.settings.lease_for,
                 heartbeat_interval=self.settings.job_heartbeat_interval,
@@ -161,7 +183,7 @@ class WorkerService:
     async def _listen_for_jobs(
         self,
         stop: asyncio.Event,
-        wakeups: Mapping[str, asyncio.Event],
+        wakeups: Mapping[str, list[asyncio.Event]],
     ) -> None:
         """Use one async LISTEN socket per worker process with polling as recovery."""
         with self.session_factory() as session:
@@ -184,14 +206,16 @@ class WorkerService:
                 async with connection:
                     await connection.execute("LISTEN manga_manager_jobs")
                     async for notification in connection.notifies():
-                        wakeup = wakeups.get(notification.payload)
-                        if wakeup is not None:
-                            wakeup.set()
+                        events = wakeups.get(notification.payload)
+                        if events is not None:
+                            for event in events:
+                                event.set()
                         else:
                             # Unknown/legacy pool names are rare and should not
                             # wait for the recovery poll after a rolling upgrade.
-                            for event in wakeups.values():
-                                event.set()
+                            for pool_events in wakeups.values():
+                                for event in pool_events:
+                                    event.set()
                         if stop.is_set():
                             return
             except asyncio.CancelledError:

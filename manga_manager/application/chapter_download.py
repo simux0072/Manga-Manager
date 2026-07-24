@@ -228,7 +228,7 @@ class ChapterDownloadHandler:
             ):
                 raise ReroutedJobError("chapter rerouted after temporary failure") from exc
             delay = max(retry_at - utcnow(), timedelta(seconds=1)) if retry_at else None
-            raise RetryableJobError(
+            raise DeferredJobError(
                 "temporarily_unavailable", exception_message(exc), retry_after=delay
             ) from exc
         except httpx.HTTPStatusError as exc:
@@ -262,7 +262,12 @@ class ChapterDownloadHandler:
                 retry_at=retry_at,
             ):
                 raise ReroutedJobError(f"chapter rerouted after HTTP {status}") from exc
-            if origin_outage or effective_cooldown is not None:
+            if (
+                status in {403, 404, 429}
+                or transient
+                or origin_outage
+                or effective_cooldown is not None
+            ):
                 raise DeferredJobError(
                     "provider_origin_unavailable" if origin_outage else code,
                     exception_message(exc),
@@ -277,7 +282,7 @@ class ChapterDownloadHandler:
                 snapshot.source, exception_message(exc), None, traffic_class="cdn"
             )
             retry_at = effective_cooldown or retry_at
-            if context.lease.attempt >= 2 and self._reroute(
+            if self._reroute(
                 context,
                 snapshot,
                 code="source_network_error",
@@ -285,15 +290,10 @@ class ChapterDownloadHandler:
                 retry_at=retry_at,
             ):
                 raise ReroutedJobError("chapter rerouted after repeated network errors") from exc
-            if effective_cooldown is not None:
-                raise DeferredJobError(
-                    "source_network_error",
-                    exception_message(exc),
-                    retry_after=max(retry_at - utcnow(), timedelta(seconds=1)),
-                ) from exc
-            delay = retry_at - utcnow() if context.lease.attempt >= 2 else None
-            raise RetryableJobError(
-                "source_network_error", exception_message(exc), retry_after=delay
+            raise DeferredJobError(
+                "source_network_error",
+                exception_message(exc),
+                retry_after=max(retry_at - utcnow(), timedelta(seconds=1)),
             ) from exc
         except StorageCapacityError as exc:
             raise DeferredJobError(
@@ -311,7 +311,7 @@ class ChapterDownloadHandler:
                 retry_at=retry_at,
             ):
                 raise ReroutedJobError("chapter rerouted after invalid content") from exc
-            raise RetryableJobError(
+            raise DeferredJobError(
                 "invalid_content", str(exc), retry_after=retry_at - utcnow()
             ) from exc
         finally:

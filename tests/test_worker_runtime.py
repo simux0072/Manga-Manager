@@ -176,7 +176,7 @@ async def test_idle_worker_returns_without_handler_call(sessions: TrackingSessio
     assert called is False
 
 
-def test_source_pull_workers_are_partitioned_by_provider(
+def test_network_workers_share_provider_pools(
     sessions: TrackingSessionFactory,
 ) -> None:
     async def handler(_context) -> None:
@@ -187,13 +187,15 @@ def test_source_pull_workers_are_partitioned_by_provider(
         handlers={JobKind.SOURCE_PULL: handler},
         settings=V2Settings(),
     )
-    pools = [pool for _slot, pool, _kinds in service._pool_specs()]
-    assert pools == [
-        "pull:asura",
-        "pull:mangadex",
-        "pull:mangafire",
-        "pull:kingofshojo",
-    ]
+    specs = service._pool_specs()
+    assert len(specs) == service.settings.network_worker_concurrency
+    assert {spec.name for spec in specs} == {"network"}
+    expected = {
+        f"{traffic}:{source}"
+        for source in ("asura", "mangadex", "mangafire", "kingofshojo")
+        for traffic in ("download", "pull", "refresh")
+    }
+    assert all(spec.claim_pools == expected for spec in specs)
 
 
 def test_maintenance_worker_claims_repairs_and_catalog_rescores(
@@ -210,7 +212,6 @@ def test_maintenance_worker_claims_repairs_and_catalog_rescores(
     )
     specs = service._pool_specs()
     assert len(specs) == 1
-    assert specs[0][1:] == (
-        "maintenance",
-        {JobKind.LIBRARY_REPAIR, JobKind.MAINTENANCE},
-    )
+    assert specs[0].name == "maintenance"
+    assert specs[0].claim_pools == {"maintenance"}
+    assert specs[0].kinds == {JobKind.LIBRARY_REPAIR, JobKind.MAINTENANCE}

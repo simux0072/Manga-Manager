@@ -11,7 +11,7 @@ from manga_manager.infrastructure.db_models import WorkJob
 from manga_manager.infrastructure.job_queue import JobQueue
 
 
-COMPATIBLE_REFRESH_VERSIONS = frozenset({1, 2})
+COMPATIBLE_REFRESH_VERSIONS = frozenset({1, 2, 3})
 
 
 @dataclass(slots=True)
@@ -64,9 +64,9 @@ class RefreshQueueReconciler:
             elif not row.workflow_key or not row.group_key:
                 action = "regroup"
                 reason = "compatible payload is missing durable workflow metadata"
-            elif version == 1:
+            elif version < 3:
                 action = "upgrade"
-                reason = "compatible v1 payload can be normalized in place"
+                reason = f"compatible v{version} payload can be normalized in place"
             else:
                 action = "preserve"
                 reason = "payload and workflow metadata are compatible"
@@ -124,5 +124,5 @@ class RefreshQueueReconciler:
     def _normalize_payload(raw: dict[str, Any]) -> dict[str, Any]:
         allowed = SourceRefreshPayload.model_fields
         values = {key: value for key, value in dict(raw or {}).items() if key in allowed}
-        values["version"] = 2
+        values["version"] = 3
         return SourceRefreshPayload.model_validate(values).model_dump(mode="json")

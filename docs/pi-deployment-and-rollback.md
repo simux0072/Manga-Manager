@@ -43,3 +43,11 @@ Before migration `0019`, take the same paired PostgreSQL backup and storage mani
 recomputes denormalized latest-release fields and adds observation, cover-band, and telemetry
 indexes without rewriting media. After upgrading, run `manga-manager database-audit --json`; do not
 start a rollback from the newer database if that audit fails—restore the paired pre-migration set.
+
+Before migration `0024`, take the paired backup and manifest again. The migration only reroutes
+queued/retrying source refresh work into the elastic network scheduler; it does not rewrite media
+or terminate leased jobs. Start the upgraded worker after migration, then verify in Operations that
+shared network permit use never exceeds `V2_NETWORK_WORKER_CONCURRENCY`, downloads outrank new
+refresh work, and a cooled-down provider does not stall other providers. Do not clear the queue:
+compatible work is upgraded in place. Roll back by stopping the worker first and restoring the
+paired pre-migration database/storage set.

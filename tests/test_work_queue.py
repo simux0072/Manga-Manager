@@ -16,6 +16,7 @@ from manga_manager.domain.jobs import (
     MaintenancePayload,
     NotificationPayload,
     SourcePullPayload,
+    SourceRefreshPayload,
 )
 from manga_manager.infrastructure.db_models import (
     CatalogSourceState,
@@ -106,6 +107,164 @@ def test_claim_uses_priority_and_skips_future_jobs(session: Session) -> None:
     assert lease.id == urgent.id
     assert lease.attempt == 1
     assert lease.payload == SourcePullPayload(source="urgent")
+
+
+def refresh_payload(
+    source: str, source_id: str, *, acquisition: bool = False
+) -> SourceRefreshPayload:
+    return SourceRefreshPayload(
+        source=source,
+        source_id=source_id,
+        title=source_id,
+        url=f"https://example.test/{source_id}",
+        acquisition_critical=acquisition,
+    )
+
+
+def test_network_claim_order_is_download_acquisition_pull_refresh(
+    session: Session,
+) -> None:
+    queue = JobQueue()
+    ordinary, _ = queue.enqueue(
+        session,
+        kind=JobKind.SOURCE_REFRESH,
+        dedupe_key="refresh:mangafire:ordinary",
+        payload=refresh_payload("mangafire", "ordinary"),
+        priority=1,
+        source="mangafire",
+        available_at=NOW,
+    )
+    pull, _ = queue.enqueue(
+        session,
+        kind=JobKind.SOURCE_PULL,
+        dedupe_key="source:mangafire",
+        payload=SourcePullPayload(source="mangafire"),
+        priority=1,
+        source="mangafire",
+        available_at=NOW,
+    )
+    acquisition, _ = queue.enqueue(
+        session,
+        kind=JobKind.SOURCE_REFRESH,
+        dedupe_key="refresh:mangadex:tracked",
+        payload=refresh_payload("mangadex", "tracked", acquisition=True),
+        priority=10,
+        source="mangadex",
+        available_at=NOW,
+    )
+    download, _ = queue.enqueue(
+        session,
+        kind=JobKind.CHAPTER_DOWNLOAD,
+        dedupe_key="chapter:999",
+        payload=ChapterDownloadPayload(chapter_release_id=999),
+        priority=999,
+        source="asura",
+        series_key="999",
+        available_at=NOW,
+    )
+    limits = {
+        "network_global": 4,
+        "chapter_global": 4,
+        "download:asura": 1,
+        "refresh:mangadex": 1,
+        "refresh:mangafire": 1,
+        "pull:mangafire": 1,
+    }
+    expected = [download.id, acquisition.id, pull.id, ordinary.id]
+    claimed: list[int] = []
+    for index in range(4):
+        lease = queue.claim(
+            session,
+            owner=f"worker-{index}",
+            lease_for=timedelta(minutes=1),
+            now=NOW,
+            pool_limits=limits,
+        )
+        assert lease is not None
+        claimed.append(lease.id)
+        assert queue.succeed(session, job_id=lease.id, owner=lease.owner, now=NOW)
+    assert claimed == expected
+
+
+def test_acquisition_refresh_promotes_existing_ordinary_job(session: Session) -> None:
+    queue = JobQueue()
+    ordinary = refresh_payload("mangadex", "tracked").model_copy(
+        update={"observation_version": "42"}
+    )
+    urgent = ordinary.model_copy(update={"acquisition_critical": True})
+    existing, created = queue.enqueue(
+        session,
+        kind=JobKind.SOURCE_REFRESH,
+        dedupe_key="refresh:mangadex:tracked",
+        payload=ordinary,
+        source="mangadex",
+        priority=55,
+        available_at=NOW + timedelta(hours=1),
+        coalesce=True,
+    )
+    promoted, promoted_created = queue.enqueue(
+        session,
+        kind=JobKind.SOURCE_REFRESH,
+        dedupe_key="refresh:mangadex:tracked",
+        payload=urgent,
+        source="mangadex",
+        priority=10,
+        available_at=NOW,
+        coalesce=True,
+    )
+
+    assert created is True
+    assert promoted_created is False
+    assert promoted.id == existing.id
+    assert promoted.payload["acquisition_critical"] is True
+    assert promoted.priority == 10
+    assert promoted.available_at == NOW
+
+
+def test_saturated_refresh_pool_does_not_hide_another_provider(
+    session: Session,
+) -> None:
+    queue = JobQueue()
+    for index in range(75):
+        queue.enqueue(
+            session,
+            kind=JobKind.SOURCE_REFRESH,
+            dedupe_key=f"refresh:mangafire:{index}",
+            payload=refresh_payload("mangafire", f"mf-{index}"),
+            priority=55,
+            source="mangafire",
+            available_at=NOW,
+        )
+    other, _ = queue.enqueue(
+        session,
+        kind=JobKind.SOURCE_REFRESH,
+        dedupe_key="refresh:kingofshojo:other",
+        payload=refresh_payload("kingofshojo", "other"),
+        priority=55,
+        source="kingofshojo",
+        available_at=NOW,
+    )
+    limits = {
+        "network_global": 2,
+        "refresh:mangafire": 1,
+        "refresh:kingofshojo": 1,
+    }
+    first = queue.claim(
+        session,
+        owner="worker-a",
+        lease_for=timedelta(minutes=1),
+        now=NOW,
+        pool_limits=limits,
+    )
+    second = queue.claim(
+        session,
+        owner="worker-b",
+        lease_for=timedelta(minutes=1),
+        now=NOW,
+        pool_limits=limits,
+    )
+    assert first is not None and first.source == "mangafire"
+    assert second is not None and second.id == other.id
 
 
 def test_expired_lease_is_recovered_by_another_worker(session: Session) -> None:

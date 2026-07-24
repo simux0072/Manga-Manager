@@ -40,7 +40,7 @@ class SourcePullPayload(JobPayload):
 
 
 class SourceRefreshPayload(JobPayload):
-    version: int = Field(default=2, ge=1)
+    version: int = Field(default=3, ge=1)
     source: str = Field(min_length=1, max_length=50, pattern=r"^[a-z0-9_-]+$")
     source_id: str = Field(min_length=1, max_length=500)
     title: str = Field(min_length=1, max_length=500)
@@ -54,6 +54,7 @@ class SourceRefreshPayload(JobPayload):
     metadata: dict = Field(default_factory=dict)
     workflow_key: str = Field(default="", max_length=100)
     observation_version: str = Field(default="", max_length=100)
+    acquisition_critical: bool = False
 
 
 class ChapterDownloadPayload(JobPayload):

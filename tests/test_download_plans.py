@@ -80,6 +80,19 @@ def test_tracking_queues_first_two_and_latest_two_before_backfill() -> None:
     )
 
 
+def test_tracking_chapterless_series_queues_acquisition_refresh() -> None:
+    session, series_id = populated_session(chapter_count=0)
+    with session.begin():
+        DownloadPlanCoordinator().track(session, series_id)
+
+    job = session.scalar(select(WorkJob))
+    assert job is not None
+    assert job.kind == "source_refresh"
+    assert job.pool == "refresh:mangafire"
+    assert job.priority == 10
+    assert job.payload["acquisition_critical"] is True
+
+
 def test_priority_terminal_jobs_release_backfill_and_untrack_only_cancels_queued() -> None:
     session, series_id = populated_session()
     coordinator = DownloadPlanCoordinator(rolling_window=2)
@@ -246,7 +259,7 @@ def test_mangadex_release_upgrades_an_existing_kingofshojo_artifact() -> None:
     assert upgrade is not None and upgrade.source == "mangadex"
 
 
-def test_fallback_prefers_mangafire_over_kingofshojo() -> None:
+def test_fallback_uses_exact_provider_order() -> None:
     session, series_id = populated_session(chapter_count=1)
     chapter = session.scalar(select(CatalogChapter))
     mangafire = session.scalar(select(CatalogChapterRelease))
@@ -269,7 +282,15 @@ def test_fallback_prefers_mangafire_over_kingofshojo() -> None:
             normalized_title="example",
             url="https://asura.test/example",
         )
-        session.add_all([king, asura])
+        mangadex = CatalogSourceSeries(
+            series_id=series_id,
+            source="mangadex",
+            source_id="mangadex-example",
+            title="Example",
+            normalized_title="example",
+            url="https://mangadex.test/example",
+        )
+        session.add_all([king, asura, mangadex])
         session.flush()
         king_release = CatalogChapterRelease(
             chapter_id=chapter.id,
@@ -285,18 +306,38 @@ def test_fallback_prefers_mangafire_over_kingofshojo() -> None:
             source_release_id="asura-1",
             url="https://asura.test/example/1",
         )
-        session.add_all([king_release, asura_release])
+        mangadex_release = CatalogChapterRelease(
+            chapter_id=chapter.id,
+            source_series_id=mangadex.id,
+            source="mangadex",
+            source_release_id="mangadex-1",
+            url="https://mangadex.test/example/1",
+        )
+        session.add_all([king_release, asura_release, mangadex_release])
         session.flush()
 
-        selected = DownloadPlanCoordinator().fallback_release(
+        coordinator = DownloadPlanCoordinator()
+        first = coordinator.fallback_release(
             session,
             chapter.id,
             asura_release.id,
         )
+        second = coordinator.fallback_release(
+            session,
+            chapter.id,
+            asura_release.id,
+            excluded_sources={"mangadex"},
+        )
+        third = coordinator.fallback_release(
+            session,
+            chapter.id,
+            asura_release.id,
+            excluded_sources={"mangadex", "mangafire"},
+        )
 
-    assert selected is not None
-    assert selected.id == mangafire.id
-    assert selected.source == "mangafire"
+    assert first is not None and first.id == mangadex_release.id
+    assert second is not None and second.id == mangafire.id
+    assert third is not None and third.id == king_release.id
 
 
 def test_cooling_provider_reroutes_all_waiting_chapters_to_alternates() -> None:

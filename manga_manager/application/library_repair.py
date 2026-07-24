@@ -12,6 +12,7 @@ from sqlalchemy import delete, func, or_, select
 from sqlalchemy.orm import Session
 
 from manga_manager.application.job_handlers import DeferredJobError, JobContext, RetryableJobError
+from manga_manager.application.download_activity import has_runnable_or_leased_downloads
 from manga_manager.domain.jobs import (
     ACTIVE_JOB_STATES,
     JobKind,
@@ -232,6 +233,8 @@ class LibraryRepairPlanner:
         return canonicalized, cancelled
 
     def enqueue_pending(self, session, *, limit: int = 25) -> tuple[int, int]:
+        if has_runnable_or_leased_downloads(session):
+            return 0, 0
         active_artifact = (
             select(ChapterArtifact.id)
             .join(CatalogChapter, CatalogChapter.id == ChapterArtifact.chapter_id)
@@ -348,6 +351,15 @@ class LibraryRepairHandler:
         payload = context.lease.payload
         if not isinstance(payload, LibraryRepairPayload):
             raise RuntimeError("library repair handler received the wrong payload")
+        if payload.reason == "automatic_projection_repair":
+            with self.session_factory() as session:
+                downloads_active = has_runnable_or_leased_downloads(session)
+            if downloads_active:
+                raise DeferredJobError(
+                    "downloads_active",
+                    "automatic metadata repair is paused while downloads are active",
+                    retry_after=timedelta(minutes=1),
+                )
         rows = await self._blocking(self._snapshot, payload.series_id)
         if rows:
             with self.session_factory() as session, session.begin():

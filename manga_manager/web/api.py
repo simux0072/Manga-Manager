@@ -1777,6 +1777,14 @@ def create_api_router(
             session.execute(select(JobPermit.pool, func.count()).group_by(JobPermit.pool)).all()
         )
         settings = V2Settings()
+        active_by_pool = {
+            pool: int(count)
+            for pool, count in session.execute(
+                select(WorkJob.pool, func.count())
+                .where(WorkJob.status.in_(ACTIVE_JOB_STATES))
+                .group_by(WorkJob.pool)
+            ).all()
+        }
         try:
             disk = shutil.disk_usage(settings.storage_root)
         except OSError:
@@ -1849,6 +1857,19 @@ def create_api_router(
                 for row in workers
             ],
             "permits": permit_counts,
+            "scheduler": {
+                "network_capacity": settings.network_worker_concurrency,
+                "network_in_use": int(permit_counts.get("network_global", 0)),
+                "pool_limits": settings.pool_limits(),
+                "active_by_pool": active_by_pool,
+                "priority_order": [
+                    "chapter_download",
+                    "acquisition_refresh",
+                    "source_pull",
+                    "source_refresh",
+                    "background_network",
+                ],
+            },
             "provider_policies": [
                 {
                     "source": row.source,

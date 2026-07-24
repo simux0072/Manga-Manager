@@ -21,7 +21,6 @@ from manga_manager.application.job_handlers import (
     DeferredJobError,
     JobContext,
     ReroutedJobError,
-    RetryableJobError,
 )
 from manga_manager.domain.jobs import ChapterDownloadPayload, JobKind
 from manga_manager.infrastructure.catalog_repository import CatalogRepository
@@ -227,7 +226,7 @@ async def test_download_success_reconciles_plan_without_periodic_recovery(
 
 
 @pytest.mark.asyncio
-async def test_download_handler_classifies_invalid_pages_as_retryable(
+async def test_download_handler_defers_invalid_pages_without_burning_attempts(
     sessions: TrackingSessions,
     tmp_path: Path,
 ) -> None:
@@ -238,7 +237,7 @@ async def test_download_handler_classifies_invalid_pages_as_retryable(
         storage=storage(tmp_path),
         adapter_factory=lambda _source: adapter,
     )
-    with pytest.raises(RetryableJobError) as error:
+    with pytest.raises(DeferredJobError) as error:
         await handler(context)
     assert error.value.code == "invalid_content"
 

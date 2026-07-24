@@ -5,12 +5,13 @@ from datetime import datetime, timezone
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from manga_manager.domain.jobs import ChapterDownloadPayload, JobKind
+from manga_manager.domain.jobs import ChapterDownloadPayload, JobKind, SourceRefreshPayload
 from manga_manager.domain.providers import SOURCE_PRIORITY as PROVIDER_PRIORITY
 from manga_manager.infrastructure.db_models import (
     CatalogChapter,
     CatalogChapterRelease,
     CatalogSeries,
+    CatalogSourceSeries,
     ChapterArtifact,
     ChapterReleaseAttempt,
     ChapterDownloadIntent,
@@ -50,8 +51,61 @@ class DownloadPlanCoordinator:
         if plan.phase in {"complete", "cancelled"}:
             plan.phase = "priority"
         self._sync_chapters(session, plan)
+        self.enqueue_acquisition_refreshes(session, series_id)
         self.reconcile(session, series_id)
         return plan
+
+    def enqueue_acquisition_refreshes(self, session: Session, series_id: int) -> int:
+        """Enumerate a newly tracked title before ordinary catalog refresh work.
+
+        Existing catalog chapters are sufficient to start the user's download
+        plan. A chapterless tracked title instead needs its provider detail page
+        immediately, so these refreshes occupy the scheduler's second tier.
+        """
+        chapter_count = session.scalar(
+            select(func.count())
+            .select_from(CatalogChapter)
+            .where(CatalogChapter.series_id == series_id)
+        )
+        if int(chapter_count or 0) > 0:
+            return 0
+        workflow_key = f"acquire:{series_id}"
+        created = 0
+        identities = session.scalars(
+            select(CatalogSourceSeries)
+            .where(CatalogSourceSeries.series_id == series_id)
+            .order_by(CatalogSourceSeries.id)
+        ).all()
+        for identity in identities:
+            if not identity.source_id or not identity.url:
+                continue
+            _job, was_created = self.queue.enqueue(
+                session,
+                kind=JobKind.SOURCE_REFRESH,
+                dedupe_key=f"refresh:{identity.source}:{identity.source_id}",
+                payload=SourceRefreshPayload(
+                    source=identity.source,
+                    source_id=identity.source_id,
+                    title=identity.title or "Unknown manga",
+                    url=identity.url,
+                    description=identity.description or "",
+                    cover_url=identity.cover_url or "",
+                    popularity=identity.popularity or 0,
+                    metadata=dict(identity.metadata_json or {}),
+                    workflow_key=workflow_key,
+                    observation_version=identity.observation_version or "",
+                    acquisition_critical=True,
+                ),
+                priority=10,
+                max_attempts=4,
+                source=identity.source,
+                series_key=str(series_id),
+                workflow_key=workflow_key,
+                group_key=workflow_key,
+                coalesce=True,
+            )
+            created += int(was_created)
+        return created
 
     def untrack(self, session: Session, series_id: int) -> None:
         plan = session.get(SeriesDownloadPlan, series_id)

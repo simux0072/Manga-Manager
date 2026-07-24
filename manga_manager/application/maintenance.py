@@ -19,6 +19,7 @@ from manga_manager.application.provider_health import (
     provider_cooldown_until,
     record_provider_failure,
 )
+from manga_manager.application.download_activity import has_runnable_or_leased_downloads
 from manga_manager.domain.jobs import MaintenancePayload
 from manga_manager.infrastructure.db_models import (
     CatalogSourceState,
@@ -50,6 +51,14 @@ class MaintenanceHandler:
         if payload.action == "rescore_matches":
             if payload.series_id <= 0:
                 raise PermanentJobError("invalid_series", "rescore requires a series id")
+            with self.session_factory() as session:
+                downloads_active = has_runnable_or_leased_downloads(session)
+            if downloads_active:
+                raise DeferredJobError(
+                    "downloads_active",
+                    "background match rescoring is paused while downloads are active",
+                    retry_after=timedelta(minutes=1),
+                )
             await asyncio.to_thread(self._rescore_matches, payload.series_id)
             context.ensure_lease()
             return

@@ -86,7 +86,12 @@ storage by default. Local staging uses 1 GiB (`STAGE_MIN_FREE_BYTES` overrides i
 - Tracking queues the first two and latest two chapters, then bounded backfill.
 - Chapter jobs reserve shared storage before network work. A low-space pause does not consume an
   attempt and clears automatically when storage recovers.
+- Network workers form one work-conserving pool. Downloads have strict scheduling priority and may
+  borrow every eligible slot; acquisition refreshes, overdue listing pulls, ordinary refreshes,
+  and background network work use capacity left idle by provider, request-class, series, storage,
+  and memory limits. Running work is never preempted.
 - Provider request limits, cooldowns, fallbacks, and leased permits are global across workers.
+  A provider cooldown releases the worker and its permits so another provider can make progress.
 - Chapter selection is ordered Asura, MangaDex, MangaFire, then KingOfShojo. MangaDex imports
   English releases, prefers official or verified scanlation groups when duplicate chapter
   numbers exist, and downloads original-quality MangaDex@Home pages. Within MangaFire, the

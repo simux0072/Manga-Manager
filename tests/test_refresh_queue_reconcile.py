@@ -37,7 +37,7 @@ def test_refresh_queue_reconcile_preserves_compatible_and_rebuilds_incompatible(
             select(WorkJob).where(WorkJob.status.in_(("queued", "leased", "retry_wait")))
         ).all()
         assert len(active) == 2
-        assert all(row.payload["version"] == 2 for row in active)
+        assert all(row.payload["version"] == 3 for row in active)
         assert all(row.workflow_key == "pull:asura:legacy" for row in active)
 
 
@@ -50,7 +50,7 @@ def test_refresh_queue_reconcile_defers_leased_incompatible_payload() -> None:
             status="leased", lease_owner="worker",
             lease_expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
             payload={
-                "version": 3, "source": "asura", "source_id": "comics/leased",
+                "version": 99, "source": "asura", "source_id": "comics/leased",
                 "title": "Leased", "url": "https://asurascans.com/comics/leased",
             },
         ))
@@ -60,7 +60,26 @@ def test_refresh_queue_reconcile_defers_leased_incompatible_payload() -> None:
         RefreshQueueReconciler().apply(session, records)
     with Session(engine) as session:
         row = session.scalar(select(WorkJob))
-        assert row is not None and row.pending_payload["version"] == 2
+        assert row is not None and row.pending_payload["version"] == 3
+
+
+def test_refresh_queue_reconcile_preserves_current_acquisition_payload() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    JobBase.metadata.create_all(engine)
+    with Session(engine) as session, session.begin():
+        session.add(WorkJob(
+            kind="source_refresh", dedupe_key="refresh:mangadex:tracked",
+            source="mangadex", status="queued", workflow_key="acquire:7",
+            group_key="acquire:7",
+            payload={
+                "version": 3, "source": "mangadex", "source_id": "tracked",
+                "title": "Tracked", "url": "https://mangadex.org/title/tracked",
+                "acquisition_critical": True,
+            },
+        ))
+    with Session(engine) as session:
+        record = RefreshQueueReconciler().audit(session)[0]
+        assert record.action == "preserve"
 
 
 def test_refresh_queue_reconcile_reports_malformed_work_without_deleting_it() -> None:

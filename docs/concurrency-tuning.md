@@ -2,7 +2,13 @@
 
 Normal starting limits are Asura 1 job/1 page, MangaDex 2 jobs/4 pages, MangaFire 2 jobs/4 pages,
 and KingOfShojo 2 jobs/4 pages, with one chapter per canonical series and eight chapter jobs
-globally. Source pulls use one independent pool per provider, so all four may pull concurrently.
+globally. Twelve shared network workers borrow work across all providers. PostgreSQL permits retain
+one listing pull per provider and bound concurrent per-title refreshes to Asura 2, MangaDex 8,
+MangaFire 4, and KingOfShojo 4. These are useful-work ceilings, not request-rate overrides; the
+provider-global request scheduler still paces every origin and CDN request.
+Workers in one process reuse provider adapters and their HTTP connection pools. The clients support
+concurrent requests, MangaFire serializes its mutable VRF/token refresh state, and the one-pull
+provider permit keeps listing diagnostics single-writer while per-title refreshes run concurrently.
 
 A source pull reads the provider's update-ordered feed and persists its frontier. Asura is scoped to
 the `Latest Updates` section (not the preceding trending shelf), MangaDex uses its official English
@@ -10,8 +16,9 @@ chapter feed, KingOfShojo uses `/manga/?order=update`, and MangaFire uses its ch
 ordering. Every row on a fetched
 page is inspected; following pages are fetched until three saved series/chapter sentinels agree, the
 listing ends, or the configured recent-page safety window is reached. Changed series become
-deduplicated `source_refresh` jobs in the same provider pool, preventing one malformed or slow series
-from restarting an entire site scan.
+deduplicated `source_refresh` jobs in a separate provider refresh pool, preventing one malformed or
+slow series from restarting an entire site scan. Those per-title jobs may execute concurrently and
+borrow every shared slot that is not needed by higher-priority work.
 
 This is an incremental update scan, not a complete hourly catalog recrawl. If a provider batch-touches
 enough entries to fill the safety window before the frontier is found, Manga Manager additionally
@@ -43,11 +50,20 @@ Operations exposes learned jobs/pages, request intervals, endpoint cooldowns, re
 frontier counts, workers, and leased permits. Do not raise static limits based on a short clean run;
 provider policies automatically expire and are re-explored conservatively.
 
-Health probes, cover backfill, library repair, Kavita, provider pulls, and each provider's downloads
-use independent PostgreSQL claim lanes. This permits useful work to overlap without bypassing global
-limits. Cover backfill has one low-priority worker and is scheduled only below 25 active chapter jobs.
-Fallback changes the provider on the same logical job, remembers attempted sources, and waits for the
-earliest cooldown instead of oscillating through cancel/recreate loops.
+Network admission is non-preemptive and strictly ordered: chapter downloads, acquisition refreshes
+needed by newly tracked titles, overdue listing pulls, ordinary per-title refreshes, then provider
+health work. A download may consume every eligible shared slot; work already in flight completes,
+then each freed slot takes the highest eligible job. Provider cooldowns and full provider permits
+make unrelated work eligible immediately instead of parking a worker in a long sleep.
+
+Storage/CPU lanes remain separate. Cover backfill, automatic projection repair, and match rescoring
+pause while a chapter is leased or immediately runnable. A future retry on a cooled-down/disabled
+provider or a storage pause releases those background lanes instead of idling the machine. Kavita
+periodic synchronization is deliberately stricter and waits until the current download queue
+settles.
+Fallback changes the provider on the same logical job in the order Asura, MangaDex, MangaFire,
+KingOfShojo, remembers attempted sources, and waits for the applicable cooldown instead of
+oscillating through cancel/recreate loops.
 
 Metadata normalization is incremental, not a final whole-library phase. Download, tracking, merge,
 recovery, and automatic repair requests coalesce into one active repair per canonical series. The

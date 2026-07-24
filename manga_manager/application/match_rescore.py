@@ -4,6 +4,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.orm import aliased
 
 from manga_manager.application.matching_score import SCORER_VERSION
+from manga_manager.application.download_activity import has_runnable_or_leased_downloads
 from manga_manager.domain.jobs import JobKind, MaintenancePayload
 from manga_manager.infrastructure.db_models import (
     CatalogMatchDecision,
@@ -56,6 +57,8 @@ class MatchRescorePlanner:
         return cancelled
 
     def enqueue_pending(self, session, *, limit: int = 10) -> int:
+        if has_runnable_or_leased_downloads(session):
+            return 0
         active = [
             job
             for job in session.scalars(

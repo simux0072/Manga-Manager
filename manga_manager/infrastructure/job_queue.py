@@ -5,9 +5,9 @@ from decimal import Decimal, InvalidOperation
 from collections.abc import Collection
 from typing import Any
 
-from sqlalchemy import Select, and_, delete, func, or_, select, text, update
+from sqlalchemy import Select, and_, case, delete, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 
 from manga_manager.domain.jobs import (
     ACTIVE_JOB_STATES,
@@ -35,6 +35,21 @@ def utcnow() -> datetime:
 
 def _state_values(states) -> tuple[str, ...]:
     return tuple(state.value for state in states)
+
+
+NETWORK_JOB_KINDS = frozenset(
+    {
+        JobKind.SOURCE_PULL.value,
+        JobKind.SOURCE_REFRESH.value,
+        JobKind.CHAPTER_DOWNLOAD.value,
+    }
+)
+MUTATING_JOB_KINDS = frozenset(
+    {
+        JobKind.CHAPTER_DOWNLOAD.value,
+        JobKind.LIBRARY_REPAIR.value,
+    }
+)
 
 
 class JobQueue:
@@ -75,12 +90,21 @@ class JobQueue:
         routed_pool = pool.strip() or default_pool(kind, routed_source)
         existing = self.active_job(session, kind=kind, dedupe_key=key)
         if existing is not None:
+            if existing.status != JobState.LEASED.value and existing.pool != routed_pool:
+                existing.pool = routed_pool
+                existing.updated_at = utcnow()
+                self._notify_workers(session, routed_pool)
             if coalesce:
                 replacement = validated_payload.model_dump(mode="json")
                 current_payload = (
                     existing.pending_payload
                     if existing.status == JobState.LEASED.value and existing.pending_payload
                     else existing.payload
+                )
+                acquisition_promotion = bool(
+                    kind is JobKind.SOURCE_REFRESH
+                    and replacement.get("acquisition_critical")
+                    and not current_payload.get("acquisition_critical")
                 )
                 old_logical_units = existing.logical_units
                 added_units = 0
@@ -105,6 +129,16 @@ class JobQueue:
                         replacement["series_ids"] = merged
                 if not self._should_coalesce(kind, current_payload, replacement):
                     return existing, False
+                if acquisition_promotion:
+                    existing.priority = min(existing.priority, priority)
+                    existing.max_attempts = max(existing.max_attempts, max_attempts)
+                    if existing.status != JobState.LEASED.value:
+                        incoming_available_at = available_at or utcnow()
+                        if aware_datetime(existing.available_at) > aware_datetime(
+                            incoming_available_at
+                        ):
+                            existing.available_at = incoming_available_at
+                    self._notify_workers(session, routed_pool)
                 if existing.status == JobState.LEASED.value:
                     existing.pending_payload = replacement
                     if kind is not JobKind.KAVITA_SYNC:
@@ -209,6 +243,7 @@ class JobQueue:
         job.error_message = message[:4000]
         job.updated_at = current
         self._release_permits(session, job.id)
+        self._notify_workers(session, job.pool)
         self._record_event(
             session, job, "rerouted", owner=owner, message=message, details=details
         )
@@ -243,6 +278,7 @@ class JobQueue:
         job.error_code = "rerouted"
         job.error_message = message[:4000]
         job.updated_at = utcnow()
+        self._notify_workers(session, job.pool)
         self._record_event(session, job, "rerouted", message=message, details=details)
         session.flush()
         return True
@@ -270,8 +306,32 @@ class JobQueue:
         kinds: Collection[JobKind] | None = None,
         pools: Collection[str] | None = None,
         exclude_ids: Collection[int] | None = None,
+        exclude_pools: Collection[str] | None = None,
+        block_network: bool = False,
+        block_chapters: bool = False,
     ) -> Select[tuple[WorkJob]]:
         current = now or utcnow()
+        leased_for_series = aliased(WorkJob)
+        scheduling_tier = case(
+            (WorkJob.kind == JobKind.CHAPTER_DOWNLOAD.value, 0),
+            (
+                and_(
+                    WorkJob.kind == JobKind.SOURCE_REFRESH.value,
+                    WorkJob.payload["acquisition_critical"].as_boolean().is_(True),
+                ),
+                1,
+            ),
+            (WorkJob.kind == JobKind.SOURCE_PULL.value, 2),
+            (WorkJob.kind == JobKind.SOURCE_REFRESH.value, 3),
+            (
+                and_(
+                    WorkJob.kind == JobKind.MAINTENANCE.value,
+                    WorkJob.pool.like("pull:%"),
+                ),
+                4,
+            ),
+            else_=5,
+        )
         ready = and_(
             WorkJob.status.in_([JobState.QUEUED.value, JobState.RETRY_WAIT.value]),
             WorkJob.available_at <= current,
@@ -287,7 +347,7 @@ class JobQueue:
             .where(WorkJob.attempts < WorkJob.max_attempts)
             .where(
                 or_(
-                    WorkJob.kind != JobKind.CHAPTER_DOWNLOAD.value,
+                    WorkJob.kind.not_in(NETWORK_JOB_KINDS),
                     ~select(CatalogSourceState.source)
                     .where(CatalogSourceState.source == WorkJob.source)
                     .where(
@@ -301,6 +361,19 @@ class JobQueue:
             )
             .where(
                 or_(
+                    WorkJob.kind.not_in(MUTATING_JOB_KINDS),
+                    WorkJob.series_key == "",
+                    ~select(leased_for_series.id)
+                    .where(leased_for_series.id != WorkJob.id)
+                    .where(leased_for_series.kind.in_(MUTATING_JOB_KINDS))
+                    .where(leased_for_series.status == JobState.LEASED.value)
+                    .where(leased_for_series.series_key == WorkJob.series_key)
+                    .where(leased_for_series.lease_expires_at > current)
+                    .exists(),
+                )
+            )
+            .where(
+                or_(
                     WorkJob.kind != JobKind.CHAPTER_DOWNLOAD.value,
                     ~select(StorageState.id)
                     .where(StorageState.id == 1)
@@ -308,7 +381,12 @@ class JobQueue:
                     .exists(),
                 )
             )
-            .order_by(WorkJob.priority.asc(), WorkJob.available_at.asc(), WorkJob.id.asc())
+            .order_by(
+                scheduling_tier.asc(),
+                WorkJob.priority.asc(),
+                WorkJob.available_at.asc(),
+                WorkJob.id.asc(),
+            )
             .with_for_update(skip_locked=True)
             .limit(1)
         )
@@ -324,6 +402,17 @@ class JobQueue:
             query = query.where(WorkJob.pool.in_(values))
         if exclude_ids:
             query = query.where(WorkJob.id.not_in(tuple(exclude_ids)))
+        if exclude_pools:
+            query = query.where(WorkJob.pool.not_in(tuple(exclude_pools)))
+        if block_network:
+            query = query.where(
+                and_(
+                    WorkJob.kind.not_in(NETWORK_JOB_KINDS),
+                    ~WorkJob.pool.like("pull:%"),
+                )
+            )
+        if block_chapters:
+            query = query.where(WorkJob.kind != JobKind.CHAPTER_DOWNLOAD.value)
         return query
 
     def claim(
@@ -346,6 +435,14 @@ class JobQueue:
         limits = pool_limits or {}
         job = None
         rejected: set[int] = set()
+        permit_counts = self._active_permit_counts(session, now=current)
+        saturated_pools = self._saturated_direct_pools(limits, permit_counts)
+        network_full = self._permit_pool_full(
+            "network_global", limits=limits, counts=permit_counts
+        )
+        chapter_full = self._permit_pool_full(
+            "chapter_global", limits=limits, counts=permit_counts
+        )
         for _ in range(50):
             candidate = session.scalar(
                 self.claim_query(
@@ -353,6 +450,9 @@ class JobQueue:
                     kinds=kinds,
                     pools=pools,
                     exclude_ids=rejected,
+                    exclude_pools=saturated_pools,
+                    block_network=network_full,
+                    block_chapters=chapter_full,
                 )
             )
             if candidate is None:
@@ -362,6 +462,13 @@ class JobQueue:
                 # unconditional permit DELETE statements.
                 self.fail_exhausted_leases(session, now=current)
                 break
+            expected_pool = default_pool(JobKind(candidate.kind), candidate.source)
+            if (
+                candidate.kind == JobKind.SOURCE_REFRESH.value
+                and candidate.pool != expected_pool
+            ):
+                candidate.pool = expected_pool
+                session.flush([candidate])
             if (
                 candidate.status == JobState.LEASED.value
                 and candidate.lease_expires_at is not None
@@ -387,6 +494,14 @@ class JobQueue:
                 job = candidate
                 break
             rejected.add(candidate.id)
+            permit_counts = self._active_permit_counts(session, now=current)
+            saturated_pools = self._saturated_direct_pools(limits, permit_counts)
+            network_full = self._permit_pool_full(
+                "network_global", limits=limits, counts=permit_counts
+            )
+            chapter_full = self._permit_pool_full(
+                "chapter_global", limits=limits, counts=permit_counts
+            )
         if job is None:
             return None
 
@@ -909,6 +1024,10 @@ class JobQueue:
     ) -> bool:
         if kind is not JobKind.SOURCE_REFRESH:
             return current != replacement
+        if replacement.get("acquisition_critical") and not current.get(
+            "acquisition_critical"
+        ):
+            return True
         old = str(current.get("observation_version") or "").strip()
         new = str(replacement.get("observation_version") or "").strip()
         if old and new:
@@ -929,11 +1048,7 @@ class JobQueue:
         now: datetime,
         limits: dict[str, int],
     ) -> bool:
-        mutating_kinds = {
-            JobKind.CHAPTER_DOWNLOAD.value,
-            JobKind.LIBRARY_REPAIR.value,
-        }
-        if job.kind in mutating_kinds and job.series_key:
+        if job.kind in MUTATING_JOB_KINDS and job.series_key:
             series_lock = f"library-series:{job.series_key}"
             if session.bind is not None and session.bind.dialect.name == "postgresql":
                 session.execute(
@@ -942,7 +1057,7 @@ class JobQueue:
                 )
             leased_for_series = session.scalar(
                 select(WorkJob.id)
-                .where(WorkJob.kind.in_(mutating_kinds))
+                .where(WorkJob.kind.in_(MUTATING_JOB_KINDS))
                 .where(WorkJob.status == JobState.LEASED.value)
                 .where(WorkJob.series_key == job.series_key)
                 .where(WorkJob.lease_expires_at > now)
@@ -951,6 +1066,8 @@ class JobQueue:
             if leased_for_series is not None:
                 return False
         pools = [job.pool]
+        if self._is_network_job(job):
+            pools.append("network_global")
         if job.kind == JobKind.CHAPTER_DOWNLOAD.value:
             pools.append("chapter_global")
         pools = sorted(set(filter(None, pools)))
@@ -998,6 +1115,44 @@ class JobQueue:
         session.flush()
         return True
 
+    @staticmethod
+    def _is_network_job(job: WorkJob) -> bool:
+        return job.kind in NETWORK_JOB_KINDS or job.pool.startswith("pull:")
+
+    @staticmethod
+    def _active_permit_counts(session: Session, *, now: datetime) -> dict[str, int]:
+        return {
+            pool: int(count)
+            for pool, count in session.execute(
+                select(JobPermit.pool, func.count())
+                .where(JobPermit.lease_expires_at > now)
+                .group_by(JobPermit.pool)
+            ).all()
+        }
+
+    @staticmethod
+    def _permit_pool_full(
+        pool: str,
+        *,
+        limits: dict[str, int],
+        counts: dict[str, int],
+    ) -> bool:
+        limit = limits.get(pool)
+        if limit is None:
+            return False
+        return counts.get(pool, 0) >= limit
+
+    @staticmethod
+    def _saturated_direct_pools(
+        limits: dict[str, int], counts: dict[str, int]
+    ) -> set[str]:
+        return {
+            pool
+            for pool, limit in limits.items()
+            if pool not in {"network_global", "chapter_global"}
+            and counts.get(pool, 0) >= limit
+        }
+
     def _release_permits(self, session: Session, job_id: int) -> None:
         session.execute(delete(JobPermit).where(JobPermit.job_id == job_id))
         session.execute(delete(StorageReservation).where(StorageReservation.job_id == job_id))
@@ -1025,8 +1180,10 @@ class JobQueue:
 
 
 def default_pool(kind: JobKind, source: str = "") -> str:
-    if kind in {JobKind.SOURCE_PULL, JobKind.SOURCE_REFRESH}:
+    if kind is JobKind.SOURCE_PULL:
         return f"pull:{source}" if source else "pull:unknown"
+    if kind is JobKind.SOURCE_REFRESH:
+        return f"refresh:{source}" if source else "refresh:unknown"
     if kind is JobKind.CHAPTER_DOWNLOAD:
         return f"download:{source}" if source else "download:unknown"
     if kind is JobKind.KAVITA_SYNC:

@@ -20,6 +20,8 @@ from manga_manager.domain.jobs import (
     JobKind,
     LibraryRepairPayload,
     MaintenancePayload,
+    SourcePullPayload,
+    SourceRefreshPayload,
 )
 from manga_manager.infrastructure.database import DEFAULT_ALEMBIC_CONFIG, run_migrations
 from manga_manager.infrastructure.job_queue import JobQueue
@@ -175,6 +177,124 @@ def test_provider_permit_cap_is_atomic_across_workers(sessions) -> None:
     assert sum(job_id is not None for job_id in claims) == 1
 
 
+def test_network_global_permit_is_atomic_across_mixed_providers(sessions) -> None:
+    _engine, factory = sessions
+    with factory() as session, session.begin():
+        for source in ("mangadex", "mangafire"):
+            JobQueue().enqueue(
+                session,
+                kind=JobKind.SOURCE_REFRESH,
+                dedupe_key=f"refresh:{source}:example",
+                payload=SourceRefreshPayload(
+                    source=source,
+                    source_id="example",
+                    title="Example",
+                    url=f"https://{source}.test/example",
+                ),
+                source=source,
+                available_at=NOW,
+            )
+    barrier = Barrier(2)
+
+    def claim(owner: str) -> int | None:
+        with factory() as session, session.begin():
+            barrier.wait()
+            lease = JobQueue().claim(
+                session,
+                owner=owner,
+                lease_for=timedelta(minutes=1),
+                now=NOW,
+                pool_limits={
+                    "network_global": 1,
+                    "refresh:mangadex": 4,
+                    "refresh:mangafire": 4,
+                },
+            )
+            return lease.id if lease else None
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        claims = list(executor.map(claim, ["worker-a", "worker-b"]))
+    assert sum(job_id is not None for job_id in claims) == 1
+
+
+def test_postgres_network_priority_uses_explicit_acquisition_flag(sessions) -> None:
+    _engine, factory = sessions
+    queue = JobQueue()
+    with factory() as session, session.begin():
+        ordinary, _ = queue.enqueue(
+            session,
+            kind=JobKind.SOURCE_REFRESH,
+            dedupe_key="refresh:mangafire:ordinary",
+            payload=SourceRefreshPayload(
+                source="mangafire",
+                source_id="ordinary",
+                title="Ordinary",
+                url="https://mangafire.test/ordinary",
+            ),
+            priority=1,
+            source="mangafire",
+            available_at=NOW,
+        )
+        pull, _ = queue.enqueue(
+            session,
+            kind=JobKind.SOURCE_PULL,
+            dedupe_key="pull:mangafire",
+            payload=SourcePullPayload(source="mangafire"),
+            priority=1,
+            source="mangafire",
+            available_at=NOW,
+        )
+        acquisition, _ = queue.enqueue(
+            session,
+            kind=JobKind.SOURCE_REFRESH,
+            dedupe_key="refresh:mangadex:tracked",
+            payload=SourceRefreshPayload(
+                source="mangadex",
+                source_id="tracked",
+                title="Tracked",
+                url="https://mangadex.test/tracked",
+                acquisition_critical=True,
+            ),
+            priority=10,
+            source="mangadex",
+            available_at=NOW,
+        )
+        download, _ = queue.enqueue(
+            session,
+            kind=JobKind.CHAPTER_DOWNLOAD,
+            dedupe_key="chapter:999",
+            payload=ChapterDownloadPayload(chapter_release_id=999),
+            priority=999,
+            source="asura",
+            series_key="999",
+            available_at=NOW,
+        )
+
+    expected = [download.id, acquisition.id, pull.id, ordinary.id]
+    claimed: list[int] = []
+    limits = {
+        "network_global": 4,
+        "chapter_global": 4,
+        "download:asura": 1,
+        "refresh:mangadex": 1,
+        "refresh:mangafire": 1,
+        "pull:mangafire": 1,
+    }
+    for index in range(4):
+        with factory() as session, session.begin():
+            lease = queue.claim(
+                session,
+                owner=f"worker-{index}",
+                lease_for=timedelta(minutes=1),
+                now=NOW,
+                pool_limits=limits,
+            )
+            assert lease is not None
+            claimed.append(lease.id)
+            assert queue.succeed(session, job_id=lease.id, owner=lease.owner, now=NOW)
+    assert claimed == expected
+
+
 def test_per_series_cap_is_atomic_across_workers(sessions) -> None:
     _engine, factory = sessions
     with factory() as session, session.begin():
@@ -274,7 +394,7 @@ def test_diagnostic_bundle_is_bounded_and_redacted(sessions, tmp_path: Path) -> 
         recent_failure_limit=1,
     )
 
-    assert payload["migration"] == "0023_mangadex_provider"
+    assert payload["migration"] == "0024_elastic_network_workers"
     assert payload["database_bytes"] > 0
     assert len(payload["recent_failures"]) == 1
     assert "secret" not in payload["recent_failures"][0]["error_message"]
@@ -290,7 +410,7 @@ def test_v2_migrations_round_trip_on_postgresql(sessions) -> None:
     command.upgrade(config, "head")
     with Session(create_engine(DATABASE_URL)) as session:
         assert session.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0023_mangadex_provider"
+            "0024_elastic_network_workers"
         )
         indexes = set(
             session.scalars(

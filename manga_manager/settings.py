@@ -19,12 +19,17 @@ class V2Settings(BaseSettings):
     database_url: str = ""
     worker_id: str = Field(default_factory=default_worker_id, min_length=1, max_length=180)
     global_chapter_concurrency: int = Field(default=8, ge=1, le=32)
+    network_worker_concurrency: int = Field(default=12, ge=1, le=64)
     # Normal workers are deliberately fixed at one. benchmark-workers uses a scoped,
     # non-validated model copy for the explicit two-job Asura experiment.
     asura_download_concurrency: int = Field(default=1, ge=1, le=1)
     mangadex_download_concurrency: int = Field(default=2, ge=1, le=8)
     mangafire_download_concurrency: int = Field(default=2, ge=1, le=8)
     kingofshojo_download_concurrency: int = Field(default=2, ge=1, le=8)
+    asura_refresh_concurrency: int = Field(default=2, ge=1, le=8)
+    mangadex_refresh_concurrency: int = Field(default=8, ge=1, le=32)
+    mangafire_refresh_concurrency: int = Field(default=4, ge=1, le=16)
+    kingofshojo_refresh_concurrency: int = Field(default=4, ge=1, le=16)
     worker_poll_seconds: float = Field(default=1.0, gt=0, le=60)
     worker_lease_seconds: int = Field(default=300, ge=30, le=86_400)
     worker_heartbeat_seconds: int = Field(default=30, ge=5, le=3_600)
@@ -81,10 +86,15 @@ class V2Settings(BaseSettings):
 
     def pool_limits(self) -> dict[str, int]:
         return {
+            "network_global": self.network_worker_concurrency,
             "pull:asura": 1,
             "pull:mangadex": 1,
             "pull:mangafire": 1,
             "pull:kingofshojo": 1,
+            "refresh:asura": self.asura_refresh_concurrency,
+            "refresh:mangadex": self.mangadex_refresh_concurrency,
+            "refresh:mangafire": self.mangafire_refresh_concurrency,
+            "refresh:kingofshojo": self.kingofshojo_refresh_concurrency,
             "download:asura": self.asura_download_concurrency,
             "download:mangadex": self.mangadex_download_concurrency,
             "download:mangafire": self.mangafire_download_concurrency,
