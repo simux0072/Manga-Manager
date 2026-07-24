@@ -6,7 +6,7 @@ import {AlertTriangle, BookOpen, Check, ExternalLink, Merge, Search, Split, X} f
 import {api} from './api'
 import type {Match, MatchSide, MergeCandidate, MergePreview, Page, Series} from './types'
 
-const fallbackProviders = ['asura', 'mangafire', 'kingofshojo']
+const fallbackProviders = ['asura', 'mangadex', 'mangafire', 'kingofshojo']
 
 export function MatchesWorkspace() {
   const [tab, setTab] = useState<'suggested' | 'manual'>('suggested')

@@ -22,6 +22,7 @@ class V2Settings(BaseSettings):
     # Normal workers are deliberately fixed at one. benchmark-workers uses a scoped,
     # non-validated model copy for the explicit two-job Asura experiment.
     asura_download_concurrency: int = Field(default=1, ge=1, le=1)
+    mangadex_download_concurrency: int = Field(default=2, ge=1, le=8)
     mangafire_download_concurrency: int = Field(default=2, ge=1, le=8)
     kingofshojo_download_concurrency: int = Field(default=2, ge=1, le=8)
     worker_poll_seconds: float = Field(default=1.0, gt=0, le=60)
@@ -35,9 +36,11 @@ class V2Settings(BaseSettings):
     circuit_breaker_failures: int = Field(default=3, ge=1, le=100)
     scheduler_check_seconds: int = Field(default=30, ge=5, le=3_600)
     enable_asura: bool = True
+    enable_mangadex: bool = True
     enable_mangafire: bool = True
     enable_kingofshojo: bool = True
     asura_poll_minutes: int = Field(default=30, ge=5)
+    mangadex_poll_minutes: int = Field(default=30, ge=5)
     mangafire_poll_minutes: int = Field(default=60, ge=5)
     kingofshojo_poll_minutes: int = Field(default=180, ge=15)
     storage_root: Path = Path("./storage-v2")
@@ -68,6 +71,8 @@ class V2Settings(BaseSettings):
         intervals: dict[str, timedelta] = {}
         if self.enable_asura:
             intervals["asura"] = timedelta(minutes=self.asura_poll_minutes)
+        if self.enable_mangadex:
+            intervals["mangadex"] = timedelta(minutes=self.mangadex_poll_minutes)
         if self.enable_mangafire:
             intervals["mangafire"] = timedelta(minutes=self.mangafire_poll_minutes)
         if self.enable_kingofshojo:
@@ -77,9 +82,11 @@ class V2Settings(BaseSettings):
     def pool_limits(self) -> dict[str, int]:
         return {
             "pull:asura": 1,
+            "pull:mangadex": 1,
             "pull:mangafire": 1,
             "pull:kingofshojo": 1,
             "download:asura": self.asura_download_concurrency,
+            "download:mangadex": self.mangadex_download_concurrency,
             "download:mangafire": self.mangafire_download_concurrency,
             "download:kingofshojo": self.kingofshojo_download_concurrency,
             "chapter_global": self.global_chapter_concurrency,

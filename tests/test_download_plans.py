@@ -197,6 +197,55 @@ def test_mangafire_official_release_upgrades_an_unranked_existing_artifact() -> 
     assert upgrade is not None and upgrade.source == "mangafire"
 
 
+def test_mangadex_release_upgrades_an_existing_kingofshojo_artifact() -> None:
+    session, series_id = populated_session(chapter_count=1)
+    chapter = session.scalar(select(CatalogChapter))
+    assert chapter is not None
+    session.commit()
+    with session.begin():
+        mangadex = CatalogSourceSeries(
+            series_id=series_id,
+            source="mangadex",
+            source_id="mangadex-example",
+            title="Example",
+            normalized_title="example",
+            url="https://mangadex.org/title/example",
+        )
+        session.add(mangadex)
+        session.flush()
+        session.add(
+            CatalogChapterRelease(
+                chapter_id=chapter.id,
+                source_series_id=mangadex.id,
+                source="mangadex",
+                source_release_id="mangadex-1",
+                url="https://mangadex.org/chapter/one",
+                quality_rank=100,
+            )
+        )
+        session.add(
+            ArtifactBlob(checksum="c" * 64, relative_path="blobs/c.cbz", byte_count=1)
+        )
+        session.add(
+            ChapterArtifact(
+                chapter_id=chapter.id,
+                blob_checksum="c" * 64,
+                state="active",
+                provenance="download",
+                source="kingofshojo",
+                quality_rank=0,
+                image_count=10,
+            )
+        )
+
+    with session.begin():
+        created = DownloadPlanCoordinator().enqueue_preferred_upgrades(session, [series_id])
+
+    assert created == 1
+    upgrade = session.scalar(select(WorkJob).where(WorkJob.dedupe_key.like("upgrade:%")))
+    assert upgrade is not None and upgrade.source == "mangadex"
+
+
 def test_fallback_prefers_mangafire_over_kingofshojo() -> None:
     session, series_id = populated_session(chapter_count=1)
     chapter = session.scalar(select(CatalogChapter))

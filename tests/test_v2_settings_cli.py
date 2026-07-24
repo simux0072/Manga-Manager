@@ -34,6 +34,7 @@ def test_cli_exposes_transition_commands() -> None:
     pull = parser.parse_args(["enqueue-pull", "asura"])
     assert pull.command == "enqueue-pull"
     assert pull.source == "asura"
+    assert parser.parse_args(["enqueue-pull", "mangadex"]).source == "mangadex"
     importer = parser.parse_args(["import-cbz", "/tmp/library", "--dry-run"])
     assert importer.command == "import-cbz"
     assert importer.dry_run is True

@@ -166,7 +166,7 @@ describe('media library frontend',()=>{
     vi.stubGlobal('fetch',vi.fn((input:string|URL|Request,init?:RequestInit)=>{
       const url=String(input)
       if(url.includes('/api/v2/operations'))return response({job_counts:{},health:{series:2,chapters:1,active_artifacts:0,missing_projections:0},sources:[],workers:[],permits:{}})
-      if(url.includes('/api/v2/providers'))return response({items:['asura','mangafire','kingofshojo']})
+      if(url.includes('/api/v2/providers'))return response({items:['asura','mangadex','mangafire','kingofshojo']})
       if(url.includes('/api/v2/matches/')&&init?.method==='POST')return response({id:Number(url.split('/').at(-1)),decision:'reviewed'})
       if(url.includes('/api/v2/matches'))return response({items:[match,duplicateMatch,secondMatch],next_cursor:null,total:3})
       return response({items:[],next_cursor:null})
@@ -207,7 +207,7 @@ describe('media library frontend',()=>{
     vi.stubGlobal('fetch',vi.fn((input:string|URL|Request,init?:RequestInit)=>{
       const url=String(input)
       if(url.includes('/api/v2/operations'))return response({job_counts:{},health:{series:2,chapters:1,active_artifacts:0,missing_projections:0},sources:[],workers:[],permits:{}})
-      if(url.includes('/api/v2/providers'))return response({items:['asura','mangafire','kingofshojo']})
+      if(url.includes('/api/v2/providers'))return response({items:['asura','mangadex','mangafire','kingofshojo']})
       if(url.endsWith('/api/v2/match-batch/preview')){
         previewBody=JSON.parse(String(init?.body))
         return response({selected:previewBody!.ids.length,eligible:previewBody!.ids.length,blocked:0,items:[]})

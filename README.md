@@ -1,7 +1,8 @@
 # Manga Manager
 
 Manga Manager is a private PostgreSQL-backed catalog, downloader, and Kavita synchronization
-service for Asura Scans, King of Shojo, and MangaFire. It provides a responsive React interface,
+service for Asura Scans, MangaDex, MangaFire, and King of Shojo. It provides a responsive React
+interface,
 durable provider-aware workers, content-addressed CBZ storage, and standalone legacy repair/import
 tools.
 
@@ -86,9 +87,14 @@ storage by default. Local staging uses 1 GiB (`STAGE_MIN_FREE_BYTES` overrides i
 - Chapter jobs reserve shared storage before network work. A low-space pause does not consume an
   attempt and clears automatically when storage recovers.
 - Provider request limits, cooldowns, fallbacks, and leased permits are global across workers.
-- Chapter selection is ordered Asura, MangaFire, then KingOfShojo. Within MangaFire, the
+- Chapter selection is ordered Asura, MangaDex, MangaFire, then KingOfShojo. MangaDex imports
+  English releases, prefers official or verified scanlation groups when duplicate chapter
+  numbers exist, and downloads original-quality MangaDex@Home pages. Within MangaFire, the
   green-check `official` release wins over an unverified duplicate chapter; its quality is stored
   with the artifact so an older unverified download can be upgraded exactly once.
+- MangaFire API requests use its rotating browser protection token. A bounded embedded JavaScript
+  isolate refreshes the public token routine when MangaFire changes it; legacy terminal 403
+  download failures are requeued once after deployment.
 - `manga-manager enqueue-kavita-pending --limit 100` queues downloaded tracked series missing a
   current Kavita mapping.
 - `manga-manager enqueue-library-repair --all-tracked` queues a resumable canonical metadata and

@@ -61,6 +61,7 @@ from manga_manager.infrastructure.db_models import (
 )
 from manga_manager.infrastructure.storage import ContentAddressedStorage
 from manga_manager.settings import V2Settings
+from manga_manager.domain.providers import provider_names
 from manga_manager.worker.service import WorkerService
 from manga_manager.worker.scheduler import SourcePollScheduler
 
@@ -131,7 +132,7 @@ def build_parser() -> argparse.ArgumentParser:
         "benchmark-workers", help="run a bounded worker-pool benchmark"
     )
     benchmark.add_argument(
-        "--source", choices=["asura", "mangafire", "kingofshojo"], default="asura"
+        "--source", choices=provider_names(), default="asura"
     )
     benchmark.add_argument("--concurrency", type=int, choices=[1, 2, 3, 4], default=1)
     benchmark.add_argument("--traffic", choices=["origin", "cdn", "both"], default="both")
@@ -171,7 +172,7 @@ def build_parser() -> argparse.ArgumentParser:
                 "--apply", action="store_true", help="apply safe repairs after backup"
             )
     pull = subcommands.add_parser("enqueue-pull", help="enqueue one source discovery pull")
-    pull.add_argument("source", choices=["asura", "mangafire", "kingofshojo"])
+    pull.add_argument("source", choices=provider_names())
     importer = subcommands.add_parser("import-cbz", help="validate or import legacy CBZ files")
     importer.add_argument("source", type=Path)
     importer.add_argument("--dry-run", action="store_true")
@@ -821,7 +822,7 @@ async def run_worker(settings: V2Settings, engine) -> int:
         adapter_factory=adapters.get,
         cooldowns={
             source: settings.source_cooldown(source)
-            for source in ("asura", "mangafire", "kingofshojo")
+            for source in provider_names()
         }
         | {"default": settings.source_cooldown("default")},
         circuit_breaker_failures=settings.circuit_breaker_failures,
@@ -908,7 +909,7 @@ async def run_worker_benchmark(
         storage=create_storage(benchmark_settings),
         cooldowns={
             name: benchmark_settings.source_cooldown(name)
-            for name in ("asura", "mangafire", "kingofshojo")
+            for name in provider_names()
         }
         | {"default": benchmark_settings.source_cooldown("default")},
         circuit_breaker_failures=benchmark_settings.circuit_breaker_failures,

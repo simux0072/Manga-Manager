@@ -272,11 +272,12 @@ class DownloadPlanCoordinator:
             .where(
                 CatalogChapter.series_id.in_(series_ids),
                 ChapterArtifact.state == "active",
-                # Fallbacks may be replaced by a preferred provider. MangaFire
-                # artifacts are also reconsidered so pre-migration unofficial
-                # chapters are upgraded once to a verified official release.
+                # Reconsider every non-Asura artifact. This upgrades older
+                # KingOfShojo/MangaFire downloads when MangaDex is discovered,
+                # while quality ranks still replace unofficial releases within
+                # the same provider.
                 (ChapterArtifact.provenance == "fallback")
-                | (ChapterArtifact.source == "mangafire"),
+                | (ChapterArtifact.source != "asura"),
             )
         ).all()
         created = 0

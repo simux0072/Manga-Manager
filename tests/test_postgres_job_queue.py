@@ -274,7 +274,7 @@ def test_diagnostic_bundle_is_bounded_and_redacted(sessions, tmp_path: Path) -> 
         recent_failure_limit=1,
     )
 
-    assert payload["migration"] == "0022_chapter_release_quality"
+    assert payload["migration"] == "0023_mangadex_provider"
     assert payload["database_bytes"] > 0
     assert len(payload["recent_failures"]) == 1
     assert "secret" not in payload["recent_failures"][0]["error_message"]
@@ -290,7 +290,7 @@ def test_v2_migrations_round_trip_on_postgresql(sessions) -> None:
     command.upgrade(config, "head")
     with Session(create_engine(DATABASE_URL)) as session:
         assert session.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0022_chapter_release_quality"
+            "0023_mangadex_provider"
         )
         indexes = set(
             session.scalars(

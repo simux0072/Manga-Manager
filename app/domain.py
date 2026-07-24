@@ -10,6 +10,7 @@ from difflib import SequenceMatcher
 
 SOURCE_PRIORITY = {
     "asura": 100,
+    "mangadex": 80,
     "mangafire": 50,
     "kingofshojo": 10,
 }

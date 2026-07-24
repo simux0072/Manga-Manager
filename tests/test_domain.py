@@ -12,7 +12,9 @@ def test_chapter_number_decimal_is_preserved():
 
 def test_priority_replacement_order():
     assert should_replace("kingofshojo", "mangafire")
-    assert should_replace("mangafire", "asura")
+    assert should_replace("mangafire", "mangadex")
+    assert should_replace("mangadex", "asura")
+    assert not should_replace("mangadex", "mangafire")
     assert not should_replace("asura", "kingofshojo")
 
 

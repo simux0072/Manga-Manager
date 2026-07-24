@@ -393,7 +393,7 @@ def seed_scale(
         session.add_all(
             CatalogSourceSeries(
                 series_id=row.id,
-                source=("asura", "mangafire", "kingofshojo")[index % 3],
+                source=("asura", "mangadex", "mangafire", "kingofshojo")[index % 4],
                 source_id=f"scale-{index}",
                 normalized_source_id=f"scale-{index}",
                 title=row.title,
@@ -447,7 +447,11 @@ def seed_scale(
                 status = "succeeded"
             series_index = index % series_count
             kind = "library_repair" if index % 4 == 0 else "chapter_download"
-            source = "" if kind == "library_repair" else ("asura", "mangafire", "kingofshojo")[index % 3]
+            source = (
+                ""
+                if kind == "library_repair"
+                else ("asura", "mangadex", "mangafire", "kingofshojo")[index % 4]
+            )
             group_key = (
                 f"cycle:{cycle.id}:maintenance:library_repair"
                 if kind == "library_repair"

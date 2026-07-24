@@ -64,6 +64,11 @@ class WorkerService:
                 {JobKind.SOURCE_PULL, JobKind.SOURCE_REFRESH, JobKind.MAINTENANCE},
             ),
             (
+                "pull:mangadex",
+                1,
+                {JobKind.SOURCE_PULL, JobKind.SOURCE_REFRESH, JobKind.MAINTENANCE},
+            ),
+            (
                 "pull:mangafire",
                 1,
                 {JobKind.SOURCE_PULL, JobKind.SOURCE_REFRESH, JobKind.MAINTENANCE},
@@ -79,13 +84,18 @@ class WorkerService:
                 {JobKind.CHAPTER_DOWNLOAD},
             ),
             (
-                "download:kingofshojo",
-                self.settings.kingofshojo_download_concurrency,
+                "download:mangadex",
+                self.settings.mangadex_download_concurrency,
                 {JobKind.CHAPTER_DOWNLOAD},
             ),
             (
                 "download:mangafire",
                 self.settings.mangafire_download_concurrency,
+                {JobKind.CHAPTER_DOWNLOAD},
+            ),
+            (
+                "download:kingofshojo",
+                self.settings.kingofshojo_download_concurrency,
                 {JobKind.CHAPTER_DOWNLOAD},
             ),
             ("kavita", 1, {JobKind.KAVITA_SYNC}),

@@ -108,7 +108,7 @@ def audit_database(connection: Connection, *, statement_timeout_ms: int = 5_000)
         "unknown_provider_identities": _scalar(
             connection,
             "SELECT count(*) FROM source_series_v2 "
-            "WHERE source NOT IN ('asura','mangafire','kingofshojo')",
+            "WHERE source NOT IN ('asura','mangadex','mangafire','kingofshojo')",
         ),
         "multiple_active_workload_cycles": max(
             _scalar(connection, "SELECT count(*) FROM workload_cycle WHERE status='active'") - 1,

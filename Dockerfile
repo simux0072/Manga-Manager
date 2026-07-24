@@ -19,7 +19,14 @@ COPY pyproject.toml uv.lock ./
 # The project metadata references README.md, but dependency installation does not need its content.
 # Keeping documentation out of this layer avoids reinstalling OpenCV and the Python stack for a
 # README-only change, which is especially expensive on the supported mechanical-disk staging host.
-RUN touch README.md && uv sync --frozen --no-dev --no-install-project
+# QuickJS publishes an x86_64 wheel but is compiled from source on ARM64. Keep the compiler out of
+# the runtime image while retaining one dependency layer that works on both the staging host and Pi.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential \
+    && touch README.md \
+    && uv sync --frozen --no-dev --no-install-project \
+    && apt-get purge -y --auto-remove build-essential \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY app ./app
 COPY manga_manager ./manga_manager

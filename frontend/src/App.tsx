@@ -9,7 +9,7 @@ const MatchesWorkspace=lazy(()=>import('./MatchesWorkspace').then(module=>({defa
 
 type Toast={id:number;message:string;tone?:'normal'|'error';action?:()=>void;actionLabel?:string}
 const ToastContext=createContext<(toast:Omit<Toast,'id'>)=>void>(()=>{})
-const fallbackSources=['asura','mangafire','kingofshojo']
+const fallbackSources=['asura','mangadex','mangafire','kingofshojo']
 const states=['interested','reading','caught_up','paused']
 
 export function App(){

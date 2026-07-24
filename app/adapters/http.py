@@ -75,7 +75,7 @@ class HttpSourceClient:
         response = await self.request("GET", url)
         return BeautifulSoup(response.text, "html.parser")
 
-    async def get_json(self, path_or_url: str):
+    async def get_json(self, path_or_url: str, *, traffic_class: str | None = None):
         url = path_or_url if path_or_url.startswith("http") else f"{self.base_url}{path_or_url}"
         response = await self.request(
             "GET",
@@ -84,6 +84,7 @@ class HttpSourceClient:
                 "Accept": "application/json",
                 "X-Requested-With": "XMLHttpRequest",
             },
+            traffic_class=traffic_class,
         )
         return response.json()
 
@@ -148,20 +149,36 @@ class HttpSourceClient:
         method: str,
         url: str,
         headers: dict[str, str] | None = None,
+        *,
+        traffic_class: str | None = None,
     ) -> httpx.Response:
-        await self.wait_for_throttle(url)
+        await self.wait_for_throttle(url, traffic_class=traffic_class)
         started = time.monotonic()
         try:
             response = await self.client.request(method, url, headers=headers)
         except Exception as exc:
-            self.observe(url, None, started, 0, exc)
+            self.observe(url, None, started, 0, exc, traffic_class=traffic_class)
             raise
         try:
-            self.raise_for_status(response)
+            self.raise_for_status(response, traffic_class=traffic_class)
         except Exception as exc:
-            self.observe(url, response, started, len(response.content), exc)
+            self.observe(
+                url,
+                response,
+                started,
+                len(response.content),
+                exc,
+                traffic_class=traffic_class,
+            )
             raise
-        self.observe(url, response, started, len(response.content), None)
+        self.observe(
+            url,
+            response,
+            started,
+            len(response.content),
+            None,
+            traffic_class=traffic_class,
+        )
         return response
 
     def observe(
@@ -171,6 +188,8 @@ class HttpSourceClient:
         started: float,
         byte_count: int,
         error: BaseException | None,
+        *,
+        traffic_class: str | None = None,
     ) -> None:
         if self.source:
             observe_request(
@@ -181,27 +200,39 @@ class HttpSourceClient:
                 started,
                 byte_count,
                 error,
+                traffic_class=traffic_class,
             )
 
-    def raise_for_status(self, response: httpx.Response) -> None:
+    def raise_for_status(
+        self,
+        response: httpx.Response,
+        *,
+        traffic_class: str | None = None,
+    ) -> None:
         if response.status_code == 429:
-            traffic_class = traffic_class_for_url(
+            observed_class = traffic_class or traffic_class_for_url(
                 self.provider_origin_url, str(response.request.url)
             )
             raise SourceRateLimited(
                 f"rate limited by {self.base_url}",
                 retry_after=retry_after_from_headers(response.headers),
                 source=self.source,
-                traffic_class=traffic_class,
+                traffic_class=observed_class,
             )
         response.raise_for_status()
 
-    async def wait_for_throttle(self, url: str = "") -> None:
+    async def wait_for_throttle(
+        self,
+        url: str = "",
+        *,
+        traffic_class: str | None = None,
+    ) -> None:
         if _provider_waiter is not None:
             if self.source:
                 await _provider_waiter(
                     self.source,
-                    traffic_class_for_url(self.provider_origin_url, url or self.base_url),
+                    traffic_class
+                    or traffic_class_for_url(self.provider_origin_url, url or self.base_url),
                     self.throttle_seconds,
                 )
                 return
@@ -228,6 +259,8 @@ def page_concurrency_for_source(source: str) -> int:
         return settings.asura_page_concurrency
     if source == "mangafire":
         return settings.mangafire_page_concurrency
+    if source == "mangadex":
+        return settings.mangadex_page_concurrency
     if source == "kingofshojo":
         return settings.kingofshojo_page_concurrency
     return 1
@@ -346,6 +379,8 @@ def page_concurrency_for_base_url(base_url: str) -> int:
         return settings.asura_page_concurrency
     if "mangafire" in base_url:
         return settings.mangafire_page_concurrency
+    if "mangadex" in base_url:
+        return settings.mangadex_page_concurrency
     if "kingofshojo" in base_url:
         return settings.kingofshojo_page_concurrency
     return 1
@@ -393,6 +428,8 @@ def observe_request(
     started: float,
     byte_count: int,
     error: BaseException | None,
+    *,
+    traffic_class: str | None = None,
 ) -> None:
     if _request_observer is None:
         return
@@ -405,7 +442,8 @@ def observe_request(
         {
             "source": source,
             "host": urlparse(url).hostname or "",
-            "traffic_class": traffic_class_for_url(provider_origin_url, url),
+            "traffic_class": traffic_class
+            or traffic_class_for_url(provider_origin_url, url),
             "status_code": response.status_code if response is not None else 0,
             "latency_ms": max(0, int((time.monotonic() - started) * 1000)),
             "byte_count": byte_count,

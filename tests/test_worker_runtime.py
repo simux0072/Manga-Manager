@@ -188,7 +188,12 @@ def test_source_pull_workers_are_partitioned_by_provider(
         settings=V2Settings(),
     )
     pools = [pool for _slot, pool, _kinds in service._pool_specs()]
-    assert pools == ["pull:asura", "pull:mangafire", "pull:kingofshojo"]
+    assert pools == [
+        "pull:asura",
+        "pull:mangadex",
+        "pull:mangafire",
+        "pull:kingofshojo",
+    ]
 
 
 def test_maintenance_worker_claims_repairs_and_catalog_rescores(

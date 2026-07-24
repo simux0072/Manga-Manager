@@ -103,8 +103,8 @@ React UI <-> /api/v2 <-> PostgreSQL jobs/catalog <-> SSE job events
 PostgreSQL is also the inter-process coordinator. Partial unique indexes enforce active job
 deduplication and one leased mutation per series. Leased permits enforce provider and global
 capacity. The worker currently creates one pull slot per provider, one Asura download slot, two
-MangaFire slots, two KingOfShojo slots, and one slot each for Kavita, repair, health, and cover
-backfill.
+MangaDex slots, two MangaFire slots, two KingOfShojo slots, and one slot each for Kavita, repair,
+health, and cover backfill.
 
 ## Data and contract reference
 
@@ -119,10 +119,11 @@ backfill.
 | `HttpSourceClient.request/get_soup/get_json/get_bytes` | provider URL, headers/referer | checked response, parsed body, or bounded bytes |
 | `KavitaClient` | local folder/series/chapter IDs and progress mutations | Kavita scan, mapping, reading state, Want to Read, and cover updates |
 
-`AsuraAdapter`, `MangaFireAdapter`, and `KingOfShojoAdapter` implement the same contract. Their parser
-helpers remove helper/template links, normalize titles/numbers, extract safe image URLs, and stop
-frontier traversal after stable sentinels. Asura additionally separates a rotating URL revision from
-its stable source ID. MangaFire supports JSON API and HTML fallbacks.
+`AsuraAdapter`, `MangaDexAdapter`, `MangaFireAdapter`, and `KingOfShojoAdapter` implement the same
+contract. Their parser helpers remove helper/template links, normalize titles/numbers, extract safe
+image URLs, and stop frontier traversal after stable sentinels. Asura additionally separates a
+rotating URL revision from its stable source ID. MangaDex uses the official API and original
+MangaDex@Home pages. MangaFire supports JSON API and HTML fallbacks.
 
 ### Domain records
 

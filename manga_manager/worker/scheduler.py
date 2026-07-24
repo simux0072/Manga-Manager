@@ -17,7 +17,14 @@ from manga_manager.application.match_rescore import MatchRescorePlanner
 from manga_manager.application.provider_health import contains_cloudflare_origin_error
 from manga_manager.application.job_retention import JobRetention
 from manga_manager.domain.jobs import JobKind, MaintenancePayload, SourcePullPayload
-from manga_manager.infrastructure.db_models import CatalogSourceState, ProviderPolicy, WorkJob
+from manga_manager.infrastructure.db_models import (
+    CatalogChapter,
+    CatalogChapterRelease,
+    CatalogSourceState,
+    ChapterDownloadIntent,
+    ProviderPolicy,
+    WorkJob,
+)
 from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.infrastructure.provider_telemetry import (
     ProviderTelemetry,
@@ -97,6 +104,12 @@ class SourcePollScheduler:
                 2,
                 max(2.0, adapter_settings.asura_request_interval_seconds),
             ),
+            "mangadex": (
+                self.settings.mangadex_download_concurrency,
+                4,
+                4,
+                adapter_settings.mangadex_request_interval_seconds,
+            ),
             "mangafire": (
                 self.settings.mangafire_download_concurrency,
                 4,
@@ -134,6 +147,7 @@ class SourcePollScheduler:
         with self.session_factory() as session, session.begin():
             self.storage_capacity.refresh(session)
             count += self._recover_misclassified_provider_outages(session, current)
+            count += self._recover_mangafire_token_failures(session, current)
             download_plans = DownloadPlanCoordinator(self.queue)
             if self._due("download_bootstrap", current, timedelta(hours=6)):
                 download_plans.bootstrap(session)
@@ -267,6 +281,71 @@ class SourcePollScheduler:
             failed.error_message = (
                 f"Automatically requeued as job #{replacement.id} after a temporary "
                 "provider-origin outage."
+            )
+            failed.updated_at = current
+            recovered += 1
+        return recovered
+
+    def _recover_mangafire_token_failures(
+        self,
+        session: Session,
+        current: datetime,
+        *,
+        limit: int = 50,
+    ) -> int:
+        """Retry terminal MangaFire 403s created before rotating VRF support."""
+        rows = session.scalars(
+            select(WorkJob)
+            .where(
+                WorkJob.kind == JobKind.CHAPTER_DOWNLOAD.value,
+                WorkJob.source == "mangafire",
+                WorkJob.status == "failed",
+                WorkJob.error_code == "http_403",
+            )
+            .order_by(WorkJob.id)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        ).all()
+        recovered = 0
+        for failed in rows:
+            release_id = int((failed.payload or {}).get("chapter_release_id") or 0)
+            release = session.get(CatalogChapterRelease, release_id)
+            if release is None:
+                failed.error_code = "mangafire_token_recovery_skipped"
+                continue
+            chapter = session.get(CatalogChapter, release.chapter_id)
+            if chapter is None:
+                failed.error_code = "mangafire_token_recovery_skipped"
+                continue
+            release.downloadable_after = None
+            replacement, created = self.queue.enqueue(
+                session,
+                kind=JobKind.CHAPTER_DOWNLOAD,
+                dedupe_key=f"chapter:{chapter.id}",
+                payload=failed.payload,
+                priority=failed.priority,
+                max_attempts=max(failed.max_attempts, 4),
+                available_at=current,
+                source="mangafire",
+                series_key=str(chapter.series_id),
+                workflow_key=failed.workflow_key,
+                group_key=failed.group_key,
+            )
+            if not created:
+                continue
+            intent = session.scalar(
+                select(ChapterDownloadIntent).where(
+                    ChapterDownloadIntent.chapter_id == chapter.id
+                )
+            )
+            if intent is not None:
+                intent.job_id = replacement.id
+                intent.state = "queued"
+                intent.updated_at = current
+            failed.error_code = "mangafire_token_requeued"
+            failed.error_message = (
+                f"Automatically requeued as job #{replacement.id} after MangaFire "
+                "introduced rotating API request tokens."
             )
             failed.updated_at = current
             recovered += 1

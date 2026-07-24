@@ -7,9 +7,10 @@ import re
 from urllib.parse import urlencode, urljoin, urlparse
 
 from bs4 import BeautifulSoup
+import httpx
 
 from app.adapters.asura import dedupe_chapters, dedupe_series, listing_diagnostics
-from app.adapters.base import FrontierSentinel, SourceAdapter
+from app.adapters.base import FrontierSentinel, SourceAdapter, SourceRateLimited
 from app.adapters.http import (
     HttpSourceClient,
     enumerate_async,
@@ -17,6 +18,7 @@ from app.adapters.http import (
     page_concurrency_for_source,
 )
 from app.adapters.parsing import image_attr, parse_source_date
+from app.adapters.mangafire_vrf import MangaFireVrf
 from app.domain import ChapterItem, SeriesItem, normalize_chapter_number
 from app.settings import settings
 
@@ -40,6 +42,7 @@ class MangaFireAdapter(SourceAdapter):
             throttle_seconds=settings.mangafire_request_interval_seconds,
             source=self.source,
         )
+        self.vrf = MangaFireVrf(self.client)
 
     async def aclose(self) -> None:
         await self.client.aclose()
@@ -117,12 +120,14 @@ class MangaFireAdapter(SourceAdapter):
         return dedupe_series(items)
 
     async def fetch_recent_titles_page(self, *, page: int, limit: int):
-        response = await self.client.request(
-            "GET",
-            f"{self.base_url}/api/titles?{self.recent_titles_query(page=page, limit=limit)}",
-            headers=mangafire_api_headers(),
-        )
-        return response.json()
+        params: dict[str, object] = {
+            "order[chapter_updated_at]": "desc",
+            "page": page,
+            "limit": limit,
+        }
+        if settings.mangafire_discovery_mode == "hot":
+            params["hot"] = 1
+        return await self.api_json("/titles", params=params)
 
     def recent_titles_query(self, *, page: int = 1, limit: int | None = None) -> str:
         params: dict[str, object] = {
@@ -148,7 +153,7 @@ class MangaFireAdapter(SourceAdapter):
     async def get_series_detail(self, source_series: SeriesItem) -> SeriesItem:
         hid = source_series.source_id or hid_from_url(source_series.url)
         try:
-            detail = self.parse_series_detail(await self.client.get_json(f"/api/titles/{hid}"))
+            detail = self.parse_series_detail(await self.api_json(f"/titles/{hid}"))
         except Exception:
             detail = None
         if detail:
@@ -349,8 +354,9 @@ class MangaFireAdapter(SourceAdapter):
         page = 1
         try:
             while True:
-                payload = await self.client.get_json(
-                    f"/api/titles/{hid}/chapters?limit=100&page={page}&sort=number&order=desc"
+                payload = await self.api_json(
+                    f"/titles/{hid}/chapters",
+                    params={"limit": 100, "page": page, "sort": "number", "order": "desc"},
                 )
                 chapters.extend(self.parse_chapters(payload, source_series))
                 meta = api_meta(payload)
@@ -419,7 +425,7 @@ class MangaFireAdapter(SourceAdapter):
 
     async def iter_chapter_pages(self, chapter: ChapterItem, progress=None) -> AsyncIterator[bytes]:
         chapter_id = urlparse(chapter.url).path.rstrip("/").split("/")[-1]
-        payload = await self.client.get_json(f"/api/chapters/{chapter_id}")
+        payload = await self.api_json(f"/chapters/{chapter_id}")
         urls = self.parse_chapter_image_urls(payload)
         total_bytes = 0
         async for index, page in enumerate_async(
@@ -438,6 +444,41 @@ class MangaFireAdapter(SourceAdapter):
     def parse_chapter_image_urls(self, payload) -> list[str]:
         pages = (payload.get("data") or {}).get("pages") or []
         return [page.get("url", "") for page in pages if page.get("url")]
+
+    async def api_json(
+        self,
+        path: str,
+        *,
+        params: dict[str, object] | None = None,
+    ):
+        params = dict(params or {})
+        for attempt in range(2):
+            token = await self.vrf.token(path, params)
+            query = urlencode({**params, "vrf": token}, doseq=True)
+            url = f"{self.base_url}/api{path}"
+            if query:
+                url = f"{url}?{query}"
+            try:
+                response = await self.client.request(
+                    "GET",
+                    url,
+                    headers=mangafire_api_headers(),
+                )
+                return response.json()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code != 403 or attempt:
+                    if exc.response.status_code == 403:
+                        raise SourceRateLimited(
+                            "MangaFire rejected its rotating API token",
+                            source=self.source,
+                            traffic_class="origin",
+                        ) from exc
+                    raise
+                message = exc.response.text.lower()
+                if "token" not in message:
+                    raise
+                await self.vrf.refresh()
+        raise RuntimeError("unreachable")
 
 
 def api_items(payload) -> list[dict]:

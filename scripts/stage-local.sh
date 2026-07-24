@@ -209,7 +209,8 @@ docker run -d --name "$web" --network "$network" --restart unless-stopped --memo
   -p "$stage_bind_address:${STAGE_PORT:-18000}:8000" \
   --log-opt max-size=10m --log-opt max-file=3 \
   -e "V2_DATABASE_URL=$database_url" -e V2_STORAGE_ROOT=/data \
-  -e "V2_ENABLE_ASURA=$sources_enabled" -e "V2_ENABLE_MANGAFIRE=$sources_enabled" \
+  -e "V2_ENABLE_ASURA=$sources_enabled" -e "V2_ENABLE_MANGADEX=$sources_enabled" \
+  -e "V2_ENABLE_MANGAFIRE=$sources_enabled" \
   -e "V2_ENABLE_KINGOFSHOJO=$sources_enabled" \
   -e "V2_MIN_FREE_BYTES=$stage_min_free_bytes" \
   -e "KAVITA_URL=${KAVITA_URL:-}" -e "KAVITA_API_KEY=${KAVITA_API_KEY:-}" \
@@ -221,7 +222,8 @@ docker run -d --name "$worker" --network "$network" --restart unless-stopped --m
   --health-cmd "manga-manager doctor" --health-interval 30s \
   --health-timeout 10s --health-start-period 30s --health-retries 3 \
   -e "V2_DATABASE_URL=$database_url" -e V2_STORAGE_ROOT=/data \
-  -e "V2_ENABLE_ASURA=$sources_enabled" -e "V2_ENABLE_MANGAFIRE=$sources_enabled" \
+  -e "V2_ENABLE_ASURA=$sources_enabled" -e "V2_ENABLE_MANGADEX=$sources_enabled" \
+  -e "V2_ENABLE_MANGAFIRE=$sources_enabled" \
   -e "V2_ENABLE_KINGOFSHOJO=$sources_enabled" \
   -e "V2_MIN_FREE_BYTES=$stage_min_free_bytes" \
   -e "KAVITA_URL=${KAVITA_URL:-}" -e "KAVITA_API_KEY=${KAVITA_API_KEY:-}" \

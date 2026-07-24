@@ -1,12 +1,13 @@
 # Provider concurrency tuning
 
-Normal starting limits are Asura 1 job/1 page, MangaFire 2 jobs/4 pages, and KingOfShojo 2 jobs/4
-pages, with one chapter per canonical series and eight chapter jobs globally. Source pulls use one
-independent pool per provider, so all three may pull concurrently.
+Normal starting limits are Asura 1 job/1 page, MangaDex 2 jobs/4 pages, MangaFire 2 jobs/4 pages,
+and KingOfShojo 2 jobs/4 pages, with one chapter per canonical series and eight chapter jobs
+globally. Source pulls use one independent pool per provider, so all four may pull concurrently.
 
 A source pull reads the provider's update-ordered feed and persists its frontier. Asura is scoped to
-the `Latest Updates` section (not the preceding trending shelf), KingOfShojo uses
-`/manga/?order=update`, and MangaFire uses its chapter-update JSON ordering. Every row on a fetched
+the `Latest Updates` section (not the preceding trending shelf), MangaDex uses its official English
+chapter feed, KingOfShojo uses `/manga/?order=update`, and MangaFire uses its chapter-update JSON
+ordering. Every row on a fetched
 page is inspected; following pages are fetched until three saved series/chapter sentinels agree, the
 listing ends, or the configured recent-page safety window is reached. Changed series become
 deduplicated `source_refresh` jobs in the same provider pool, preventing one malformed or slow series
@@ -33,6 +34,7 @@ Run bounded experiments only against content you may access:
 
 ```bash
 UV_CACHE_DIR=/tmp/uv-cache uv run manga-manager benchmark-workers --source asura --concurrency 1 --traffic both
+UV_CACHE_DIR=/tmp/uv-cache uv run manga-manager benchmark-workers --source mangadex --concurrency 2 --traffic both
 UV_CACHE_DIR=/tmp/uv-cache uv run manga-manager benchmark-workers --source mangafire --concurrency 2 --traffic both
 UV_CACHE_DIR=/tmp/uv-cache uv run manga-manager benchmark-workers --source kingofshojo --concurrency 2 --traffic both
 ```

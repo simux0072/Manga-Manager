@@ -14,10 +14,71 @@ from app.adapters.http import (
 )
 from app.adapters.base import FrontierSentinel, SourceRateLimited
 from app.adapters.kingofshojo import KingOfShojoAdapter
+from app.adapters.mangadex import (
+    MangaDexAdapter,
+    select_chapter_releases,
+    series_from_chapter,
+)
 from app.adapters.mangafire import MangaFireAdapter
 from app.adapters.http import iter_ordered_bytes
 from app.adapters.parsing import extract_image_urls
 from app.domain import SeriesItem
+
+
+class StaticVrf:
+    def __init__(self) -> None:
+        self.refreshes = 0
+
+    async def token(self, _path: str, _params: dict[str, object]) -> str:
+        return "test-token"
+
+    async def refresh(self) -> None:
+        self.refreshes += 1
+
+
+def mangadex_chapter(
+    release_id: str,
+    *,
+    number: str = "12",
+    language: str = "en",
+    manga_id: str = "manga-id",
+    group: str = "Group",
+    official: bool = False,
+    verified: bool = False,
+    pages: int = 20,
+) -> dict:
+    return {
+        "id": release_id,
+        "type": "chapter",
+        "attributes": {
+            "chapter": number,
+            "title": "",
+            "translatedLanguage": language,
+            "pages": pages,
+            "readableAt": "2026-07-24T08:00:00+00:00",
+        },
+        "relationships": [
+            {
+                "id": manga_id,
+                "type": "manga",
+                "attributes": {
+                    "title": {"en": "Example Manga"},
+                    "altTitles": [{"ja-ro": "Example"}],
+                    "description": {"en": "Summary"},
+                    "tags": [],
+                },
+            },
+            {
+                "id": f"group-{release_id}",
+                "type": "scanlation_group",
+                "attributes": {
+                    "name": group,
+                    "official": official,
+                    "verified": verified,
+                },
+            },
+        ],
+    }
 
 
 def test_extract_image_urls_supports_lazy_attrs_and_scripts():
@@ -649,6 +710,7 @@ async def test_mangafire_recent_frontier_uses_titles_api_with_browser_headers(mo
         "https://mangafire.to",
         transport=httpx.MockTransport(handler),
     )
+    adapter.vrf = StaticVrf()
     try:
         items = await adapter.list_recent_frontier([])
     finally:
@@ -658,6 +720,150 @@ async def test_mangafire_recent_frontier_uses_titles_api_with_browser_headers(mo
     assert items[0].source_id == "gl3"
     assert items[0].cover_url == "https://img.example/large.jpg"
     assert items[0].metadata["recent_chapters"][0]["number"] == "61"
+
+
+async def test_mangafire_api_refreshes_rejected_rotating_token():
+    requests = 0
+
+    async def handler(request):
+        nonlocal requests
+        requests += 1
+        assert request.url.params["vrf"] == "test-token"
+        if requests == 1:
+            return httpx.Response(403, json={"message": "Missing token."}, request=request)
+        return httpx.Response(200, json={"data": {"pages": []}}, request=request)
+
+    adapter = MangaFireAdapter()
+    adapter.client = HttpSourceClient(
+        "https://mangafire.to",
+        transport=httpx.MockTransport(handler),
+        source="mangafire",
+    )
+    adapter.vrf = StaticVrf()
+    try:
+        assert await adapter.api_json("/chapters/release-id") == {"data": {"pages": []}}
+    finally:
+        await adapter.aclose()
+
+    assert requests == 2
+    assert adapter.vrf.refreshes == 1
+
+
+def test_mangadex_latest_feed_keeps_only_configured_language():
+    english = series_from_chapter(mangadex_chapter("english"))
+    japanese = series_from_chapter(mangadex_chapter("japanese", language="ja"))
+
+    assert english is not None
+    assert english.source == "mangadex"
+    assert english.source_id == "manga-id"
+    assert english.metadata["latest_chapter"] == "12"
+    assert japanese is None
+
+
+def test_mangadex_duplicate_chapters_prefer_official_then_verified_release():
+    source = SeriesItem(
+        source="mangadex",
+        source_id="manga-id",
+        title="Example Manga",
+        url="https://mangadex.org/title/manga-id",
+    )
+    rows = [
+        mangadex_chapter("unverified", group="Unofficial"),
+        mangadex_chapter("verified", group="Verified", verified=True),
+        mangadex_chapter("official", group="Official", official=True),
+        mangadex_chapter("other-language", language="es", official=True),
+        mangadex_chapter("next-chapter", number="13", verified=True),
+    ]
+
+    chapters = select_chapter_releases(rows, source)
+
+    assert [chapter.number for chapter in chapters] == ["12", "13"]
+    assert chapters[0].metadata["release_id"] == "official"
+    assert chapters[0].metadata["quality_rank"] > chapters[1].metadata["quality_rank"]
+    assert {
+        row["release_id"] for row in chapters[0].metadata["alternate_releases"]
+    } == {"unverified", "verified"}
+
+
+def test_mangadex_duplicate_chapters_prefer_more_complete_release_within_tier():
+    source = SeriesItem(
+        source="mangadex",
+        source_id="manga-id",
+        title="Example Manga",
+        url="https://mangadex.org/title/manga-id",
+    )
+    shorter = mangadex_chapter(
+        "shorter",
+        verified=True,
+        pages=9,
+    )
+    shorter["attributes"]["readableAt"] = "2026-07-24T09:00:00+00:00"
+    complete = mangadex_chapter(
+        "complete",
+        verified=True,
+        pages=28,
+    )
+    complete["attributes"]["readableAt"] = "2026-07-23T09:00:00+00:00"
+
+    chapters = select_chapter_releases(
+        [shorter, complete],
+        source,
+    )
+
+    assert [chapter.metadata["release_id"] for chapter in chapters] == ["complete"]
+    assert chapters[0].metadata["alternate_releases"][0]["release_id"] == "shorter"
+
+
+async def test_mangadex_at_home_download_uses_original_not_data_saver_pages():
+    requested: list[str] = []
+
+    async def api_handler(request):
+        requested.append(str(request.url))
+        return httpx.Response(
+            200,
+            json={
+                "baseUrl": "https://uploads.mangadex.test",
+                "chapter": {
+                    "hash": "hash",
+                    "data": ["001.png", "002.png"],
+                    "dataSaver": ["001-low.jpg", "002-low.jpg"],
+                },
+            },
+            request=request,
+        )
+
+    async def image_handler(request):
+        requested.append(str(request.url))
+        return httpx.Response(
+            200,
+            headers={"content-type": "image/png"},
+            content=request.url.path.encode(),
+            request=request,
+        )
+
+    adapter = MangaDexAdapter()
+    adapter.at_home_client = HttpSourceClient(
+        "https://api.mangadex.org",
+        transport=httpx.MockTransport(api_handler),
+        source="mangadex",
+    )
+    adapter.client = HttpSourceClient(
+        "https://api.mangadex.org",
+        transport=httpx.MockTransport(image_handler),
+        source="mangadex",
+    )
+    chapter = select_chapter_releases(
+        [mangadex_chapter("release-id")],
+        SeriesItem("mangadex", "manga-id", "Example", "https://mangadex.org/title/manga-id"),
+    )[0]
+    try:
+        pages = await adapter.download_chapter_pages(chapter)
+    finally:
+        await adapter.aclose()
+
+    assert len(pages) == 2
+    assert any("/data/hash/001.png" in url for url in requested)
+    assert all("data-saver" not in url and "-low.jpg" not in url for url in requested)
 
 
 async def test_asura_second_page_404_is_normal_pagination_end(monkeypatch):
@@ -911,6 +1117,7 @@ async def test_mangafire_recent_frontier_imports_api_rows_when_homepage_is_js_sh
         "https://mangafire.to",
         transport=httpx.MockTransport(handler),
     )
+    adapter.vrf = StaticVrf()
     try:
         items = await adapter.list_recent_frontier([])
     finally:
@@ -957,6 +1164,7 @@ async def test_mangafire_recent_frontier_stops_after_api_sentinel_hits(monkeypat
         "https://mangafire.to",
         transport=httpx.MockTransport(handler),
     )
+    adapter.vrf = StaticVrf()
     try:
         items = await adapter.list_recent_frontier([FrontierSentinel("known", "10")])
     finally:
@@ -996,6 +1204,7 @@ async def test_mangafire_frontier_honors_configured_window_beyond_three_pages(mo
     adapter.client = HttpSourceClient(
         "https://mangafire.to", transport=httpx.MockTransport(handler)
     )
+    adapter.vrf = StaticVrf()
     try:
         items = await adapter.list_recent_frontier([FrontierSentinel("known", "10")])
     finally:
@@ -1038,6 +1247,7 @@ async def test_mangafire_recent_frontier_falls_back_to_html_when_api_fails(monke
         "https://mangafire.to",
         transport=httpx.MockTransport(handler),
     )
+    adapter.vrf = StaticVrf()
     try:
         items = await adapter.list_recent_frontier([])
     finally:

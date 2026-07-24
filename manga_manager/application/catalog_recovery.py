@@ -15,6 +15,7 @@ from manga_manager.domain.jobs import (
     SourcePullPayload,
     SourceRefreshPayload,
 )
+from manga_manager.domain.providers import provider_names
 from manga_manager.infrastructure.db_models import (
     CatalogMatchDecision,
     CatalogObservation,
@@ -211,7 +212,7 @@ class CatalogRecovery:
                     session.add(series)
                     session.flush()
                     for source, source_id in legacy_row["identities"]:
-                        if source not in {"asura", "mangafire", "kingofshojo"}:
+                        if source not in set(provider_names()):
                             continue
                         session.add(
                             CatalogSourceSeries(
@@ -243,7 +244,7 @@ class CatalogRecovery:
                             payload_json={**asdict(record), "resulting_series_id": series.id},
                         )
                     )
-            for source in sorted(refresh_sources & {"asura", "mangafire", "kingofshojo"}):
+            for source in sorted(refresh_sources & set(provider_names())):
                 self.queue.enqueue(
                     session,
                     kind=JobKind.SOURCE_PULL,
@@ -258,7 +259,7 @@ class CatalogRecovery:
                 )
             ):
                 if (
-                    identity.source not in {"asura", "mangafire", "kingofshojo"}
+                    identity.source not in set(provider_names())
                     or not identity.url
                 ):
                     continue
