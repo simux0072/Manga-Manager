@@ -51,6 +51,7 @@ class WorkerSettings:
     retry_base: timedelta = timedelta(seconds=30)
     retry_cap: timedelta = timedelta(hours=1)
     pool_limits: Mapping[str, int] | None = None
+    provider_pacing_window_seconds: float = 2.0
 
     def __post_init__(self) -> None:
         if self.lease_for <= timedelta(0):
@@ -63,6 +64,8 @@ class WorkerSettings:
             raise ValueError("poll_interval must be positive")
         if self.retry_base <= timedelta(0) or self.retry_cap < self.retry_base:
             raise ValueError("retry delays are invalid")
+        if self.provider_pacing_window_seconds <= 0:
+            raise ValueError("provider pacing window must be positive")
 
 
 class JobWorker:
@@ -209,6 +212,7 @@ class JobWorker:
                 now=self.clock(),
                 kinds=self.claim_kinds,
                 pool_limits=dict(self.settings.pool_limits or {}),
+                provider_pacing_window_seconds=self.settings.provider_pacing_window_seconds,
                 pools=self.claim_pools,
             )
 

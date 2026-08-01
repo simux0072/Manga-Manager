@@ -312,6 +312,20 @@ class JobQueue:
     ) -> Select[tuple[WorkJob]]:
         current = now or utcnow()
         leased_for_series = aliased(WorkJob)
+        active_for_group = aliased(WorkJob)
+        active_group_load = (
+            select(func.count())
+            .select_from(active_for_group)
+            .where(active_for_group.group_key == WorkJob.group_key)
+            .where(active_for_group.status == JobState.LEASED.value)
+            .where(active_for_group.lease_expires_at > current)
+            .correlate(WorkJob)
+            .scalar_subquery()
+        )
+        fairness_load = case(
+            (WorkJob.kind == JobKind.CHAPTER_DOWNLOAD.value, active_group_load),
+            else_=0,
+        )
         scheduling_tier = case(
             (WorkJob.kind == JobKind.CHAPTER_DOWNLOAD.value, 0),
             (
@@ -363,13 +377,29 @@ class JobQueue:
                 or_(
                     WorkJob.kind.not_in(MUTATING_JOB_KINDS),
                     WorkJob.series_key == "",
-                    ~select(leased_for_series.id)
-                    .where(leased_for_series.id != WorkJob.id)
-                    .where(leased_for_series.kind.in_(MUTATING_JOB_KINDS))
-                    .where(leased_for_series.status == JobState.LEASED.value)
-                    .where(leased_for_series.series_key == WorkJob.series_key)
-                    .where(leased_for_series.lease_expires_at > current)
-                    .exists(),
+                    and_(
+                        WorkJob.kind == JobKind.CHAPTER_DOWNLOAD.value,
+                        ~select(leased_for_series.id)
+                        .where(leased_for_series.id != WorkJob.id)
+                        .where(
+                            leased_for_series.kind
+                            == JobKind.LIBRARY_REPAIR.value
+                        )
+                        .where(leased_for_series.status == JobState.LEASED.value)
+                        .where(leased_for_series.series_key == WorkJob.series_key)
+                        .where(leased_for_series.lease_expires_at > current)
+                        .exists(),
+                    ),
+                    and_(
+                        WorkJob.kind == JobKind.LIBRARY_REPAIR.value,
+                        ~select(leased_for_series.id)
+                        .where(leased_for_series.id != WorkJob.id)
+                        .where(leased_for_series.kind.in_(MUTATING_JOB_KINDS))
+                        .where(leased_for_series.status == JobState.LEASED.value)
+                        .where(leased_for_series.series_key == WorkJob.series_key)
+                        .where(leased_for_series.lease_expires_at > current)
+                        .exists(),
+                    ),
                 )
             )
             .where(
@@ -383,6 +413,7 @@ class JobQueue:
             )
             .order_by(
                 scheduling_tier.asc(),
+                fairness_load.asc(),
                 WorkJob.priority.asc(),
                 WorkJob.available_at.asc(),
                 WorkJob.id.asc(),
@@ -424,6 +455,7 @@ class JobQueue:
         now: datetime | None = None,
         kinds: Collection[JobKind] | None = None,
         pool_limits: dict[str, int] | None = None,
+        provider_pacing_window_seconds: float = 2.0,
         pools: Collection[str] | None = None,
     ) -> JobLease | None:
         worker = owner.strip()
@@ -490,6 +522,7 @@ class JobQueue:
                 expires_at=current + lease_for,
                 now=current,
                 limits=limits,
+                provider_pacing_window_seconds=provider_pacing_window_seconds,
             ):
                 job = candidate
                 break
@@ -1047,6 +1080,7 @@ class JobQueue:
         expires_at: datetime,
         now: datetime,
         limits: dict[str, int],
+        provider_pacing_window_seconds: float,
     ) -> bool:
         if job.kind in MUTATING_JOB_KINDS and job.series_key:
             series_lock = f"library-series:{job.series_key}"
@@ -1055,9 +1089,14 @@ class JobQueue:
                     text("SELECT pg_advisory_xact_lock(hashtext(:series_lock))"),
                     {"series_lock": series_lock},
                 )
+            conflicting_kinds = (
+                {JobKind.LIBRARY_REPAIR.value}
+                if job.kind == JobKind.CHAPTER_DOWNLOAD.value
+                else MUTATING_JOB_KINDS
+            )
             leased_for_series = session.scalar(
                 select(WorkJob.id)
-                .where(WorkJob.kind.in_(MUTATING_JOB_KINDS))
+                .where(WorkJob.kind.in_(conflicting_kinds))
                 .where(WorkJob.status == JobState.LEASED.value)
                 .where(WorkJob.series_key == job.series_key)
                 .where(WorkJob.lease_expires_at > now)
@@ -1073,18 +1112,50 @@ class JobQueue:
         pools = sorted(set(filter(None, pools)))
         for pool in pools:
             limit = limits.get(pool)
-            if pool.startswith("download:") and job.source:
+            if pool.startswith(("download:", "refresh:")) and job.source:
                 policy = session.get(ProviderPolicy, job.source)
                 if policy is not None and (
                     policy.expires_at is None or aware_datetime(policy.expires_at) > now
                 ):
-                    limit = policy.learned_job_limit
+                    # A clean provider may expand to the shared network ceiling.
+                    # Slow request pacing prevents workers from piling up inside
+                    # the adapter, while a recently limited provider temporarily
+                    # falls back to its learned safe tier until a clean poll.
+                    if policy.request_interval_seconds > 0:
+                        pacing_limit = max(
+                            1,
+                            int(
+                                provider_pacing_window_seconds
+                                / policy.request_interval_seconds
+                            ),
+                        )
+                        limit = min(limit, pacing_limit) if limit is not None else pacing_limit
+                    limited_at = (
+                        aware_datetime(policy.last_limited_at)
+                        if policy.last_limited_at is not None
+                        else None
+                    )
+                    clean_since = (
+                        aware_datetime(policy.clean_since)
+                        if policy.clean_since is not None
+                        else None
+                    )
+                    if limited_at is not None and (
+                        clean_since is None or clean_since <= limited_at
+                    ):
+                        learned_limit = max(1, policy.learned_job_limit)
+                        limit = (
+                            min(limit, learned_limit)
+                            if limit is not None
+                            else learned_limit
+                        )
                     metadata = dict(policy.metadata_json or {})
                     until = metadata.get("exploration_until")
                     if until:
                         try:
                             if datetime.fromisoformat(str(until)) > now:
-                                limit = max(limit, int(metadata.get("exploration_tier") or limit))
+                                explored = int(metadata.get("exploration_tier") or limit or 1)
+                                limit = max(limit or 1, explored)
                         except ValueError:
                             pass
             if limit is None:

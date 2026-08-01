@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 
 from sqlalchemy.orm import Session
 
+import manga_manager.infrastructure.database as database_module
 from manga_manager.infrastructure.db_models import WorkJob
 from manga_manager.infrastructure.database import (
     create_database_engine,
@@ -22,6 +23,28 @@ from manga_manager.infrastructure.database import (
 def test_runtime_rejects_non_postgresql_database() -> None:
     with pytest.raises(ValueError, match="requires a PostgreSQL"):
         create_database_engine("sqlite:///:memory:")
+
+
+def test_web_database_pool_has_bounded_browser_burst_capacity(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+    sentinel = object()
+
+    def fake_create_engine(database_url: str, **options):
+        captured["database_url"] = database_url
+        captured.update(options)
+        return sentinel
+
+    monkeypatch.setattr(database_module, "create_engine", fake_create_engine)
+
+    engine = create_database_engine(
+        "postgresql+psycopg://manga:manga@postgres:5432/manga_manager",
+        role="web",
+    )
+
+    assert engine is sentinel
+    assert captured["pool_size"] == 8
+    assert captured["max_overflow"] == 4
+    assert captured["pool_timeout"] == 10
 
 
 def test_v2_migration_builds_job_constraints_and_indexes(tmp_path: Path) -> None:
@@ -78,7 +101,7 @@ def test_v2_migration_builds_job_constraints_and_indexes(tmp_path: Path) -> None
         "uq_job_active_dedupe",
         "ix_job_pool_claim",
         "ix_job_source_status",
-        "uq_job_leased_chapter_series",
+        "uq_job_leased_library_repair_series",
     } <= indexes
     checks = {constraint["name"] for constraint in inspector.get_check_constraints("job")}
     assert {
@@ -97,7 +120,7 @@ def test_v2_migration_builds_job_constraints_and_indexes(tmp_path: Path) -> None
     sessions = create_session_factory(engine)
     with sessions() as session:
         version = session.scalar(text("SELECT version_num FROM alembic_version"))
-    assert version == "0024_elastic_network_workers"
+    assert version == "0025_shared_worker_fairness"
 
 
 def test_catalog_recovery_migration_downgrades_and_reapplies_on_sqlite(tmp_path: Path) -> None:
@@ -113,7 +136,7 @@ def test_catalog_recovery_migration_downgrades_and_reapplies_on_sqlite(tmp_path:
 
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0024_elastic_network_workers"
+            "0025_shared_worker_fairness"
         )
 
 

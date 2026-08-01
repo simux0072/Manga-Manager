@@ -11,6 +11,7 @@ from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import String, and_, case, func, or_, select
 from sqlalchemy.orm import Session, aliased, sessionmaker
+from starlette.concurrency import run_in_threadpool
 
 from app.kavita import configured_kavita_client
 
@@ -1858,6 +1859,7 @@ def create_api_router(
             ],
             "permits": permit_counts,
             "scheduler": {
+                "shared_worker_capacity": settings.worker_concurrency,
                 "network_capacity": settings.network_worker_concurrency,
                 "network_in_use": int(permit_counts.get("network_global", 0)),
                 "pool_limits": settings.pool_limits(),
@@ -2066,7 +2068,9 @@ def create_api_router(
         async def stream():
             cursor = after
             while not await request.is_disconnected():
-                rows, counts = load_event_batch(cursor)
+                # This route is intentionally async for streaming, but SQLAlchemy is synchronous.
+                # Keep pool waits and queries off the event loop just like the normal sync routes.
+                rows, counts = await run_in_threadpool(load_event_batch, cursor)
                 for payload in rows:
                     cursor = int(payload["event_id"])
                     yield f"id: {cursor}\nevent: job\ndata: {json.dumps(payload)}\n\n"

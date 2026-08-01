@@ -891,7 +891,18 @@ async def run_worker_benchmark(
     from manga_manager.infrastructure.provider_telemetry import ProviderTelemetry
 
     field = f"{source}_download_concurrency"
-    benchmark_settings = settings.model_copy(update={field: concurrency})
+    benchmark_settings = settings.model_copy(
+        update={
+            field: concurrency,
+            "worker_concurrency": concurrency,
+            "network_worker_concurrency": max(
+                concurrency, settings.network_worker_concurrency
+            ),
+            "global_chapter_concurrency": max(
+                concurrency, settings.global_chapter_concurrency
+            ),
+        }
+    )
     sessions = create_session_factory(engine)
     scheduler = ProviderRequestScheduler(sessions)
     telemetry = ProviderTelemetry(sessions)

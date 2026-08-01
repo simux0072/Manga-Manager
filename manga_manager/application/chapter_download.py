@@ -466,6 +466,7 @@ class ChapterDownloadHandler:
             state.updated_at = utcnow()
             policy = session.get(ProviderPolicy, source)
             if policy is not None and cooldown_until is not None:
+                limited_at = utcnow()
                 metadata = dict(policy.metadata_json or {})
                 metadata.update(
                     {
@@ -476,6 +477,8 @@ class ChapterDownloadHandler:
                 )
                 policy.metadata_json = metadata
                 policy.clean_since = None
+                policy.last_limited_at = limited_at
+                policy.learned_job_limit = max(1, policy.learned_job_limit // 2)
             endpoint = session.scalar(
                 select(ProviderEndpointState).where(
                     ProviderEndpointState.source == source,

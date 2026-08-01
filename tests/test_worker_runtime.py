@@ -176,7 +176,7 @@ async def test_idle_worker_returns_without_handler_call(sessions: TrackingSessio
     assert called is False
 
 
-def test_network_workers_share_provider_pools(
+def test_all_workers_share_every_available_pool(
     sessions: TrackingSessionFactory,
 ) -> None:
     async def handler(_context) -> None:
@@ -188,8 +188,8 @@ def test_network_workers_share_provider_pools(
         settings=V2Settings(),
     )
     specs = service._pool_specs()
-    assert len(specs) == service.settings.network_worker_concurrency
-    assert {spec.name for spec in specs} == {"network"}
+    assert len(specs) == service.settings.worker_concurrency
+    assert {spec.name for spec in specs} == {"shared"}
     expected = {
         f"{traffic}:{source}"
         for source in ("asura", "mangadex", "mangafire", "kingofshojo")
@@ -212,6 +212,6 @@ def test_maintenance_worker_claims_repairs_and_catalog_rescores(
     )
     specs = service._pool_specs()
     assert len(specs) == 1
-    assert specs[0].name == "maintenance"
+    assert specs[0].name == "shared"
     assert specs[0].claim_pools == {"maintenance"}
     assert specs[0].kinds == {JobKind.LIBRARY_REPAIR, JobKind.MAINTENANCE}

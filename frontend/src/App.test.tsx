@@ -6,8 +6,14 @@ import {afterEach, beforeEach, describe, expect, it, vi} from 'vitest'
 import {App} from './App'
 
 class EventSourceMock {
-  addEventListener = vi.fn()
+  static instances:EventSourceMock[]=[]
+  listeners=new Map<string,((event:Event)=>void)[]>()
+  constructor(){EventSourceMock.instances.push(this)}
+  addEventListener = vi.fn((type:string,listener:(event:Event)=>void)=>{
+    this.listeners.set(type,[...(this.listeners.get(type)||[]),listener])
+  })
   close = vi.fn()
+  emit(type:string,event:Event){this.listeners.get(type)?.forEach(listener=>listener(event))}
 }
 
 const series = {
@@ -42,6 +48,7 @@ function renderApp(path='/discovery'){
 
 describe('media library frontend',()=>{
   beforeEach(()=>{
+    EventSourceMock.instances=[]
     vi.stubGlobal('EventSource',EventSourceMock)
     vi.stubGlobal('fetch',vi.fn((input:string|URL|Request)=>{
       const url=String(input)
@@ -53,6 +60,30 @@ describe('media library frontend',()=>{
     }))
   })
   afterEach(()=>vi.unstubAllGlobals())
+
+  it('coalesces a burst of job events into one operations refresh',async()=>{
+    renderApp()
+    await screen.findByText(series.title)
+    const requestMock=fetch as ReturnType<typeof vi.fn>
+    const operationRequests=()=>requestMock.mock.calls.filter(call=>String(call[0]).includes('/api/v2/operations')).length
+    const before=operationRequests()
+    const stream=EventSourceMock.instances.at(-1)
+    expect(stream).toBeDefined()
+
+    act(()=>{
+      for(let eventId=1;eventId<=100;eventId++){
+        stream!.emit('job',new MessageEvent('job',{
+          data:JSON.stringify({kind:'source_refresh',type:'succeeded',state:'succeeded'}),
+          lastEventId:String(eventId),
+        }))
+      }
+      stream!.emit('counts',new MessageEvent('counts',{data:'{}'}))
+    })
+
+    await waitFor(()=>expect(operationRequests()).toBe(before+1))
+    await new Promise(resolve=>setTimeout(resolve,350))
+    expect(operationRequests()).toBe(before+1)
+  })
 
   it('searches while typing and applies multiple sources immediately',async()=>{
     renderApp()

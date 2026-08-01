@@ -295,7 +295,7 @@ def test_postgres_network_priority_uses_explicit_acquisition_flag(sessions) -> N
     assert claimed == expected
 
 
-def test_per_series_cap_is_atomic_across_workers(sessions) -> None:
+def test_same_series_parallel_claims_are_atomic_across_workers(sessions) -> None:
     _engine, factory = sessions
     with factory() as session, session.begin():
         for release_id in (1, 2):
@@ -324,7 +324,8 @@ def test_per_series_cap_is_atomic_across_workers(sessions) -> None:
 
     with ThreadPoolExecutor(max_workers=2) as executor:
         claims = list(executor.map(claim, ["worker-a", "worker-b"]))
-    assert sum(job_id is not None for job_id in claims) == 1
+    assert sum(job_id is not None for job_id in claims) == 2
+    assert len(set(claims)) == 2
 
 
 def test_storage_reservation_cap_is_atomic_across_workers(sessions, tmp_path: Path) -> None:
@@ -394,7 +395,7 @@ def test_diagnostic_bundle_is_bounded_and_redacted(sessions, tmp_path: Path) -> 
         recent_failure_limit=1,
     )
 
-    assert payload["migration"] == "0024_elastic_network_workers"
+    assert payload["migration"] == "0025_shared_worker_fairness"
     assert payload["database_bytes"] > 0
     assert len(payload["recent_failures"]) == 1
     assert "secret" not in payload["recent_failures"][0]["error_message"]
@@ -410,7 +411,7 @@ def test_v2_migrations_round_trip_on_postgresql(sessions) -> None:
     command.upgrade(config, "head")
     with Session(create_engine(DATABASE_URL)) as session:
         assert session.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0024_elastic_network_workers"
+            "0025_shared_worker_fairness"
         )
         indexes = set(
             session.scalars(

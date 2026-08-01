@@ -91,48 +91,45 @@ class WorkerService:
         if self.pools is not None:
             network_pools = network_pools.intersection(self.pools)
 
-        specs: list[WorkerSlotSpec] = []
-        if network_kinds and network_pools:
-            if self.pools is None or len(network_pools) > 1:
-                count = self.settings.network_worker_concurrency
-            else:
-                only_pool = next(iter(network_pools))
-                count = self.settings.pool_limits().get(only_pool, 1)
-            for _ in range(count):
-                specs.append(
-                    WorkerSlotSpec(
-                        slot=len(specs) + 1,
-                        name="network",
-                        claim_pools=network_pools,
-                        kinds=frozenset(network_kinds),
-                    )
-                )
-
         requested = [
-            ("kavita", 1, {JobKind.KAVITA_SYNC}),
-            # Catalog rescoring is a maintenance job routed to this pool.  Keeping
-            # LIBRARY_REPAIR and MAINTENANCE in one single-slot lane protects the
-            # storage-heavy repair work while still allowing queued catalog work
-            # to make progress.
-            ("maintenance", 1, {JobKind.LIBRARY_REPAIR, JobKind.MAINTENANCE}),
-            ("health", 1, {JobKind.MAINTENANCE}),
-            ("cover_backfill", 1, {JobKind.COVER_BACKFILL}),
+            ("kavita", {JobKind.KAVITA_SYNC}),
+            # Catalog rescoring and repair share a permit-limited pool even though
+            # every worker slot is eligible to claim either kind.
+            ("maintenance", {JobKind.LIBRARY_REPAIR, JobKind.MAINTENANCE}),
+            ("health", {JobKind.MAINTENANCE}),
+            ("cover_backfill", {JobKind.COVER_BACKFILL}),
         ]
-        for pool, count, kinds in requested:
+        shared_pools = set(network_pools)
+        shared_kinds = set(network_kinds)
+        for pool, kinds in requested:
             if self.pools is not None and pool not in self.pools:
                 continue
             if not kinds.intersection(self.handlers):
                 continue
-            for _ in range(count):
-                specs.append(
-                    WorkerSlotSpec(
-                        slot=len(specs) + 1,
-                        name=pool,
-                        claim_pools=frozenset({pool}),
-                        kinds=frozenset(kinds),
-                    )
-                )
-        return specs
+            shared_pools.add(pool)
+            shared_kinds.update(kinds.intersection(self.handlers))
+        if not shared_pools or not shared_kinds:
+            return []
+
+        if self.pools is None:
+            count = self.settings.worker_concurrency
+        else:
+            limits = self.settings.pool_limits()
+            count = min(
+                self.settings.worker_concurrency,
+                max((limits.get(pool, 1) for pool in shared_pools), default=1),
+            )
+        claim_pools = frozenset(shared_pools)
+        kinds = frozenset(shared_kinds)
+        return [
+            WorkerSlotSpec(
+                slot=slot,
+                name="shared",
+                claim_pools=claim_pools,
+                kinds=kinds,
+            )
+            for slot in range(1, count + 1)
+        ]
 
     async def _run_slot(
         self,
@@ -169,6 +166,9 @@ class WorkerService:
                 retry_base=timedelta(seconds=self.settings.retry_base_seconds),
                 retry_cap=timedelta(seconds=self.settings.retry_cap_seconds),
                 pool_limits=self.settings.pool_limits(),
+                provider_pacing_window_seconds=(
+                    self.settings.provider_pacing_window_seconds
+                ),
             ),
         )
         try:

@@ -356,6 +356,8 @@ class CatalogRepository:
             policy.clean_since = None
             update_poll_cadence(policy, successful=False, changed=False)
             if cooldown_until is not None:
+                policy.last_limited_at = utcnow()
+                policy.learned_job_limit = max(1, policy.learned_job_limit // 2)
                 seconds = max(60, int((cooldown_until - utcnow()).total_seconds()))
                 policy.cooldown_seconds = max(policy.cooldown_seconds, seconds)
                 metadata = dict(policy.metadata_json or {})

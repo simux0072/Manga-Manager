@@ -44,6 +44,56 @@ jobs:
       - run: uv run ruff check .
       - run: uv run pytest -q
 
+  scheduler-safety:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: manga_scheduler_test
+          POSTGRES_USER: manga
+          POSTGRES_PASSWORD: manga
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U manga -d manga_scheduler_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      V2_TEST_DATABASE_URL: postgresql+psycopg://manga:manga@127.0.0.1:5432/manga_scheduler_test
+      V2_WORKER_CONCURRENCY: 24
+      V2_NETWORK_WORKER_CONCURRENCY: 20
+      V2_GLOBAL_CHAPTER_CONCURRENCY: 20
+      V2_PROVIDER_PACING_WINDOW_SECONDS: 2
+    steps:
+      - uses: actions/checkout@v6
+      - uses: astral-sh/setup-uv@v8.3.2
+        with:
+          enable-cache: true
+          python-version: "3.12"
+      - run: uv sync --frozen --extra dev
+      - name: Check scheduler implementation
+        run: >-
+          uv run ruff check
+          manga_manager/infrastructure/job_queue.py
+          manga_manager/worker
+          manga_manager/settings.py
+          tests/test_work_queue.py
+          tests/test_worker_runtime.py
+          tests/test_postgres_job_queue.py
+      - name: Test shared-worker fairness and PostgreSQL races
+        run: >-
+          uv run pytest -q
+          tests/test_work_queue.py
+          tests/test_worker_runtime.py
+          tests/test_download_activity.py
+          tests/test_v2_settings_cli.py
+          tests/test_v2_database.py
+          tests/test_postgres_job_queue.py
+          tests/test_provider_scheduler.py
+
   arm64-image:
     runs-on: ubuntu-latest
     steps:

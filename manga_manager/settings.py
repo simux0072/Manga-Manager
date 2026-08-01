@@ -18,14 +18,19 @@ class V2Settings(BaseSettings):
 
     database_url: str = ""
     worker_id: str = Field(default_factory=default_worker_id, min_length=1, max_length=180)
-    global_chapter_concurrency: int = Field(default=8, ge=1, le=32)
-    network_worker_concurrency: int = Field(default=12, ge=1, le=64)
-    # Normal workers are deliberately fixed at one. benchmark-workers uses a scoped,
-    # non-validated model copy for the explicit two-job Asura experiment.
-    asura_download_concurrency: int = Field(default=1, ge=1, le=1)
-    mangadex_download_concurrency: int = Field(default=2, ge=1, le=8)
-    mangafire_download_concurrency: int = Field(default=2, ge=1, le=8)
-    kingofshojo_download_concurrency: int = Field(default=2, ge=1, le=8)
+    # All job kinds share these asynchronous slots. Network and chapter permits
+    # deliberately sit below the worker count so a saturated download backlog
+    # cannot starve maintenance, Kavita, or health work.
+    worker_concurrency: int = Field(default=24, ge=4, le=64)
+    global_chapter_concurrency: int = Field(default=20, ge=1, le=64)
+    network_worker_concurrency: int = Field(default=20, ge=1, le=64)
+    provider_pacing_window_seconds: float = Field(default=2.0, ge=0.25, le=30.0)
+    # Retained as provider-learning seed values and for benchmark compatibility.
+    # Normal runtime download permits are elastic up to network_global.
+    asura_download_concurrency: int = Field(default=1, ge=1, le=64)
+    mangadex_download_concurrency: int = Field(default=2, ge=1, le=64)
+    mangafire_download_concurrency: int = Field(default=2, ge=1, le=64)
+    kingofshojo_download_concurrency: int = Field(default=2, ge=1, le=64)
     asura_refresh_concurrency: int = Field(default=2, ge=1, le=8)
     mangadex_refresh_concurrency: int = Field(default=8, ge=1, le=32)
     mangafire_refresh_concurrency: int = Field(default=4, ge=1, le=16)
@@ -91,14 +96,14 @@ class V2Settings(BaseSettings):
             "pull:mangadex": 1,
             "pull:mangafire": 1,
             "pull:kingofshojo": 1,
-            "refresh:asura": self.asura_refresh_concurrency,
-            "refresh:mangadex": self.mangadex_refresh_concurrency,
-            "refresh:mangafire": self.mangafire_refresh_concurrency,
-            "refresh:kingofshojo": self.kingofshojo_refresh_concurrency,
-            "download:asura": self.asura_download_concurrency,
-            "download:mangadex": self.mangadex_download_concurrency,
-            "download:mangafire": self.mangafire_download_concurrency,
-            "download:kingofshojo": self.kingofshojo_download_concurrency,
+            "refresh:asura": self.network_worker_concurrency,
+            "refresh:mangadex": self.network_worker_concurrency,
+            "refresh:mangafire": self.network_worker_concurrency,
+            "refresh:kingofshojo": self.network_worker_concurrency,
+            "download:asura": self.network_worker_concurrency,
+            "download:mangadex": self.network_worker_concurrency,
+            "download:mangafire": self.network_worker_concurrency,
+            "download:kingofshojo": self.network_worker_concurrency,
             "chapter_global": self.global_chapter_concurrency,
             "kavita": 1,
             "maintenance": 1,

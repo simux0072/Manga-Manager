@@ -11,12 +11,42 @@ type Toast={id:number;message:string;tone?:'normal'|'error';action?:()=>void;act
 const ToastContext=createContext<(toast:Omit<Toast,'id'>)=>void>(()=>{})
 const fallbackSources=['asura','mangadex','mangafire','kingofshojo']
 const states=['interested','reading','caught_up','paused']
+const eventRefreshDelayMs=250
 
 export function App(){
   const [drawer,setDrawer]=useState(false),[toasts,setToasts]=useState<Toast[]>([])
   const queryClient=useQueryClient()
   const operations=useQuery({queryKey:['operations'],queryFn:({signal})=>api.operations(signal),refetchInterval:30_000})
-  useEffect(()=>{let last=Number(sessionStorage.getItem('eventCursor')||0);const stream=new EventSource(`/api/v2/events${last?`?after=${last}`:''}`);stream.addEventListener('job',event=>{last=Math.max(last,Number((event as MessageEvent).lastEventId||0));sessionStorage.setItem('eventCursor',String(last));let payload:{kind?:string;type?:string;state?:string}={};try{payload=JSON.parse((event as MessageEvent).data)}catch{}queryClient.invalidateQueries({queryKey:['jobs']});queryClient.invalidateQueries({queryKey:['job-groups']});queryClient.invalidateQueries({queryKey:['job-group-children']});if(payload.type!=='progress'){queryClient.invalidateQueries({queryKey:['workload-cycle']});queryClient.invalidateQueries({queryKey:['operations']});queryClient.invalidateQueries({queryKey:['activity']})}if(payload.kind==='kavita_sync'&&['succeeded','failed','cancelled'].includes(payload.state||'')){queryClient.invalidateQueries({queryKey:['library']});queryClient.invalidateQueries({queryKey:['updates']})}});stream.addEventListener('counts',()=>{queryClient.invalidateQueries({queryKey:['operations']});queryClient.invalidateQueries({queryKey:['workload-cycle']})});return()=>stream.close()},[queryClient])
+  useEffect(()=>{
+    let last=Number(sessionStorage.getItem('eventCursor')||0)
+    let refreshTimer:ReturnType<typeof setTimeout>|undefined
+    const pendingKeys=new Set<string>()
+    const flushRefreshes=()=>{
+      refreshTimer=undefined
+      const keys=[...pendingKeys]
+      pendingKeys.clear()
+      keys.forEach(key=>{void queryClient.invalidateQueries({queryKey:[key]})})
+    }
+    const scheduleRefresh=(...keys:string[])=>{
+      keys.forEach(key=>pendingKeys.add(key))
+      refreshTimer??=setTimeout(flushRefreshes,eventRefreshDelayMs)
+    }
+    const stream=new EventSource(`/api/v2/events${last?`?after=${last}`:''}`)
+    stream.addEventListener('job',event=>{
+      last=Math.max(last,Number((event as MessageEvent).lastEventId||0))
+      sessionStorage.setItem('eventCursor',String(last))
+      let payload:{kind?:string;type?:string;state?:string}={}
+      try{payload=JSON.parse((event as MessageEvent).data)}catch{}
+      scheduleRefresh('jobs','job-groups','job-group-children')
+      if(payload.type!=='progress')scheduleRefresh('workload-cycle','operations','activity')
+      if(payload.kind==='kavita_sync'&&['succeeded','failed','cancelled'].includes(payload.state||''))scheduleRefresh('library','updates')
+    })
+    stream.addEventListener('counts',()=>scheduleRefresh('operations','workload-cycle'))
+    return()=>{
+      stream.close()
+      if(refreshTimer!==undefined)clearTimeout(refreshTimer)
+    }
+  },[queryClient])
   useEffect(()=>{document.documentElement.classList.toggle('drawer-open',drawer);return()=>document.documentElement.classList.remove('drawer-open')},[drawer])
   const push=(toast:Omit<Toast,'id'>)=>{const id=Date.now()+Math.random();setToasts(current=>[...current,{...toast,id}]);setTimeout(()=>setToasts(current=>current.filter(item=>item.id!==id)),6500)}
   useEffect(()=>{const show=(event:Event)=>{const toast=(event as CustomEvent<Omit<Toast,'id'>>).detail;if(toast?.message)push(toast)};window.addEventListener('manga-toast',show);return()=>window.removeEventListener('manga-toast',show)},[])

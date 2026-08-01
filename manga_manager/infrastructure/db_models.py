@@ -74,16 +74,14 @@ class WorkJob(JobBase):
         Index("ix_job_cycle_group_status", "cycle_id", "group_key", "status"),
         Index("ix_job_workflow_status", "workflow_key", "status"),
         Index(
-            "uq_job_leased_chapter_series",
+            "uq_job_leased_library_repair_series",
             "series_key",
             unique=True,
             sqlite_where=text(
-                "kind IN ('chapter_download', 'library_repair') "
-                "AND status = 'leased' AND series_key <> ''"
+                "kind = 'library_repair' AND status = 'leased' AND series_key <> ''"
             ),
             postgresql_where=text(
-                "kind IN ('chapter_download', 'library_repair') "
-                "AND status = 'leased' AND series_key <> ''"
+                "kind = 'library_repair' AND status = 'leased' AND series_key <> ''"
             ),
         ),
     )

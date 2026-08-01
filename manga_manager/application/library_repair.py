@@ -351,15 +351,16 @@ class LibraryRepairHandler:
         payload = context.lease.payload
         if not isinstance(payload, LibraryRepairPayload):
             raise RuntimeError("library repair handler received the wrong payload")
-        if payload.reason == "automatic_projection_repair":
-            with self.session_factory() as session:
-                downloads_active = has_runnable_or_leased_downloads(session)
-            if downloads_active:
-                raise DeferredJobError(
-                    "downloads_active",
-                    "automatic metadata repair is paused while downloads are active",
-                    retry_after=timedelta(minutes=1),
-                )
+        with self.session_factory() as session:
+            downloads_active = has_runnable_or_leased_downloads(
+                session, series_key=str(payload.series_id)
+            )
+        if downloads_active:
+            raise DeferredJobError(
+                "downloads_active",
+                "library repair is paused while this manga has active downloads",
+                retry_after=timedelta(minutes=1),
+            )
         rows = await self._blocking(self._snapshot, payload.series_id)
         if rows:
             with self.session_factory() as session, session.begin():

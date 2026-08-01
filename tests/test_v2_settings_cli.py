@@ -17,9 +17,10 @@ def test_v2_settings_require_postgresql() -> None:
     )
 
 
-def test_normal_worker_cannot_enable_asura_concurrency_two() -> None:
-    with pytest.raises(ValueError, match="less than or equal to 1"):
-        V2Settings(asura_download_concurrency=2)
+def test_provider_seed_limits_do_not_cap_the_shared_runtime_pool() -> None:
+    settings = V2Settings(asura_download_concurrency=2)
+    assert settings.asura_download_concurrency == 2
+    assert settings.pool_limits()["download:asura"] == settings.network_worker_concurrency
 
 
 def test_cli_exposes_transition_commands() -> None:

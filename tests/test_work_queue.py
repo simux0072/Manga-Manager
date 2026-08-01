@@ -23,6 +23,7 @@ from manga_manager.infrastructure.db_models import (
     JobBase,
     JobEvent,
     JobPermit,
+    ProviderPolicy,
     WorkJob,
     WorkloadCycle,
 )
@@ -602,9 +603,9 @@ def test_provider_and_global_permits_limit_chapter_claims(session: Session) -> N
     )
 
 
-def test_per_series_exclusion_skips_to_other_series(session: Session) -> None:
+def test_chapters_from_one_series_can_run_concurrently(session: Session) -> None:
     queue = JobQueue()
-    for release_id, series_key in ((1, "same"), (2, "same"), (3, "other")):
+    for release_id, series_key in ((1, "same"), (2, "same")):
         queue.enqueue(
             session,
             kind=JobKind.CHAPTER_DOWNLOAD,
@@ -622,7 +623,56 @@ def test_per_series_exclusion_skips_to_other_series(session: Session) -> None:
         session, owner="b", lease_for=timedelta(minutes=1), now=NOW, pool_limits=limits
     )
     assert first is not None and first.series_key == "same"
-    assert second is not None and second.series_key == "other"
+    assert second is not None and second.series_key == "same"
+
+
+def test_new_download_group_receives_newly_available_workers(session: Session) -> None:
+    queue = JobQueue()
+    for release_id in range(1, 9):
+        queue.enqueue(
+            session,
+            kind=JobKind.CHAPTER_DOWNLOAD,
+            dedupe_key=f"release:first:{release_id}",
+            payload=ChapterDownloadPayload(chapter_release_id=release_id),
+            source="mangafire",
+            series_key="first-manga",
+            available_at=NOW,
+        )
+    limits = {"download:mangafire": 8, "chapter_global": 8}
+    for index in range(4):
+        lease = queue.claim(
+            session,
+            owner=f"first-{index}",
+            lease_for=timedelta(minutes=1),
+            now=NOW,
+            pool_limits=limits,
+        )
+        assert lease is not None and lease.series_key == "first-manga"
+
+    for release_id in range(20, 24):
+        queue.enqueue(
+            session,
+            kind=JobKind.CHAPTER_DOWNLOAD,
+            dedupe_key=f"release:second:{release_id}",
+            payload=ChapterDownloadPayload(chapter_release_id=release_id),
+            source="mangafire",
+            series_key="second-manga",
+            available_at=NOW,
+        )
+    migrated = [
+        queue.claim(
+            session,
+            owner=f"second-{index}",
+            lease_for=timedelta(minutes=1),
+            now=NOW,
+            pool_limits=limits,
+        )
+        for index in range(4)
+    ]
+    assert all(lease is not None for lease in migrated)
+    assert {lease.series_key for lease in migrated if lease is not None} == {
+        "second-manga"
+    }
 
 
 def test_library_repair_and_download_are_exclusive_for_one_series(session: Session) -> None:
@@ -757,6 +807,73 @@ def test_shared_source_cooldown_skips_provider_jobs(session: Session) -> None:
         )
         is not None
     )
+
+
+def test_provider_pacing_limits_only_workers_that_would_wait(session: Session) -> None:
+    queue = JobQueue()
+    for release_id in range(1, 4):
+        queue.enqueue(
+            session,
+            kind=JobKind.CHAPTER_DOWNLOAD,
+            dedupe_key=f"release:paced:{release_id}",
+            payload=ChapterDownloadPayload(chapter_release_id=release_id),
+            source="asura",
+            series_key=f"paced-{release_id}",
+            available_at=NOW,
+        )
+    session.add(
+        ProviderPolicy(
+            source="asura",
+            learned_job_limit=1,
+            request_interval_seconds=2.0,
+            clean_since=NOW - timedelta(days=1),
+        )
+    )
+    session.flush()
+    limits = {"download:asura": 20, "network_global": 20, "chapter_global": 20}
+    first = queue.claim(
+        session, owner="paced-1", lease_for=timedelta(minutes=1), now=NOW, pool_limits=limits
+    )
+    second = queue.claim(
+        session, owner="paced-2", lease_for=timedelta(minutes=1), now=NOW, pool_limits=limits
+    )
+    assert first is not None
+    assert second is None
+
+
+def test_clean_unpaced_provider_expands_to_shared_capacity(session: Session) -> None:
+    queue = JobQueue()
+    for release_id in range(1, 4):
+        queue.enqueue(
+            session,
+            kind=JobKind.CHAPTER_DOWNLOAD,
+            dedupe_key=f"release:elastic:{release_id}",
+            payload=ChapterDownloadPayload(chapter_release_id=release_id),
+            source="mangafire",
+            series_key="elastic-series",
+            available_at=NOW,
+        )
+    session.add(
+        ProviderPolicy(
+            source="mangafire",
+            learned_job_limit=1,
+            request_interval_seconds=0,
+            clean_since=NOW - timedelta(days=1),
+        )
+    )
+    session.flush()
+    limits = {"download:mangafire": 20, "network_global": 20, "chapter_global": 20}
+    claims = [
+        queue.claim(
+            session,
+            owner=f"elastic-{index}",
+            lease_for=timedelta(minutes=1),
+            now=NOW,
+            pool_limits=limits,
+        )
+        for index in range(3)
+    ]
+    assert all(claim is not None for claim in claims)
 
 
 def test_global_chapter_ceiling_applies_across_provider_pools(session: Session) -> None:

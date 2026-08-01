@@ -14,7 +14,10 @@ from manga_manager.infrastructure.db_models import (
 
 
 def has_runnable_or_leased_downloads(
-    session: Session, *, now: datetime | None = None
+    session: Session,
+    *,
+    now: datetime | None = None,
+    series_key: str | None = None,
 ) -> bool:
     """Return whether foreground download work can use resources now.
 
@@ -52,13 +55,10 @@ def has_runnable_or_leased_downloads(
         WorkJob.lease_expires_at.is_not(None),
         WorkJob.lease_expires_at > current,
     )
-    return bool(
-        session.scalar(
-            select(
-                exists().where(
-                    WorkJob.kind == JobKind.CHAPTER_DOWNLOAD.value,
-                    or_(live_lease, runnable),
-                )
-            )
-        )
+    active_download = exists().where(
+        WorkJob.kind == JobKind.CHAPTER_DOWNLOAD.value,
+        or_(live_lease, runnable),
     )
+    if series_key is not None:
+        active_download = active_download.where(WorkJob.series_key == series_key)
+    return bool(session.scalar(select(active_download)))
