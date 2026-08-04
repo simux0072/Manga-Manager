@@ -138,6 +138,15 @@ describe('media library frontend',()=>{
     expect(await screen.findByText('Waiting to retry')).toBeInTheDocument()
     expect(screen.getByText(/Retry in 1m/)).toBeInTheDocument()
     expect(document.querySelector('.progress-track.waiting')).toBeInTheDocument()
+    const retryNow=screen.getByRole('button',{name:'Retry now'})
+    const dismiss=screen.getByRole('button',{name:'Dismiss'})
+    expect(retryNow).toHaveClass('retry-now')
+    expect(dismiss).toHaveClass('dismiss-wait')
+    await userEvent.click(retryNow)
+    await waitFor(()=>expect(fetch).toHaveBeenCalledWith('/api/v2/jobs/79/retry',expect.objectContaining({method:'POST'})))
+    expect(await screen.findByText(/attempt budget unchanged/i)).toBeInTheDocument()
+    await userEvent.click(dismiss)
+    await waitFor(()=>expect(fetch).toHaveBeenCalledWith('/api/v2/jobs/79/dismiss',expect.objectContaining({method:'POST'})))
   })
 
   it('dismisses all unresolved failures from the Job Center',async()=>{

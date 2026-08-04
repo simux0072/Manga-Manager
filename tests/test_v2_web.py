@@ -1114,6 +1114,57 @@ async def test_failed_views_only_show_latest_attempt_and_allow_dismissal() -> No
     )
 
 
+async def test_waiting_retries_can_be_released_or_dismissed_by_operator() -> None:
+    app, sessions = app_with_catalog()
+    retry_at = datetime.now(timezone.utc) + timedelta(hours=1)
+    with sessions() as session, session.begin():
+        release = WorkJob(
+            kind="source_pull",
+            dedupe_key="source:mangadex:release",
+            payload={"version": 1, "source": "mangadex"},
+            source="mangadex",
+            pool="pull:mangadex",
+            status="retry_wait",
+            attempts=1,
+            max_attempts=3,
+            available_at=retry_at,
+        )
+        dismiss = WorkJob(
+            kind="source_pull",
+            dedupe_key="source:mangafire:dismiss",
+            payload={"version": 1, "source": "mangafire"},
+            source="mangafire",
+            pool="pull:mangafire",
+            status="retry_wait",
+            attempts=1,
+            max_attempts=3,
+            available_at=retry_at,
+        )
+        session.add_all([release, dismiss])
+        session.flush()
+        release_id, dismiss_id = release.id, dismiss.id
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        retried = await client.post(f"/api/v2/jobs/{release_id}/retry")
+        dismissed = await client.post(f"/api/v2/jobs/{dismiss_id}/dismiss")
+
+    assert retried.status_code == 200
+    assert retried.json()["job"]["status"] == "queued"
+    assert retried.json()["job"]["attempt"] == 1
+    assert retried.json()["job"]["max_attempts"] == 3
+    assert dismissed.status_code == 200
+    assert dismissed.json()["job"]["status"] == "cancelled"
+    with sessions() as session:
+        events = session.scalars(
+            select(JobEvent)
+            .where(JobEvent.job_id.in_([release_id, dismiss_id]))
+            .order_by(JobEvent.id)
+        ).all()
+    assert {event.event_type for event in events} == {"released", "cancelled"}
+
+
 async def test_all_unresolved_failures_can_be_dismissed_without_deleting_audit() -> None:
     app, sessions = app_with_catalog()
     with sessions() as session, session.begin():

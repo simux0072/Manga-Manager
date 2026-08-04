@@ -339,6 +339,39 @@ class JobQueue:
         session.flush()
         return len(jobs)
 
+    def retry_now(
+        self,
+        session: Session,
+        *,
+        job_id: int,
+        now: datetime | None = None,
+    ) -> WorkJob | None:
+        """Release one scheduled retry without consuming an attempt itself."""
+
+        current = now or utcnow()
+        job = session.scalar(
+            select(WorkJob)
+            .where(WorkJob.id == job_id)
+            .where(WorkJob.status == JobState.RETRY_WAIT.value)
+            .with_for_update()
+        )
+        if job is None:
+            return None
+        job.status = JobState.QUEUED.value
+        job.available_at = current
+        job.updated_at = current
+        job.completed_at = None
+        self._record_event(
+            session,
+            job,
+            "released",
+            message="scheduled retry released now by operator",
+            details={"manual": True, "attempts_unchanged": True},
+        )
+        self._notify_workers(session, job.pool)
+        session.flush()
+        return job
+
     def claim_query(
         self,
         *,

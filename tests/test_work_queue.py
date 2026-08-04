@@ -393,6 +393,47 @@ def test_retry_becomes_terminal_at_max_attempts(session: Session) -> None:
     )
 
 
+def test_operator_can_release_retry_wait_without_consuming_an_attempt(
+    session: Session,
+) -> None:
+    queue = JobQueue()
+    job, _ = queue.enqueue(
+        session,
+        kind=JobKind.SOURCE_PULL,
+        dedupe_key="source:mangadex:manual-release",
+        payload=SourcePullPayload(source="mangadex"),
+        available_at=NOW,
+    )
+    lease = queue.claim(
+        session, owner="worker-a", lease_for=timedelta(minutes=1), now=NOW
+    )
+    assert lease is not None
+    retry_at = NOW + timedelta(hours=1)
+    assert queue.retry(
+        session,
+        job_id=job.id,
+        owner=lease.owner,
+        available_at=retry_at,
+        error_code="provider_rate_limited",
+        error_message="try later",
+        now=NOW,
+    ) is JobState.RETRY_WAIT
+    attempts_before = job.attempts
+
+    released = queue.retry_now(session, job_id=job.id, now=NOW + timedelta(minutes=1))
+
+    assert released is job
+    assert job.status == JobState.QUEUED.value
+    assert job.available_at == NOW + timedelta(minutes=1)
+    assert job.attempts == attempts_before
+    event = session.scalars(
+        select(JobEvent).where(JobEvent.job_id == job.id).order_by(JobEvent.id.desc())
+    ).first()
+    assert event is not None
+    assert event.event_type == "released"
+    assert event.details["attempts_unchanged"] is True
+
+
 def test_final_expired_lease_is_failed_instead_of_reclaimed(session: Session) -> None:
     queue = JobQueue()
     job, _ = queue.enqueue(

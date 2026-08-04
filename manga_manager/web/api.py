@@ -1980,21 +1980,27 @@ def create_api_router(
     def retry_job(job_id: int, session: SessionDep):
         with session.begin():
             job = session.get(WorkJob, job_id)
-            if job is None or job.status not in {"failed", "cancelled"}:
+            if job is None or job.status not in {"failed", "cancelled", "retry_wait"}:
                 raise HTTPException(409, "job cannot be retried")
-            job, _created = JobQueue().enqueue(
-                session,
-                kind=JobKind(job.kind),
-                dedupe_key=job.dedupe_key,
-                payload=job.payload,
-                priority=job.priority,
-                max_attempts=max(job.max_attempts, 3),
-                source=job.source,
-                series_key=job.series_key,
-                pool=job.pool,
-                workflow_key=job.workflow_key,
-                group_key=job.group_key,
-            )
+            if job.status == "retry_wait":
+                released = JobQueue().retry_now(session, job_id=job.id)
+                if released is None:
+                    raise HTTPException(409, "scheduled retry could not be released")
+                job = released
+            else:
+                job, _created = JobQueue().enqueue(
+                    session,
+                    kind=JobKind(job.kind),
+                    dedupe_key=job.dedupe_key,
+                    payload=job.payload,
+                    priority=job.priority,
+                    max_attempts=max(job.max_attempts, 3),
+                    source=job.source,
+                    series_key=job.series_key,
+                    pool=job.pool,
+                    workflow_key=job.workflow_key,
+                    group_key=job.group_key,
+                )
         return {"job": serialize_jobs(session, [job])[0]}
 
     @router.post("/jobs/failures/dismiss")
@@ -2027,24 +2033,37 @@ def create_api_router(
         with session.begin():
             job = session.scalar(
                 select(WorkJob)
-                .where(WorkJob.id == job_id, WorkJob.status == "failed")
+                .where(
+                    WorkJob.id == job_id,
+                    WorkJob.status.in_(("failed", "retry_wait")),
+                )
                 .with_for_update()
             )
             if job is None:
-                raise HTTPException(409, "failed job cannot be dismissed")
-            changed_at = utcnow()
-            job.status = "cancelled"
-            job.updated_at = changed_at
-            job.completed_at = job.completed_at or changed_at
-            session.add(
-                JobEvent(
+                raise HTTPException(409, "job cannot be dismissed")
+            if job.status == "retry_wait":
+                if not JobQueue().cancel(
+                    session,
                     job_id=job.id,
-                    event_type="cancelled",
-                    status="cancelled",
-                    message="failure dismissed from the live job center",
-                    created_at=changed_at,
+                    reason="scheduled retry dismissed by operator",
+                ):
+                    raise HTTPException(409, "scheduled retry could not be dismissed")
+            elif job.status == "failed":
+                changed_at = utcnow()
+                job.status = "cancelled"
+                job.updated_at = changed_at
+                job.completed_at = job.completed_at or changed_at
+                session.add(
+                    JobEvent(
+                        job_id=job.id,
+                        event_type="cancelled",
+                        status="cancelled",
+                        message="failure dismissed from the live job center",
+                        created_at=changed_at,
+                    )
                 )
-            )
+            else:
+                raise HTTPException(409, "job cannot be dismissed")
         return {"job": serialize_jobs(session, [job])[0]}
 
     @router.get("/events")
