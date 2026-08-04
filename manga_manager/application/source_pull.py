@@ -484,6 +484,7 @@ class SourceRefreshHandler:
             )
         with self.session_factory() as session, session.begin():
             source_series = self.catalog.ingest(session, enriched, chapters)
+            self.catalog.record_provider_job_success(session, source=payload.source)
             source_series_id = source_series.id
             # Apply a newly observed preferred provider or an official MangaFire
             # variant immediately. Waiting for the six-hour bootstrap made an

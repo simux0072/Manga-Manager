@@ -11,6 +11,7 @@ from app.adapters.http import (
     HttpSourceClient,
     configure_provider_waiter,
     configure_request_observer,
+    worker_page_capacity,
 )
 from app.adapters.base import FrontierSentinel, SourceRateLimited
 from app.adapters.kingofshojo import KingOfShojoAdapter
@@ -760,6 +761,27 @@ def test_mangadex_latest_feed_keeps_only_configured_language():
     assert japanese is None
 
 
+async def test_mangadex_recovery_probe_uses_lightweight_ping() -> None:
+    requested_paths: list[str] = []
+
+    async def handler(request):
+        requested_paths.append(request.url.path)
+        return httpx.Response(200, text="pong", request=request)
+
+    adapter = MangaDexAdapter()
+    adapter.client = HttpSourceClient(
+        "https://api.mangadex.org",
+        transport=httpx.MockTransport(handler),
+        source="mangadex",
+    )
+    try:
+        await adapter.probe()
+    finally:
+        await adapter.aclose()
+
+    assert requested_paths == ["/ping"]
+
+
 def test_mangadex_duplicate_chapters_prefer_official_then_verified_release():
     source = SeriesItem(
         source="mangadex",
@@ -1319,6 +1341,34 @@ async def test_http_client_raises_rate_limit_with_retry_after():
     assert exc_info.value.retry_after is not None
 
 
+async def test_http_client_retries_idempotent_transport_failures(monkeypatch):
+    attempts = 0
+    waits: list[float] = []
+
+    async def handler(request):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise httpx.ConnectError("temporary connect failure", request=request)
+        return httpx.Response(200, json={"result": "ok"}, request=request)
+
+    async def no_sleep(delay: float) -> None:
+        waits.append(delay)
+
+    monkeypatch.setattr("app.adapters.http.asyncio.sleep", no_sleep)
+    client = HttpSourceClient(
+        "https://example.com",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        assert await client.get_json("/data") == {"result": "ok"}
+    finally:
+        await client.aclose()
+
+    assert attempts == 3
+    assert waits == [0.25, 0.5]
+
+
 async def test_ordered_page_fetch_uses_bounded_sliding_window():
     class WindowClient:
         base_url = "https://mangafire.window.test"
@@ -1345,6 +1395,15 @@ async def test_ordered_page_fetch_uses_bounded_sliding_window():
     client.release_first.set()
     assert await first_page == b"https://mangafire.window.test/0"
     await iterator.aclose()
+
+
+def test_worker_page_capacity_uses_the_configured_memory_budget(monkeypatch):
+    monkeypatch.setattr("app.adapters.http.settings.max_page_bytes", 25 * 1024 * 1024)
+    monkeypatch.setattr(
+        "app.adapters.http.settings.worker_inflight_byte_budget", 128 * 1024 * 1024
+    )
+
+    assert worker_page_capacity() == 5
 
 
 async def test_shared_provider_scheduler_runs_even_when_static_interval_is_zero():

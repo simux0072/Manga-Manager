@@ -86,10 +86,12 @@ ensure_postgres() {
       exit 1
     }
     docker network inspect "$network" >/dev/null 2>&1 || docker network create "$network" >/dev/null
-    docker run -d --name "$postgres" --network "$network" --memory 384m \
+    docker run -d --name "$postgres" --network "$network" --memory 256m \
       --log-opt max-size=10m --log-opt max-file=3 \
       -e POSTGRES_DB=manga_manager -e POSTGRES_USER=manga -e POSTGRES_PASSWORD=manga \
-      -v "$db_volume:/var/lib/postgresql/data" postgres:16-alpine >/dev/null
+      -v "$db_volume:/var/lib/postgresql/data" postgres:16-alpine postgres \
+      -c shared_buffers=64MB -c work_mem=2MB -c maintenance_work_mem=32MB \
+      -c max_connections=40 >/dev/null
   fi
   attempts=0
   until docker exec "$postgres" pg_isready -U manga -d manga_manager >/dev/null 2>&1; do

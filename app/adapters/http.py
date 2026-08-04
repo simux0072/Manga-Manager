@@ -19,7 +19,6 @@ from manga_manager.domain.providers import KNOWN_SOURCES, PROVIDER_ORIGINS, sour
 _page_limiters: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 _request_schedulers: dict[str, tuple[asyncio.Lock, float]] = {}
 _worker_page_semaphores: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
-WORKER_INFLIGHT_BYTE_BUDGET = 256 * 1024 * 1024
 _provider_waiter: Callable[[str, str, float], Awaitable[None]] | None = None
 _request_observer: Callable[[dict], None] | None = None
 
@@ -152,34 +151,47 @@ class HttpSourceClient:
         *,
         traffic_class: str | None = None,
     ) -> httpx.Response:
-        await self.wait_for_throttle(url, traffic_class=traffic_class)
-        started = time.monotonic()
-        try:
-            response = await self.client.request(method, url, headers=headers)
-        except Exception as exc:
-            self.observe(url, None, started, 0, exc, traffic_class=traffic_class)
-            raise
-        try:
-            self.raise_for_status(response, traffic_class=traffic_class)
-        except Exception as exc:
+        retryable = method.upper() in {"GET", "HEAD", "OPTIONS"}
+        attempts = 3 if retryable else 1
+        for attempt in range(1, attempts + 1):
+            await self.wait_for_throttle(url, traffic_class=traffic_class)
+            started = time.monotonic()
+            try:
+                response = await self.client.request(method, url, headers=headers)
+            except httpx.TransportError as exc:
+                self.observe(url, None, started, 0, exc, traffic_class=traffic_class)
+                if attempt >= attempts:
+                    raise
+                # Manga providers occasionally drop or refuse a connection while
+                # remaining otherwise healthy. Retry only idempotent requests and
+                # run every attempt through the shared provider pacer.
+                await asyncio.sleep(0.25 * attempt)
+                continue
+            except Exception as exc:
+                self.observe(url, None, started, 0, exc, traffic_class=traffic_class)
+                raise
+            try:
+                self.raise_for_status(response, traffic_class=traffic_class)
+            except Exception as exc:
+                self.observe(
+                    url,
+                    response,
+                    started,
+                    len(response.content),
+                    exc,
+                    traffic_class=traffic_class,
+                )
+                raise
             self.observe(
                 url,
                 response,
                 started,
                 len(response.content),
-                exc,
+                None,
                 traffic_class=traffic_class,
             )
-            raise
-        self.observe(
-            url,
-            response,
-            started,
-            len(response.content),
-            None,
-            traffic_class=traffic_class,
-        )
-        return response
+            return response
+        raise RuntimeError("unreachable")
 
     def observe(
         self,
@@ -336,11 +348,15 @@ def worker_page_semaphore() -> asyncio.Semaphore:
     loop = asyncio.get_running_loop()
     semaphore = _worker_page_semaphores.get(loop)
     if semaphore is None:
-        max_page_bytes = max(1, settings.max_page_bytes)
-        capacity = max(1, WORKER_INFLIGHT_BYTE_BUDGET // max_page_bytes)
-        semaphore = asyncio.Semaphore(capacity)
+        semaphore = asyncio.Semaphore(worker_page_capacity())
         _worker_page_semaphores[loop] = semaphore
     return semaphore
+
+
+def worker_page_capacity() -> int:
+    """Bound buffered page downloads by their worst-case configured size."""
+    max_page_bytes = max(1, settings.max_page_bytes)
+    return max(1, settings.worker_inflight_byte_budget // max_page_bytes)
 
 
 class DynamicLimiter:

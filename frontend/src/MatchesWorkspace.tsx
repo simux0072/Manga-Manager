@@ -1,7 +1,7 @@
 import {useEffect, useMemo, useRef, useState} from 'react'
 import {useInfiniteQuery, useMutation, useQuery, useQueryClient} from '@tanstack/react-query'
 import type {InfiniteData} from '@tanstack/react-query'
-import {AlertTriangle, BookOpen, Check, ExternalLink, Merge, Search, Split, X} from 'lucide-react'
+import {AlertTriangle, ArrowUpDown, BookOpen, Check, ExternalLink, Merge, Search, Split, X} from 'lucide-react'
 
 import {api} from './api'
 import type {Match, MatchSide, MergeCandidate, MergePreview, Page, Series} from './types'
@@ -36,18 +36,21 @@ function SuggestedMatches() {
   const [confirm, setConfirm] = useState<number | null>(null)
   const [selected, setSelected] = useState<number[]>([])
   const [entireQueue, setEntireQueue] = useState(false)
+  const [excluded, setExcluded] = useState<number[]>([])
+  const [order, setOrder] = useState<'asc' | 'desc'>('desc')
   const [batchPreview, setBatchPreview] = useState<{selected:number;eligible:number;blocked:number;items:{id:number;blocked_reasons:string[]}[]}|null>(null)
   const [confirmBatch, setConfirmBatch] = useState(false)
   const [previewBusy, setPreviewBusy] = useState(false)
+  const queryKey = ['matches', order] as const
   const query = useInfiniteQuery({
-    queryKey: ['matches'],
-    queryFn: ({pageParam, signal}) => api.matches(pageParam, signal),
+    queryKey,
+    queryFn: ({pageParam, signal}) => api.matches(order, pageParam, signal),
     initialPageParam: 0,
     getNextPageParam: page => page.next_cursor || undefined,
     maxPages: 10,
   })
   const updateCachedMatches = (remove: (match: Match) => boolean) => {
-    client.setQueryData<InfiniteData<Page<Match, number>>>(['matches'], current => current && ({
+    client.setQueryData<InfiniteData<Page<Match, number>>>(queryKey, current => current && ({
       ...current,
       pages: current.pages.map(page => ({
         ...page,
@@ -59,15 +62,15 @@ function SuggestedMatches() {
     mutationFn: ({id, value}: {id: number; value: 'accepted' | 'rejected'}) =>
       api.decideMatch(id, value, value === 'accepted' ? 'MERGE' : ''),
     onMutate: async ({id}) => {
-      await client.cancelQueries({queryKey: ['matches'], exact: true})
-      const previous = client.getQueryData<InfiniteData<Page<Match, number>>>(['matches'])
+      await client.cancelQueries({queryKey, exact: true})
+      const previous = client.getQueryData<InfiniteData<Page<Match, number>>>(queryKey)
       const reviewed = previous?.pages.flatMap(page => page.items).find(match => match.id === id)
       const reviewedPair = reviewed && matchPairKey(reviewed)
       updateCachedMatches(match => match.id === id || (!!reviewedPair && matchPairKey(match) === reviewedPair))
       return {previous, reviewed}
     },
     onError: (error, _variables, context) => {
-      if (context?.previous) client.setQueryData(['matches'], context.previous)
+      if (context?.previous) client.setQueryData(queryKey, context.previous)
       window.dispatchEvent(new CustomEvent('manga-toast', {detail: {message: error.message, tone: 'error'}}))
     },
     onSuccess: (_result, variables, context) => {
@@ -88,10 +91,10 @@ function SuggestedMatches() {
     },
   })
   const batch = useMutation({
-    mutationFn: ({value}:{value:'accepted'|'rejected'}) => api.decideMatches(selected,value,value==='accepted'?'MERGE':'',entireQueue),
+    mutationFn: ({value}:{value:'accepted'|'rejected'}) => api.decideMatches(selected,value,value==='accepted'?'MERGE':'',entireQueue,excluded),
     onSuccess: (result, variables) => {
       const applied = new Set(result.ids)
-      const cached = client.getQueryData<InfiniteData<Page<Match, number>>>(['matches'])
+      const cached = client.getQueryData<InfiniteData<Page<Match, number>>>(queryKey)
       const appliedPairs = new Set(
         cached?.pages.flatMap(page => page.items)
           .filter(match => applied.has(match.id)).map(matchPairKey) || [],
@@ -104,7 +107,7 @@ function SuggestedMatches() {
       }
       updateCachedMatches(match => applied.has(match.id) || appliedPairs.has(matchPairKey(match))
         || affectedSeries.has(match.left.id) || affectedSeries.has(match.right.id))
-      setSelected([]); setEntireQueue(false); setBatchPreview(null); setConfirmBatch(false)
+      setSelected([]); setExcluded([]); setEntireQueue(false); setBatchPreview(null); setConfirmBatch(false)
       client.invalidateQueries({queryKey:['library']})
       window.dispatchEvent(new CustomEvent('manga-toast',{detail:{message:
         `${result.ids.length} proposal${result.ids.length===1?'':'s'} ${variables.value==='accepted'?'merged':'kept separate'}`,
@@ -127,10 +130,13 @@ function SuggestedMatches() {
       return visible.length === current.length ? current : visible
     })
   }, [entireQueue, visibleIds])
+  const allLoadedSelected = !entireQueue && !query.hasNextPage && items.length > 0
+    && items.every(match => selected.includes(match.id))
+  const entireQueueChecked = (entireQueue && excluded.length === 0) || allLoadedSelected
   const loadBatchPreview = async (openConfirmation = false) => {
     setPreviewBusy(true)
     try {
-      const preview = await api.previewMatches(selected, entireQueue)
+      const preview = await api.previewMatches(selected, entireQueue, excluded)
       setBatchPreview(preview)
       if (openConfirmation) setConfirmBatch(true)
     } catch (error) {
@@ -147,8 +153,9 @@ function SuggestedMatches() {
   if (!items.length) return <Message icon={<Check />} title="No matches need review" detail="Use Manual merge when you already know two titles belong together." />
   return <>
     <section className="match-batch-bar">
-      <label><input type="checkbox" checked={entireQueue} disabled={reviewBusy} onChange={event=>{setEntireQueue(event.target.checked);setSelected([]);setBatchPreview(null)}}/> Select entire queue</label>
-      <span>{entireQueue?'Entire queue':`${selected.length} selected`}</span>
+      <label><input type="checkbox" checked={entireQueueChecked} disabled={reviewBusy} onChange={event=>{setEntireQueue(event.target.checked);setSelected([]);setExcluded([]);setBatchPreview(null)}}/> Select entire queue</label>
+      <span>{entireQueue?(excluded.length?`Entire queue except ${excluded.length}`:'Entire queue'):`${selected.length} selected`}</span>
+      <button className="secondary" disabled={reviewBusy} aria-label="Reverse merge result order" onClick={()=>setOrder(current=>current==='desc'?'asc':'desc')}><ArrowUpDown />{order==='desc'?'Highest first':'Lowest first'}</button>
       <button className="secondary" disabled={reviewBusy||(!entireQueue&&!selected.length)} onClick={()=>loadBatchPreview()}>Preview</button>
       <button className="secondary" disabled={reviewBusy||(!entireQueue&&!selected.length)} onClick={()=>batch.mutate({value:'rejected'})}>Keep separate</button>
       <button className="primary" disabled={reviewBusy||(!entireQueue&&!selected.length)} onClick={()=>loadBatchPreview(true)}>Merge eligible</button>
@@ -157,7 +164,7 @@ function SuggestedMatches() {
     {batchPreview?.items.some(item=>item.blocked_reasons.length>0)&&<div className="inline-notice" role="status">Blocked proposals remain pending: {batchPreview.items.filter(item=>item.blocked_reasons.length).map(item=>`#${item.id} ${item.blocked_reasons.join(', ')}`).join(' · ')}</div>}
     <div className="match-list">
       {items.map(match => <article className="match-card" key={match.id}>
-        <label className="match-select"><input type="checkbox" checked={entireQueue||selected.includes(match.id)} disabled={entireQueue||reviewBusy} onChange={()=>{setBatchPreview(null);setSelected(current=>current.includes(match.id)?current.filter(id=>id!==match.id):[...current,match.id])}}/>Select</label>
+        <label className="match-select"><input type="checkbox" checked={entireQueue?!excluded.includes(match.id):selected.includes(match.id)} disabled={reviewBusy} onChange={()=>{setBatchPreview(null);if(entireQueue){setExcluded(current=>current.includes(match.id)?current.filter(id=>id!==match.id):[...current,match.id])}else{setSelected(current=>current.includes(match.id)?current.filter(id=>id!==match.id):[...current,match.id])}}}/>Select</label>
         <Side side={match.left} />
         <div className="match-evidence">
           <div className="confidence"><b>{Math.round(match.confidence * 100)}%</b><span>confidence</span></div>

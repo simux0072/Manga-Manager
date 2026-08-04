@@ -247,6 +247,44 @@ async def test_source_pull_reads_persisted_frontier(sessions: TrackingSessionFac
     assert adapter.frontier == [FrontierSentinel(source_id="known", latest_chapter="9")]
 
 
+async def test_successful_refresh_resets_nonconsecutive_transport_failures(
+    sessions: TrackingSessionFactory,
+) -> None:
+    with sessions() as session, session.begin():
+        session.add(
+            CatalogSourceState(
+                source="fake",
+                health_status="degraded",
+                consecutive_failures=2,
+                last_error="RemoteProtocolError",
+            )
+        )
+        session.add(
+            ProviderEndpointState(
+                source="fake",
+                traffic_class="origin",
+                consecutive_failures=2,
+                last_error="RemoteProtocolError",
+            )
+        )
+    adapter = FakeAdapter(sessions)
+    handler = SourceRefreshHandler(
+        session_factory=sessions,
+        adapter_factory=lambda _source: adapter,
+    )
+
+    await handler(claimed_refresh_context(sessions))
+
+    with sessions() as session:
+        state = session.get(CatalogSourceState, "fake")
+        endpoint = session.scalar(select(ProviderEndpointState))
+        assert state.health_status == "healthy"
+        assert state.consecutive_failures == 0
+        assert state.last_error == ""
+        assert endpoint.consecutive_failures == 0
+        assert endpoint.last_error == ""
+
+
 @pytest.mark.asyncio
 async def test_source_pull_refreshes_tracked_series_outside_truncated_safety_window(
     sessions: TrackingSessionFactory,

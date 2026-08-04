@@ -20,6 +20,7 @@ db_volume="$project-db"
 database_url="postgresql+psycopg://manga:manga@$postgres:5432/manga_manager"
 stage_min_free_bytes="${STAGE_MIN_FREE_BYTES:-1073741824}"
 stage_bind_address="${STAGE_BIND_ADDRESS:-0.0.0.0}"
+stage_cli_memory="${STAGE_CLI_MEMORY:-384m}"
 mode="${1:-rehearse}"
 build_requested=false
 if [ "$mode" = "serve" ] && [ "${2:-}" = "--build" ]; then build_requested=true; fi
@@ -129,10 +130,12 @@ docker network inspect "$network" >/dev/null 2>&1 || docker network create "$net
 docker volume inspect "$db_volume" >/dev/null 2>&1 || docker volume create "$db_volume" >/dev/null
 docker rm -f "$web" "$worker" >/dev/null 2>&1 || true
 remove_postgres
-docker run -d --name "$postgres" --network "$network" --memory 384m \
+docker run -d --name "$postgres" --network "$network" --memory 256m \
   --log-opt max-size=10m --log-opt max-file=3 \
   -e POSTGRES_DB=manga_manager -e POSTGRES_USER=manga -e POSTGRES_PASSWORD=manga \
-  -v "$db_volume:/var/lib/postgresql/data" postgres:16-alpine >/dev/null
+  -v "$db_volume:/var/lib/postgresql/data" postgres:16-alpine postgres \
+  -c shared_buffers=64MB -c work_mem=2MB -c maintenance_work_mem=32MB \
+  -c max_connections=40 >/dev/null
 
 attempt=0
 until docker exec "$postgres" pg_isready -h 127.0.0.1 -U manga -d manga_manager >/dev/null 2>&1; do
@@ -143,15 +146,15 @@ until docker exec "$postgres" pg_isready -h 127.0.0.1 -U manga -d manga_manager 
   sleep 1
 done
 
-docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" "$image" \
+docker run --rm --network "$network" --memory "$stage_cli_memory" -e "V2_DATABASE_URL=$database_url" "$image" \
   manga-manager migrate
 
 if [ -n "${STAGE_IMPORT_ROOT:-}" ]; then
   import_root=$(cd "$STAGE_IMPORT_ROOT" && pwd)
-  docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+  docker run --rm --network "$network" --memory "$stage_cli_memory" -e "V2_DATABASE_URL=$database_url" \
     -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" -v "$import_root:/import:ro" "$image" \
     manga-manager import-cbz /import --report /data/stage-import-report.json
-  docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+  docker run --rm --network "$network" --memory "$stage_cli_memory" -e "V2_DATABASE_URL=$database_url" \
     -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" \
     manga-manager reconcile-storage
 fi
@@ -163,49 +166,49 @@ if [ -n "${STAGE_LEGACY_DATABASE:-}" ]; then
       container_database="/host/${legacy_database#"$PWD"/}"
       container_storage="/host/${legacy_storage#"$PWD"/}"
       container_data="/host/${data_dir#"$PWD"/}"
-      docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+      docker run --rm --network "$network" --memory "$stage_cli_memory" -e "V2_DATABASE_URL=$database_url" \
         -e "V2_STORAGE_ROOT=$container_data" -e V2_MIN_FREE_BYTES=0 \
         -v "$PWD:/host" "$image" manga-manager migrate-legacy-library "$container_database" \
         --storage-root "$container_storage" \
         --report "$container_data/legacy-library-import.json" --apply
-      docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+      docker run --rm --network "$network" --memory "$stage_cli_memory" -e "V2_DATABASE_URL=$database_url" \
         -e "V2_STORAGE_ROOT=$container_data" -v "$PWD:/host" "$image" \
         manga-manager repair-catalog-recovery "$container_database" \
         --report "$container_data/catalog-recovery.json" --apply
       ;;
     *)
-      docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+      docker run --rm --network "$network" --memory "$stage_cli_memory" -e "V2_DATABASE_URL=$database_url" \
         -e V2_STORAGE_ROOT=/data -e V2_MIN_FREE_BYTES=0 -v "$data_dir:/data" \
         -v "$legacy_database:/legacy/catalog.db:ro" \
         -v "$legacy_storage:/legacy/storage:ro" "$image" manga-manager \
         migrate-legacy-library /legacy/catalog.db --storage-root /legacy/storage \
         --report /data/legacy-library-import.json --apply
-      docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+      docker run --rm --network "$network" --memory "$stage_cli_memory" -e "V2_DATABASE_URL=$database_url" \
         -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" \
         -v "$legacy_database:/legacy/catalog.db:ro" "$image" \
         manga-manager repair-catalog-recovery /legacy/catalog.db \
         --report /data/catalog-recovery.json --apply
       ;;
   esac
-  docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+  docker run --rm --network "$network" --memory "$stage_cli_memory" -e "V2_DATABASE_URL=$database_url" \
     -e V2_STORAGE_ROOT=/data -e V2_MIN_FREE_BYTES=0 -v "$data_dir:/data" "$image" \
     manga-manager reconcile-storage
 fi
 if [ "$run_repairs" = true ]; then
-  docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+  docker run --rm --network "$network" --memory "$stage_cli_memory" -e "V2_DATABASE_URL=$database_url" \
     -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" manga-manager \
     repair-provider-identities --report /data/provider-identities-dry-run.json
-  docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+  docker run --rm --network "$network" --memory "$stage_cli_memory" -e "V2_DATABASE_URL=$database_url" \
     -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" manga-manager \
     repair-provider-identities --report /data/provider-identities-applied.json --apply
-  docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+  docker run --rm --network "$network" --memory "$stage_cli_memory" -e "V2_DATABASE_URL=$database_url" \
     -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" manga-manager \
     reconcile-refresh-queue --report /data/refresh-queue-dry-run.json
-  docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+  docker run --rm --network "$network" --memory "$stage_cli_memory" -e "V2_DATABASE_URL=$database_url" \
     -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" manga-manager \
     reconcile-refresh-queue --report /data/refresh-queue-applied.json --apply
 fi
-docker run -d --name "$web" --network "$network" --restart unless-stopped --memory 384m \
+docker run -d --name "$web" --network "$network" --restart unless-stopped --memory 256m \
   -p "$stage_bind_address:${STAGE_PORT:-18000}:8000" \
   --log-opt max-size=10m --log-opt max-file=3 \
   -e "V2_DATABASE_URL=$database_url" -e V2_STORAGE_ROOT=/data \
@@ -213,11 +216,12 @@ docker run -d --name "$web" --network "$network" --restart unless-stopped --memo
   -e "V2_ENABLE_MANGAFIRE=$sources_enabled" \
   -e "V2_ENABLE_KINGOFSHOJO=$sources_enabled" \
   -e "V2_MIN_FREE_BYTES=$stage_min_free_bytes" \
+  -e MALLOC_ARENA_MAX=2 -e MALLOC_TRIM_THRESHOLD_=131072 \
   -e "KAVITA_URL=${KAVITA_URL:-}" -e "KAVITA_API_KEY=${KAVITA_API_KEY:-}" \
   -e "KAVITA_LIBRARY_ROOT=${KAVITA_LIBRARY_ROOT:-}" \
   -v "$data_dir:/data" "$image" \
   uvicorn manga_manager.web.app:app --host 0.0.0.0 --port 8000 >/dev/null
-docker run -d --name "$worker" --network "$network" --restart unless-stopped --memory 1g \
+docker run -d --name "$worker" --network "$network" --restart unless-stopped --memory 768m \
   --log-opt max-size=10m --log-opt max-file=3 \
   --health-cmd "manga-manager doctor" --health-interval 30s \
   --health-timeout 10s --health-start-period 30s --health-retries 3 \
@@ -226,6 +230,7 @@ docker run -d --name "$worker" --network "$network" --restart unless-stopped --m
   -e "V2_ENABLE_MANGAFIRE=$sources_enabled" \
   -e "V2_ENABLE_KINGOFSHOJO=$sources_enabled" \
   -e "V2_MIN_FREE_BYTES=$stage_min_free_bytes" \
+  -e MALLOC_ARENA_MAX=2 -e MALLOC_TRIM_THRESHOLD_=131072 \
   -e "KAVITA_URL=${KAVITA_URL:-}" -e "KAVITA_API_KEY=${KAVITA_API_KEY:-}" \
   -e "KAVITA_LIBRARY_ROOT=${KAVITA_LIBRARY_ROOT:-}" \
   -v "$data_dir:/data" "$image" \
@@ -253,14 +258,14 @@ fi
 if [ -n "${KAVITA_URL:-}" ] && [ -n "${KAVITA_API_KEY:-}" ]; then
   wait_for_kind kavita_sync
 fi
-docker run --rm --network "$network" --memory 256m -e "V2_DATABASE_URL=$database_url" \
+docker run --rm --network "$network" --memory "$stage_cli_memory" -e "V2_DATABASE_URL=$database_url" \
   -e V2_STORAGE_ROOT=/data -v "$data_dir:/data" "$image" manga-manager stage-check --json
 
 probe_output=$(docker run --rm --network "$network" -e "V2_DATABASE_URL=$database_url" "$image" \
   manga-manager enqueue-probe)
 probe_id=$(printf '%s\n' "$probe_output" | sed -n 's/^job_id=\([0-9][0-9]*\).*/\1/p')
 [ -n "$probe_id" ] && wait_for_job "$probe_id"
-docker run --rm --memory 1g "$image" python scripts/stress-download-memory.py
+docker run --rm --memory 768m "$image" python scripts/stress-download-memory.py
 
 if [ -n "${STAGE_SMOKE_SOURCE:-}" ]; then
   smoke_output=$(docker run --rm --network "$network" -e "V2_DATABASE_URL=$database_url" "$image" \

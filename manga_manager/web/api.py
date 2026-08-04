@@ -120,6 +120,7 @@ class MatchChange(BaseModel):
 
 class BatchMatchChange(MatchChange):
     ids: list[int] = []
+    excluded_ids: list[int] = []
     entire_queue: bool = False
 
 
@@ -822,8 +823,16 @@ def create_api_router(
         session: SessionDep,
         cursor: int = Query(default=0, ge=0),
         limit: int = Query(default=24, ge=1, le=100),
+        order: str = Query(default="desc", pattern="^(asc|desc)$"),
     ):
         proposals = pending_match_proposal_index(session)
+        if order == "asc":
+            proposals.reverse()
+        proposal_key = (
+            (lambda value: (value["confidence"], -value["id"]))
+            if order == "asc"
+            else (lambda value: (-value["confidence"], value["id"]))
+        )
         if cursor:
             current_index = next(
                 (index for index, value in enumerate(proposals) if value["id"] == cursor),
@@ -839,13 +848,19 @@ def create_api_router(
                         CatalogMatchDecision.id == cursor
                     )
                 )
-                cursor_key = (-cursor_confidence, cursor) if cursor_confidence is not None else None
+                cursor_key = (
+                    (cursor_confidence, -cursor)
+                    if order == "asc" and cursor_confidence is not None
+                    else (-cursor_confidence, cursor)
+                    if cursor_confidence is not None
+                    else None
+                )
                 start = next(
                     (
                         index
                         for index, value in enumerate(proposals)
                         if cursor_key is not None
-                        and (-value["confidence"], value["id"]) > cursor_key
+                        and proposal_key(value) > cursor_key
                     ),
                     len(proposals),
                 )
@@ -1336,8 +1351,9 @@ def create_api_router(
     @router.post("/match-batch/preview")
     def preview_match_batch(change: BatchMatchChange, session: SessionDep):
         proposals = pending_match_proposal_index(session)
+        excluded_ids = set(change.excluded_ids)
         selected = (
-            proposals
+            [row for row in proposals if row["id"] not in excluded_ids]
             if change.entire_queue
             else [row for row in proposals if row["id"] in set(change.ids)]
         )
@@ -1368,8 +1384,9 @@ def create_api_router(
 
         with session.begin():
             proposals = pending_match_proposal_index(session)
+            excluded_ids = set(change.excluded_ids)
             selected = (
-                proposals
+                [row for row in proposals if row["id"] not in excluded_ids]
                 if change.entire_queue
                 else [row for row in proposals if row["id"] in set(change.ids)]
             )

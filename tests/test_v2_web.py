@@ -770,6 +770,52 @@ async def test_connected_batch_matches_merge_once() -> None:
         assert session.query(WorkJob).filter_by(kind="library_repair").count() == 1
 
 
+async def test_match_queue_supports_ascending_order_and_queue_wide_exclusions() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        existing = session.query(CatalogMatchDecision).one()
+        existing_id = existing.id
+        existing.confidence = 0.9
+        third = CatalogSeries(title="Third", normalized_title="third", status="interested")
+        fourth = CatalogSeries(title="Fourth", normalized_title="fourth", status="interested")
+        session.add_all([third, fourth])
+        session.flush()
+        third_identity = CatalogSourceSeries(
+            series_id=third.id, source="mangadex", source_id="third",
+            title="Third", normalized_title="third", url="https://example.test/third",
+        )
+        fourth_identity = CatalogSourceSeries(
+            series_id=fourth.id, source="kingofshojo", source_id="fourth",
+            title="Fourth", normalized_title="fourth", url="https://example.test/fourth",
+        )
+        session.add_all([third_identity, fourth_identity])
+        session.flush()
+        lower = CatalogMatchDecision(
+            left_source_series_id=min(third_identity.id, fourth_identity.id),
+            right_source_series_id=max(third_identity.id, fourth_identity.id),
+            confidence=0.2,
+        )
+        session.add(lower)
+        session.flush()
+        lower_id = lower.id
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        ascending = await client.get("/api/v2/matches", params={"order": "asc"})
+        preview = await client.post(
+            "/api/v2/match-batch/preview",
+            json={
+                "ids": [], "excluded_ids": [lower_id],
+                "entire_queue": True, "decision": "rejected",
+            },
+        )
+    assert ascending.status_code == 200
+    assert [row["id"] for row in ascending.json()["items"]] == [lower_id, existing_id]
+    assert preview.status_code == 200
+    assert preview.json()["selected"] == 1
+    assert preview.json()["items"][0]["id"] == existing_id
+
+
 async def test_connected_batch_consolidates_equivalent_duplicate_provider_records() -> None:
     app, sessions = app_with_catalog()
     with sessions() as session, session.begin():

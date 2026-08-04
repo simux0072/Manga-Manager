@@ -28,10 +28,10 @@ async def main() -> None:
     totals = await asyncio.gather(*(consume(job) for job in range(4)))
     peak_path = Path("/sys/fs/cgroup/memory.peak")
     peak = int(peak_path.read_text().strip()) if peak_path.is_file() else 0
-    limit = 1024 * 1024 * 1024
+    limit = 768 * 1024 * 1024
     print(f"jobs=4 bytes={sum(totals)} memory_peak={peak} limit={limit}")
     if peak and peak >= limit:
-        raise SystemExit("worker memory peak reached the 1 GiB limit")
+        raise SystemExit("worker memory peak reached the 768 MiB limit")
 
 
 if __name__ == "__main__":

@@ -39,6 +39,11 @@ class MangaDexAdapter(SourceAdapter):
         await self.client.aclose()
         await self.at_home_client.aclose()
 
+    async def probe(self) -> None:
+        response = await self.client.request("GET", f"{self.base_url}/ping")
+        if response.text.strip().lower() != "pong":
+            raise ValueError("MangaDex health probe returned an unexpected response")
+
     async def list_recent(self) -> list[SeriesItem]:
         return await self.list_recent_frontier([])
 

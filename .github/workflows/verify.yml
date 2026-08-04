@@ -41,6 +41,10 @@ jobs:
         working-directory: frontend
       - run: npm run build
         working-directory: frontend
+      - name: Validate container and deployment configuration
+        run: |
+          docker compose config --quiet
+          sh -n scripts/stage-local.sh scripts/reset-local-data.sh
       - run: uv run ruff check .
       - run: uv run pytest -q
 
@@ -77,9 +81,20 @@ jobs:
       - name: Check scheduler implementation
         run: >-
           uv run ruff check
+          app/adapters/base.py
+          app/adapters/http.py
+          app/adapters/mangadex.py
+          manga_manager/application/maintenance.py
+          manga_manager/application/source_pull.py
+          manga_manager/infrastructure/catalog_repository.py
           manga_manager/infrastructure/job_queue.py
+          manga_manager/infrastructure/provider_scheduler.py
           manga_manager/worker
           manga_manager/settings.py
+          tests/test_adapters.py
+          tests/test_maintenance.py
+          tests/test_provider_scheduler.py
+          tests/test_v2_source_pull.py
           tests/test_work_queue.py
           tests/test_worker_runtime.py
           tests/test_postgres_job_queue.py
@@ -89,8 +104,11 @@ jobs:
           tests/test_work_queue.py
           tests/test_worker_runtime.py
           tests/test_download_activity.py
+          tests/test_adapters.py
+          tests/test_maintenance.py
           tests/test_v2_settings_cli.py
           tests/test_v2_database.py
+          tests/test_v2_source_pull.py
           tests/test_postgres_job_queue.py
           tests/test_provider_scheduler.py
 

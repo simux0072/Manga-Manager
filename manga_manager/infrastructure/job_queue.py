@@ -50,6 +50,13 @@ MUTATING_JOB_KINDS = frozenset(
         JobKind.LIBRARY_REPAIR.value,
     }
 )
+PROVIDER_RECOVERY_ERROR_CODES = frozenset(
+    {
+        "provider_origin_unavailable",
+        "source_http_error",
+        "source_network_error",
+    }
+)
 
 
 class JobQueue:
@@ -299,6 +306,39 @@ class JobQueue:
             .limit(1)
         )
 
+    def resume_recovered_provider(
+        self,
+        session: Session,
+        *,
+        source: str,
+        now: datetime | None = None,
+    ) -> int:
+        """Release outage-deferred work after provider recovery is confirmed."""
+
+        current = now or utcnow()
+        jobs = session.scalars(
+            select(WorkJob)
+            .where(WorkJob.source == source)
+            .where(WorkJob.status == JobState.RETRY_WAIT.value)
+            .where(WorkJob.available_at > current)
+            .where(WorkJob.error_code.in_(PROVIDER_RECOVERY_ERROR_CODES))
+            .with_for_update(skip_locked=True)
+        ).all()
+        for job in jobs:
+            job.available_at = current
+            job.error_code = ""
+            job.error_message = ""
+            job.updated_at = current
+            self._record_event(
+                session,
+                job,
+                "released",
+                message=f"{source} recovered; deferred work released",
+            )
+            self._notify_workers(session, job.pool)
+        session.flush()
+        return len(jobs)
+
     def claim_query(
         self,
         *,
@@ -307,6 +347,7 @@ class JobQueue:
         pools: Collection[str] | None = None,
         exclude_ids: Collection[int] | None = None,
         exclude_pools: Collection[str] | None = None,
+        exclude_sources: Collection[str] | None = None,
         block_network: bool = False,
         block_chapters: bool = False,
     ) -> Select[tuple[WorkJob]]:
@@ -435,6 +476,8 @@ class JobQueue:
             query = query.where(WorkJob.id.not_in(tuple(exclude_ids)))
         if exclude_pools:
             query = query.where(WorkJob.pool.not_in(tuple(exclude_pools)))
+        if exclude_sources:
+            query = query.where(WorkJob.source.not_in(tuple(exclude_sources)))
         if block_network:
             query = query.where(
                 and_(
@@ -469,6 +512,13 @@ class JobQueue:
         rejected: set[int] = set()
         permit_counts = self._active_permit_counts(session, now=current)
         saturated_pools = self._saturated_direct_pools(limits, permit_counts)
+        saturated_sources = self._saturated_provider_sources(
+            session,
+            limits=limits,
+            counts=permit_counts,
+            now=current,
+            provider_pacing_window_seconds=provider_pacing_window_seconds,
+        )
         network_full = self._permit_pool_full(
             "network_global", limits=limits, counts=permit_counts
         )
@@ -483,6 +533,7 @@ class JobQueue:
                     pools=pools,
                     exclude_ids=rejected,
                     exclude_pools=saturated_pools,
+                    exclude_sources=saturated_sources,
                     block_network=network_full,
                     block_chapters=chapter_full,
                 )
@@ -527,8 +578,21 @@ class JobQueue:
                 job = candidate
                 break
             rejected.add(candidate.id)
+            if self._is_network_job(candidate) and candidate.source:
+                # Once any permit rejects a provider in this claim pass, do not
+                # scan dozens more queued jobs for the same saturated provider.
+                saturated_sources.add(candidate.source)
             permit_counts = self._active_permit_counts(session, now=current)
             saturated_pools = self._saturated_direct_pools(limits, permit_counts)
+            saturated_sources.update(
+                self._saturated_provider_sources(
+                    session,
+                    limits=limits,
+                    counts=permit_counts,
+                    now=current,
+                    provider_pacing_window_seconds=provider_pacing_window_seconds,
+                )
+            )
             network_full = self._permit_pool_full(
                 "network_global", limits=limits, counts=permit_counts
             )
@@ -1107,57 +1171,23 @@ class JobQueue:
         pools = [job.pool]
         if self._is_network_job(job):
             pools.append("network_global")
+            if job.source:
+                # Pull, refresh, and download are separate scheduling lanes, but
+                # they must share one provider-wide recovery/concurrency limit.
+                pools.append(f"provider:{job.source}")
         if job.kind == JobKind.CHAPTER_DOWNLOAD.value:
             pools.append("chapter_global")
         pools = sorted(set(filter(None, pools)))
         for pool in pools:
             limit = limits.get(pool)
-            if pool.startswith(("download:", "refresh:")) and job.source:
-                policy = session.get(ProviderPolicy, job.source)
-                if policy is not None and (
-                    policy.expires_at is None or aware_datetime(policy.expires_at) > now
-                ):
-                    # A clean provider may expand to the shared network ceiling.
-                    # Slow request pacing prevents workers from piling up inside
-                    # the adapter, while a recently limited provider temporarily
-                    # falls back to its learned safe tier until a clean poll.
-                    if policy.request_interval_seconds > 0:
-                        pacing_limit = max(
-                            1,
-                            int(
-                                provider_pacing_window_seconds
-                                / policy.request_interval_seconds
-                            ),
-                        )
-                        limit = min(limit, pacing_limit) if limit is not None else pacing_limit
-                    limited_at = (
-                        aware_datetime(policy.last_limited_at)
-                        if policy.last_limited_at is not None
-                        else None
-                    )
-                    clean_since = (
-                        aware_datetime(policy.clean_since)
-                        if policy.clean_since is not None
-                        else None
-                    )
-                    if limited_at is not None and (
-                        clean_since is None or clean_since <= limited_at
-                    ):
-                        learned_limit = max(1, policy.learned_job_limit)
-                        limit = (
-                            min(limit, learned_limit)
-                            if limit is not None
-                            else learned_limit
-                        )
-                    metadata = dict(policy.metadata_json or {})
-                    until = metadata.get("exploration_until")
-                    if until:
-                        try:
-                            if datetime.fromisoformat(str(until)) > now:
-                                explored = int(metadata.get("exploration_tier") or limit or 1)
-                                limit = max(limit or 1, explored)
-                        except ValueError:
-                            pass
+            if pool.startswith(("download:", "refresh:", "provider:")) and job.source:
+                limit = self._effective_provider_limit(
+                    session,
+                    source=job.source,
+                    limit=limit,
+                    now=now,
+                    provider_pacing_window_seconds=provider_pacing_window_seconds,
+                )
             if limit is None:
                 continue
             if session.bind is not None and session.bind.dialect.name == "postgresql":
@@ -1223,6 +1253,80 @@ class JobQueue:
             if pool not in {"network_global", "chapter_global"}
             and counts.get(pool, 0) >= limit
         }
+
+    def _saturated_provider_sources(
+        self,
+        session: Session,
+        *,
+        limits: dict[str, int],
+        counts: dict[str, int],
+        now: datetime,
+        provider_pacing_window_seconds: float,
+    ) -> set[str]:
+        saturated: set[str] = set()
+        for pool, configured_limit in limits.items():
+            if not pool.startswith("provider:"):
+                continue
+            source = pool.removeprefix("provider:")
+            effective_limit = self._effective_provider_limit(
+                session,
+                source=source,
+                limit=configured_limit,
+                now=now,
+                provider_pacing_window_seconds=provider_pacing_window_seconds,
+            )
+            if effective_limit is not None and counts.get(pool, 0) >= effective_limit:
+                saturated.add(source)
+        return saturated
+
+    @staticmethod
+    def _effective_provider_limit(
+        session: Session,
+        *,
+        source: str,
+        limit: int | None,
+        now: datetime,
+        provider_pacing_window_seconds: float,
+    ) -> int | None:
+        policy = session.get(ProviderPolicy, source)
+        if policy is None or (
+            policy.expires_at is not None and aware_datetime(policy.expires_at) <= now
+        ):
+            return limit
+        # A clean provider may expand to the shared network ceiling. Slow
+        # request pacing prevents workers from piling up inside the adapter,
+        # while a recently limited provider falls back to its learned safe tier.
+        if policy.request_interval_seconds > 0:
+            pacing_limit = max(
+                1,
+                int(provider_pacing_window_seconds / policy.request_interval_seconds),
+            )
+            limit = min(limit, pacing_limit) if limit is not None else pacing_limit
+        limited_at = (
+            aware_datetime(policy.last_limited_at)
+            if policy.last_limited_at is not None
+            else None
+        )
+        clean_since = (
+            aware_datetime(policy.clean_since) if policy.clean_since is not None else None
+        )
+        if limited_at is not None:
+            adaptive_limit = max(1, policy.learned_job_limit)
+            if clean_since is not None and clean_since > limited_at:
+                recovery_window = max(int(policy.cooldown_seconds or 0), 300)
+                clean_seconds = max(0.0, (now - clean_since).total_seconds())
+                adaptive_limit += int(clean_seconds // recovery_window)
+            limit = min(limit, adaptive_limit) if limit is not None else adaptive_limit
+        metadata = dict(policy.metadata_json or {})
+        until = metadata.get("exploration_until")
+        if until:
+            try:
+                if datetime.fromisoformat(str(until)) > now:
+                    explored = int(metadata.get("exploration_tier") or limit or 1)
+                    limit = max(limit or 1, explored)
+            except ValueError:
+                pass
+        return limit
 
     def _release_permits(self, session: Session, job_id: int) -> None:
         session.execute(delete(JobPermit).where(JobPermit.job_id == job_id))

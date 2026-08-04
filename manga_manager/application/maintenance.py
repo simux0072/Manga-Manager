@@ -26,6 +26,8 @@ from manga_manager.infrastructure.db_models import (
     ProviderEndpointState,
     ProviderPolicy,
 )
+from manga_manager.infrastructure.provider_scheduler import provider_recovery_probe
+from manga_manager.infrastructure.job_queue import JobQueue
 from manga_manager.worker.runtime import SessionFactory
 
 
@@ -40,6 +42,7 @@ class MaintenanceHandler:
         self.session_factory = session_factory
         self.adapter_factory = adapter_factory
         self.close_adapter = close_adapter
+        self.queue = JobQueue()
 
     async def __call__(self, context: JobContext) -> None:
         payload = context.lease.payload
@@ -82,7 +85,8 @@ class MaintenanceHandler:
         if adapter is None:
             raise DeferredJobError("provider_unavailable", source, retry_after=timedelta(minutes=5))
         try:
-            await adapter.list_recent_frontier([])
+            with provider_recovery_probe():
+                await adapter.probe()
         except SourceRateLimited as exc:
             delay = timedelta(minutes=self._record_probe_failure(source))
             raise DeferredJobError(
@@ -135,12 +139,27 @@ class MaintenanceHandler:
                 if state is not None:
                     state.cooldown_until = None
                     state.health_status = "healthy"
+                    state.consecutive_failures = 0
+                    state.last_error = ""
+                    state.next_request_at = None
+                    state.updated_at = now
                     # Let the scheduler perform a full poll immediately after recovery.
                     state.last_poll_at = None
                 session.execute(
                     update(ProviderEndpointState)
                     .where(ProviderEndpointState.source == source)
-                    .values(cooldown_until=None, consecutive_failures=0, last_error="")
+                    .values(
+                        cooldown_until=None,
+                        next_request_at=None,
+                        consecutive_failures=0,
+                        last_error="",
+                        updated_at=now,
+                    )
+                )
+                self.queue.resume_recovered_provider(
+                    session,
+                    source=source,
+                    now=now,
                 )
             else:
                 metadata["next_recovery_probe"] = (now + timedelta(seconds=30)).isoformat()

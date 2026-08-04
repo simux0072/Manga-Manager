@@ -30,14 +30,14 @@ def create_database_engine(
             "application_name": f"manga-manager-{role}",
             "options": "-c statement_timeout=30000 -c lock_timeout=5000",
         }
-        # One browser can use six HTTP/1.1 connections, and multiple open tabs each keep an SSE
-        # stream while refreshing dashboard data. Keep enough bounded headroom for those short
-        # reads without changing the worker's independently sized pool.
+        # SSE streams release their request session before waiting, and worker
+        # database work is split across a small number of bounded executor lanes.
+        # Keep modest burst headroom without retaining twenty PostgreSQL backends.
         pool_size, max_overflow = {
-            "web": (8, 4),
-            "worker": (16, 4),
-            "cli": (2, 2),
-        }.get(role, (2, 2))
+            "web": (4, 2),
+            "worker": (6, 2),
+            "cli": (1, 1),
+        }.get(role, (1, 1))
         pool_options = {
             "pool_size": pool_size,
             "max_overflow": max_overflow,

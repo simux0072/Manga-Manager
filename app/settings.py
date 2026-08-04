@@ -22,6 +22,7 @@ class Settings(BaseSettings):
 
     request_timeout_seconds: float = Field(default=25.0, ge=5.0)
     max_page_bytes: int = Field(default=25 * 1024 * 1024, ge=1)
+    worker_inflight_byte_budget: int = Field(default=128 * 1024 * 1024, ge=1)
     asura_request_interval_seconds: float = Field(default=2.0, ge=0.0)
     mangadex_request_interval_seconds: float = Field(default=0.25, ge=0.0)
     mangadex_at_home_interval_seconds: float = Field(default=1.55, ge=0.0)

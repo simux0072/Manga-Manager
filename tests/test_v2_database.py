@@ -42,8 +42,8 @@ def test_web_database_pool_has_bounded_browser_burst_capacity(monkeypatch) -> No
     )
 
     assert engine is sentinel
-    assert captured["pool_size"] == 8
-    assert captured["max_overflow"] == 4
+    assert captured["pool_size"] == 4
+    assert captured["max_overflow"] == 2
     assert captured["pool_timeout"] == 10
 
 

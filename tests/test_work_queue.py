@@ -876,6 +876,163 @@ def test_clean_unpaced_provider_expands_to_shared_capacity(session: Session) -> 
     assert all(claim is not None for claim in claims)
 
 
+def test_recovered_provider_ramps_up_one_worker_per_clean_window(session: Session) -> None:
+    queue = JobQueue()
+    for release_id in range(1, 5):
+        queue.enqueue(
+            session,
+            kind=JobKind.CHAPTER_DOWNLOAD,
+            dedupe_key=f"release:recovering:{release_id}",
+            payload=ChapterDownloadPayload(chapter_release_id=release_id),
+            source="mangafire",
+            series_key=f"recovering-{release_id}",
+            available_at=NOW,
+        )
+    session.add(
+        ProviderPolicy(
+            source="mangafire",
+            learned_job_limit=1,
+            request_interval_seconds=0,
+            cooldown_seconds=3600,
+            last_limited_at=NOW - timedelta(hours=3),
+            clean_since=NOW - timedelta(hours=2, minutes=1),
+        )
+    )
+    session.flush()
+    limits = {"download:mangafire": 20, "network_global": 20, "chapter_global": 20}
+    claims = [
+        queue.claim(
+            session,
+            owner=f"recovering-{index}",
+            lease_for=timedelta(minutes=1),
+            now=NOW,
+            pool_limits=limits,
+        )
+        for index in range(4)
+    ]
+    assert [claim is not None for claim in claims] == [True, True, True, False]
+
+
+def test_recovering_provider_limit_is_shared_by_pull_and_refresh(session: Session) -> None:
+    from manga_manager.domain.jobs import SourcePullPayload, SourceRefreshPayload
+
+    queue = JobQueue()
+    queue.enqueue(
+        session,
+        kind=JobKind.SOURCE_PULL,
+        dedupe_key="pull:mangadex:recovery",
+        payload=SourcePullPayload(source="mangadex"),
+        source="mangadex",
+        available_at=NOW,
+    )
+    queue.enqueue(
+        session,
+        kind=JobKind.SOURCE_REFRESH,
+        dedupe_key="refresh:mangadex:recovery",
+        payload=SourceRefreshPayload(
+            source="mangadex",
+            source_id="manga-id",
+            title="Manga",
+            url="https://mangadex.org/title/manga-id",
+        ),
+        source="mangadex",
+        available_at=NOW,
+    )
+    session.add(
+        ProviderPolicy(
+            source="mangadex",
+            learned_job_limit=1,
+            request_interval_seconds=0,
+            cooldown_seconds=3600,
+            last_limited_at=NOW - timedelta(minutes=1),
+        )
+    )
+    session.flush()
+    limits = {
+        "pull:mangadex": 1,
+        "refresh:mangadex": 20,
+        "provider:mangadex": 20,
+        "network_global": 20,
+    }
+
+    first = queue.claim(
+        session,
+        owner="recovery-first",
+        lease_for=timedelta(minutes=1),
+        now=NOW,
+        pool_limits=limits,
+    )
+    second = queue.claim(
+        session,
+        owner="recovery-second",
+        lease_for=timedelta(minutes=1),
+        now=NOW,
+        pool_limits=limits,
+    )
+
+    assert first is not None
+    assert second is None
+
+
+def test_saturated_provider_is_skipped_before_scanning_its_backlog(session: Session) -> None:
+    from manga_manager.domain.jobs import MaintenancePayload, SourceRefreshPayload
+
+    queue = JobQueue()
+    for index in range(52):
+        queue.enqueue(
+            session,
+            kind=JobKind.SOURCE_REFRESH,
+            dedupe_key=f"refresh:mangadex:saturated:{index}",
+            payload=SourceRefreshPayload(
+                source="mangadex",
+                source_id=f"manga-{index}",
+                title=f"Manga {index}",
+                url=f"https://mangadex.org/title/manga-{index}",
+            ),
+            source="mangadex",
+            available_at=NOW,
+        )
+    queue.enqueue(
+        session,
+        kind=JobKind.MAINTENANCE,
+        dedupe_key="maintenance:while-mangadex-saturated",
+        payload=MaintenancePayload(action="stage_probe"),
+        available_at=NOW,
+    )
+    session.add(
+        ProviderPolicy(
+            source="mangadex",
+            learned_job_limit=1,
+            last_limited_at=NOW - timedelta(minutes=1),
+        )
+    )
+    session.flush()
+    limits = {
+        "refresh:mangadex": 20,
+        "provider:mangadex": 20,
+        "network_global": 20,
+        "maintenance": 1,
+    }
+
+    first = queue.claim(
+        session,
+        owner="provider-busy",
+        lease_for=timedelta(minutes=1),
+        now=NOW,
+        pool_limits=limits,
+    )
+    migrated = queue.claim(
+        session,
+        owner="worker-migrated",
+        lease_for=timedelta(minutes=1),
+        now=NOW,
+        pool_limits=limits,
+    )
+
+    assert first is not None and first.source == "mangadex"
+    assert migrated is not None and migrated.kind is JobKind.MAINTENANCE
+
+
 def test_global_chapter_ceiling_applies_across_provider_pools(session: Session) -> None:
     queue = JobQueue()
     for release_id, source in ((1, "mangafire"), (2, "kingofshojo")):

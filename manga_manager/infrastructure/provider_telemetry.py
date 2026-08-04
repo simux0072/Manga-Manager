@@ -338,8 +338,8 @@ class BufferedTelemetryObserver:
         telemetry: ProviderTelemetry,
         *,
         flush_interval_seconds: float = 1.0,
-        max_samples: int = 5_000,
-        batch_size: int = 1_000,
+        max_samples: int = 2_000,
+        batch_size: int = 500,
     ) -> None:
         self.telemetry = telemetry
         self.flush_interval_seconds = max(0.1, flush_interval_seconds)

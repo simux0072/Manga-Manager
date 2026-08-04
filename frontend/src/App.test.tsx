@@ -124,6 +124,22 @@ describe('media library frontend',()=>{
     expect(fetch).toHaveBeenCalledWith('/api/v2/jobs/77/dismiss',expect.objectContaining({method:'POST'}))
   })
 
+  it('shows retry waits with an amber progress bar and live countdown',async()=>{
+    const retryAt=new Date(Date.now()+65_000).toISOString()
+    const waitingJob={id:79,kind:'source_pull',description:'Pull MangaDex catalog',source:'mangadex',pool:'pull:mangadex',cycle_id:1,workflow_key:'',group_key:'pull:mangadex',status:'retry_wait',queue_position:null,attempt:1,max_attempts:3,error_code:'source_network_error',error_message:'Provider unavailable',available_at:retryAt,created_at:new Date().toISOString(),updated_at:new Date().toISOString(),completed_at:null,progress:{phase:'catalog',current:1,total:3,unit:'phases',bytes:0,message:'Waiting for provider',updated_at:new Date().toISOString(),percent:33.3},context:{}}
+    vi.stubGlobal('fetch',vi.fn((input:string|URL|Request)=>{
+      const url=String(input)
+      if(url.includes('/api/v2/operations'))return response({job_counts:{retry_wait:1},active_groups:1,health:{series:1,chapters:1,active_artifacts:0,missing_projections:0,storage_free_bytes:0},sources:[],workers:[],permits:{},provider_policies:[],provider_endpoints:[],recent_benchmarks:[]})
+      if(url.includes('/api/v2/jobs?')&&url.includes('state=retry_wait'))return response({items:[waitingJob],next_cursor:null})
+      if(url.includes('/api/v2/jobs'))return response({items:[],next_cursor:null})
+      return response({items:[],next_cursor:null})
+    }))
+    renderApp('/operations')
+    expect(await screen.findByText('Waiting to retry')).toBeInTheDocument()
+    expect(screen.getByText(/Retry in 1m/)).toBeInTheDocument()
+    expect(document.querySelector('.progress-track.waiting')).toBeInTheDocument()
+  })
+
   it('dismisses all unresolved failures from the Job Center',async()=>{
     const failedJob={id:78,kind:'maintenance',description:'Probe storage',source:'',pool:'health',cycle_id:1,workflow_key:'',group_key:'probe',status:'failed',queue_position:null,attempt:3,max_attempts:3,error_code:'probe_failed',error_message:'disk unavailable',available_at:'2026-07-15T00:00:00Z',created_at:'2026-07-15T00:00:00Z',updated_at:'2026-07-15T00:00:00Z',completed_at:'2026-07-15T00:00:00Z',progress:{phase:'',current:0,total:0,unit:'',bytes:0,message:'',updated_at:null,percent:null},context:{}}
     vi.stubGlobal('fetch',vi.fn((input:string|URL|Request)=>{
@@ -253,6 +269,42 @@ describe('media library frontend',()=>{
     await userEvent.click(checkboxes[2])
     await userEvent.click(screen.getByRole('button',{name:'Merge eligible'}))
     expect(await screen.findByText('Merge 2 eligible proposals?')).toBeInTheDocument()
-    expect(previewBody).toEqual({ids:[51,53],entire_queue:false,decision:'rejected'})
+    expect(previewBody).toEqual({ids:[51,53],excluded_ids:[],entire_queue:false,decision:'rejected'})
+  })
+
+  it('keeps queue-wide selection editable and reflects exclusions in the master checkbox',async()=>{
+    const match={
+      id:61,decision_ids:[61],confidence:.91,evidence:[],blocked_reasons:[],
+      left:{...series,source_title:series.title,source:'asura',url:'https://asura.test/painter',cover_evidence_used:true},
+      right:{...matchingSeries,source_title:matchingSeries.title,source:'mangafire',url:'https://mangafire.test/painter',cover_evidence_used:true},
+    }
+    const other={...match,id:62,decision_ids:[62],confidence:.72,left:{...match.left,id:31,title:'Low Left'},right:{...match.right,id:32,title:'Low Right'}}
+    let previewBody:{ids:number[];excluded_ids:number[];entire_queue:boolean}|null=null
+    vi.stubGlobal('fetch',vi.fn((input:string|URL|Request,init?:RequestInit)=>{
+      const url=String(input)
+      if(url.includes('/api/v2/operations'))return response({job_counts:{},health:{series:2,chapters:1,active_artifacts:0,missing_projections:0},sources:[],workers:[],permits:{}})
+      if(url.includes('/api/v2/providers'))return response({items:['asura','mangadex','mangafire','kingofshojo']})
+      if(url.endsWith('/api/v2/match-batch/preview')){previewBody=JSON.parse(String(init?.body));return response({selected:1,eligible:1,blocked:0,items:[]})}
+      if(url.includes('/api/v2/matches'))return response({items:url.includes('order=asc')?[other,match]:[match,other],next_cursor:null})
+      return response({items:[],next_cursor:null})
+    }))
+    renderApp('/matches')
+    await waitFor(()=>expect(document.querySelectorAll('.match-card')).toHaveLength(2))
+    const master=screen.getByRole('checkbox',{name:/Select entire queue/i}) as HTMLInputElement
+    await userEvent.click(master)
+    expect(master).toBeChecked()
+    let pairCheckboxes=screen.getAllByRole('checkbox').slice(1) as HTMLInputElement[]
+    expect(pairCheckboxes.every(box=>box.checked&&!box.disabled)).toBe(true)
+    await userEvent.click(pairCheckboxes[0])
+    expect(master).not.toBeChecked()
+    expect(pairCheckboxes[0]).not.toBeChecked()
+    await userEvent.click(screen.getByRole('button',{name:'Preview'}))
+    await waitFor(()=>expect(previewBody).toEqual({ids:[],excluded_ids:[61],entire_queue:true,decision:'rejected'}))
+    pairCheckboxes=screen.getAllByRole('checkbox').slice(1) as HTMLInputElement[]
+    await userEvent.click(pairCheckboxes[0])
+    expect(master).toBeChecked()
+    await userEvent.click(screen.getByRole('button',{name:'Reverse merge result order'}))
+    await waitFor(()=>expect(fetch).toHaveBeenCalledWith(expect.stringContaining('order=asc'),expect.anything()))
+    expect(screen.getByRole('button',{name:'Reverse merge result order'})).toHaveTextContent('Lowest first')
   })
 })

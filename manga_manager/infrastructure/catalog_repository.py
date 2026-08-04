@@ -22,6 +22,7 @@ from manga_manager.infrastructure.db_models import (
     CatalogSeriesAlias,
     CatalogSourceSeries,
     CatalogSourceState,
+    ProviderEndpointState,
     ProviderPolicy,
 )
 from app.adapters.asura import split_asura_source_id
@@ -330,6 +331,46 @@ class CatalogRepository:
                 successful=partial_failures == 0,
                 changed=bool((metrics or {}).get("candidates")),
             )
+        session.flush()
+
+    def record_provider_job_success(self, session: Session, *, source: str) -> None:
+        """Reset transport failures after a complete provider job succeeds.
+
+        A job that was already active when cooldown began cannot clear the circuit;
+        only the dedicated recovery probe may do that. Outside cooldown, this keeps
+        the failure counter genuinely consecutive across parallel refresh jobs.
+        """
+
+        current = utcnow()
+        state = self._source_state(session, source)
+        cooldown_until = state.cooldown_until
+        if cooldown_until is not None:
+            if cooldown_until.tzinfo is None:
+                cooldown_until = cooldown_until.replace(tzinfo=timezone.utc)
+            if cooldown_until > current:
+                return
+        state.health_status = "healthy"
+        state.consecutive_failures = 0
+        state.last_error = ""
+        state.cooldown_until = None
+        state.updated_at = current
+        for endpoint in session.scalars(
+            select(ProviderEndpointState).where(ProviderEndpointState.source == source)
+        ):
+            endpoint_cooldown = endpoint.cooldown_until
+            if endpoint_cooldown is not None:
+                if endpoint_cooldown.tzinfo is None:
+                    endpoint_cooldown = endpoint_cooldown.replace(tzinfo=timezone.utc)
+                if endpoint_cooldown > current:
+                    continue
+            endpoint.consecutive_failures = 0
+            endpoint.last_error = ""
+            endpoint.cooldown_until = None
+            endpoint.updated_at = current
+        policy = session.get(ProviderPolicy, source)
+        if policy is not None and policy.clean_since is None:
+            policy.clean_since = current
+            policy.updated_at = current
         session.flush()
 
     def record_poll_failure(

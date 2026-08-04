@@ -7,6 +7,16 @@ x-logging: &default-logging
 services:
   postgres:
     image: postgres:16-alpine
+    command:
+      - postgres
+      - -c
+      - shared_buffers=64MB
+      - -c
+      - work_mem=2MB
+      - -c
+      - maintenance_work_mem=32MB
+      - -c
+      - max_connections=40
     environment:
       POSTGRES_DB: manga_manager
       POSTGRES_USER: manga
@@ -18,7 +28,7 @@ services:
       interval: 10s
       timeout: 5s
       retries: 5
-    mem_limit: 384m
+    mem_limit: 256m
     restart: unless-stopped
     logging: *default-logging
     networks: [internal]
@@ -42,6 +52,8 @@ services:
       V2_DATABASE_URL: postgresql+psycopg://manga:${POSTGRES_PASSWORD:-manga}@postgres:5432/manga_manager
       V2_STORAGE_ROOT: /data
       V2_MIN_FREE_BYTES: ${V2_MIN_FREE_BYTES:-5368709120}
+      MALLOC_ARENA_MAX: "2"
+      MALLOC_TRIM_THRESHOLD_: "131072"
     command: ["uvicorn", "manga_manager.web.app:app", "--host", "0.0.0.0", "--port", "8000"]
     ports: ["${MANGA_MANAGER_BIND_ADDRESS:-0.0.0.0}:${MANGA_MANAGER_PORT:-8000}:8000"]
     volumes: ["${MANGA_STORAGE_ROOT:-./storage-v2}:/data"]
@@ -53,7 +65,7 @@ services:
       interval: 15s
       timeout: 5s
       retries: 5
-    mem_limit: 384m
+    mem_limit: 256m
     restart: unless-stopped
     logging: *default-logging
     networks: [internal]
@@ -69,13 +81,15 @@ services:
       V2_WORKER_ID: manga-manager
       V2_STORAGE_ROOT: /data
       V2_MIN_FREE_BYTES: ${V2_MIN_FREE_BYTES:-5368709120}
+      MALLOC_ARENA_MAX: "2"
+      MALLOC_TRIM_THRESHOLD_: "131072"
     command: ["manga-manager", "worker"]
     depends_on:
       migrate:
         condition: service_completed_successfully
     volumes: ["${MANGA_STORAGE_ROOT:-./storage-v2}:/data"]
     restart: unless-stopped
-    mem_limit: 1g
+    mem_limit: 768m
     healthcheck:
       test: ["CMD", "manga-manager", "doctor"]
       interval: 30s

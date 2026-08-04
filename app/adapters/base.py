@@ -44,6 +44,11 @@ class SourceAdapter(ABC):
     async def list_recent_frontier(self, sentinels: list[FrontierSentinel]) -> list[SeriesItem]:
         return await self.list_recent()
 
+    async def probe(self) -> None:
+        """Perform the smallest provider request available for recovery checks."""
+
+        await self.list_recent_frontier([])
+
     @abstractmethod
     async def get_chapters(self, source_series: SeriesItem) -> list[ChapterItem]:
         raise NotImplementedError
