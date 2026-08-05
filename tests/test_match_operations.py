@@ -92,6 +92,7 @@ def test_enqueue_reserves_series_and_is_idempotent(sessions) -> None:
         job = session.query(WorkJob).filter_by(kind="match_operation").one()
         assert job.pool == "catalog_mutation"
         assert job.max_attempts == 3
+        assert job.group_key == f"match-operation:rejected:{operation.id}"
 
 
 def test_overlapping_operation_is_rejected_before_queueing(sessions) -> None:

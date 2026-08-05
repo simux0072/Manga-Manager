@@ -21,6 +21,38 @@ database_url="postgresql+psycopg://manga:manga@$postgres:5432/manga_manager"
 stage_min_free_bytes="${STAGE_MIN_FREE_BYTES:-1073741824}"
 stage_bind_address="${STAGE_BIND_ADDRESS:-0.0.0.0}"
 stage_cli_memory="${STAGE_CLI_MEMORY:-384m}"
+
+# A direct application rebuild must not silently detach an already provisioned Kavita
+# instance.  kavita-local.sh writes only generated scalar values to this mode-0600 file,
+# and explicit process environment values still take precedence.
+legacy_kavita_env_file="$state_dir/kavita.env"
+if [ -n "${KAVITA_ENV_FILE:-}" ]; then
+  kavita_env_file="$KAVITA_ENV_FILE"
+  [ -f "$kavita_env_file" ] || {
+    echo "KAVITA_ENV_FILE does not exist: $kavita_env_file" >&2
+    exit 2
+  }
+elif [ -f "$legacy_kavita_env_file" ]; then
+  kavita_env_file="$legacy_kavita_env_file"
+else
+  kavita_env_file="$state_dir/$project-kavita.env"
+fi
+if [ -f "$kavita_env_file" ]; then
+  saved_kavita_url=$(sed -n 's/^KAVITA_URL=//p' "$kavita_env_file")
+  saved_kavita_api_key=$(sed -n 's/^KAVITA_API_KEY=//p' "$kavita_env_file")
+  saved_kavita_library_root=$(sed -n 's/^KAVITA_LIBRARY_ROOT=//p' "$kavita_env_file")
+  KAVITA_URL="${KAVITA_URL:-$saved_kavita_url}"
+  KAVITA_API_KEY="${KAVITA_API_KEY:-$saved_kavita_api_key}"
+  KAVITA_LIBRARY_ROOT="${KAVITA_LIBRARY_ROOT:-$saved_kavita_library_root}"
+  export KAVITA_URL KAVITA_API_KEY KAVITA_LIBRARY_ROOT
+fi
+case "${KAVITA_URL:+url}:${KAVITA_API_KEY:+key}" in
+  url:key|:) ;;
+  *)
+    echo "Kavita configuration is incomplete; KAVITA_URL and KAVITA_API_KEY must be set together" >&2
+    exit 2
+    ;;
+esac
 mode="${1:-rehearse}"
 build_requested=false
 if [ "$mode" = "serve" ] && [ "${2:-}" = "--build" ]; then build_requested=true; fi

@@ -25,6 +25,7 @@ from manga_manager.infrastructure.db_models import (
 from manga_manager.web.api import (
     event_resume_cursor,
     human_evidence,
+    match_operation_group_title,
     operational_error_message,
     pending_match_proposal_index,
     proposal_blockers,
@@ -39,6 +40,21 @@ def test_event_resume_cursor_prefers_the_latest_valid_cursor() -> None:
     assert event_resume_cursor(12, "18") == 18
     assert event_resume_cursor(20, "18") == 20
     assert event_resume_cursor(12, "not-an-event-id") == 12
+
+
+def test_match_operation_groups_use_work_labels_instead_of_manga_titles() -> None:
+    assert match_operation_group_title("match-batch:accepted:example", "accepted") == (
+        "Merge manga pairs"
+    )
+    assert match_operation_group_title("match-batch:rejected:example", "rejected") == (
+        "Split manga pairs"
+    )
+    assert match_operation_group_title("match-operations", "accepted") == (
+        "Manga merge and split operations"
+    )
+    assert match_operation_group_title("match-operation:unknown:1", "") == (
+        "Manga merge and split operations"
+    )
 
 
 def execute_match_operations(sessions) -> None:
@@ -788,6 +804,10 @@ async def test_connected_batch_matches_merge_once() -> None:
         )
     assert response.status_code == 202, response.text
     assert len(response.json()["ids"]) == 2
+    with sessions() as session:
+        match_jobs = session.query(WorkJob).filter_by(kind="match_operation").all()
+        assert len({job.group_key for job in match_jobs}) == 1
+        assert match_jobs[0].group_key.startswith("match-batch:accepted:")
     execute_match_operations(sessions)
     with sessions() as session:
         assert session.query(CatalogSeries).count() == 1

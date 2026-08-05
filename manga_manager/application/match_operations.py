@@ -84,6 +84,7 @@ def enqueue_match_operation(
     proposal_ids: list[int],
     series_ids: list[int],
     priority: int = 70,
+    group_key: str | None = None,
 ) -> tuple[MatchOperation, bool]:
     unique_decisions = sorted(set(decision_ids))
     unique_proposals = sorted(set(proposal_ids))
@@ -129,7 +130,7 @@ def enqueue_match_operation(
         priority=priority,
         max_attempts=3,
         pool="catalog_mutation",
-        group_key="match-operations",
+        group_key=group_key or f"match-operation:{action}:{operation.id}",
     )
     operation.job_id = job.id
     operation.updated_at = utcnow()

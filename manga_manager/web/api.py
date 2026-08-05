@@ -5,6 +5,7 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from collections.abc import Callable
 from typing import Annotated, Any
+from uuid import uuid4
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status as http_status
 from fastapi.responses import FileResponse, Response, StreamingResponse
@@ -77,6 +78,16 @@ def event_resume_cursor(after: int, last_event_id: str | None) -> int:
         return max(after, int(last_event_id or 0), 0)
     except ValueError:
         return after
+
+
+def match_operation_group_title(group_key: str, action: str) -> str:
+    if group_key == "match-operations":
+        return "Manga merge and split operations"
+    if action == "accepted" or ":accepted:" in group_key:
+        return "Merge manga pairs"
+    if action == "rejected" or ":rejected:" in group_key:
+        return "Split manga pairs"
+    return "Manga merge and split operations"
 
 
 def job_state_predicate(states: list[str]):
@@ -1431,6 +1442,7 @@ def create_api_router(
             queued: list[MatchOperation] = []
             blocked: list[dict[str, Any]] = []
             components = connected_proposal_components(selected)
+            batch_group_key = f"match-batch:{change.decision}:{uuid4().hex}"
             for component in components:
                 reasons = (
                     [
@@ -1464,6 +1476,7 @@ def create_api_router(
                             decision_ids=decision_ids,
                             proposal_ids=proposal_ids,
                             series_ids=component["series_ids"],
+                            group_key=batch_group_key,
                         )
                 except (HTTPException, IntegrityError) as error:
                     detail = (
@@ -1646,6 +1659,8 @@ def create_api_router(
             serialized = serialized_representatives[representative.id]
             is_pull_group = representative.kind in {"source_pull", "source_refresh"}
             group_status_counts = all_status_counts[row.group_key]
+            if row.group_key == "match-operations" and state:
+                group_status_counts = status_counts
             total = sum(group_status_counts.values())
             done = sum(
                 group_status_counts.get(value, 0) for value in ("succeeded", "failed", "cancelled")
@@ -1682,6 +1697,10 @@ def create_api_router(
                         if representative.kind == "cover_backfill"
                         else "Maintenance and health checks"
                         if representative.kind == "maintenance"
+                        else match_operation_group_title(
+                            row.group_key, serialized["context"].get("action", "")
+                        )
+                        if representative.kind == JobKind.MATCH_OPERATION.value
                         else serialized["context"].get("title") or serialized["description"]
                     ),
                     "cover_url": serialized["context"].get("cover_url", ""),
@@ -2392,6 +2411,7 @@ def serialize_jobs(session: Session, rows: list[WorkJob]) -> list[dict[str, Any]
                 ]
                 context = {
                     "operation_id": operation.id,
+                    "action": operation.action,
                     "proposal_ids": list(operation.proposal_ids or []),
                     "series_ids": list(operation.series_ids or []),
                     "title": " + ".join(titles[:2]),

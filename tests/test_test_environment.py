@@ -103,6 +103,9 @@ def test_runtime_entrypoints_do_not_reinvoke_uv() -> None:
     assert 'docker stop --time "${STAGE_POSTGRES_STOP_SECONDS:-300}"' in stage
     assert 'docker rm -f "$postgres"' not in stage
     assert 'STAGE_BIND_ADDRESS:-0.0.0.0' in stage
+    assert 'kavita_env_file="$state_dir/$project-kavita.env"' in stage
+    assert 'saved_kavita_api_key=$(sed' in stage
+    assert 'KAVITA_URL and KAVITA_API_KEY must be set together' in stage
     kavita = (ROOT / "scripts" / "kavita-local.sh").read_text()
     assert "jvmilazz0/kavita:0.8.9" in kavita
     assert "jvmilazz0/kavita:0.9.0.2" not in kavita
