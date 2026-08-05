@@ -139,19 +139,6 @@ def provider_duplicate_groups(
     identity_ids = {row.id for row in identities}
     if not identity_ids:
         return []
-    chapters: dict[int, set[str]] = {identity_id: set() for identity_id in identity_ids}
-    for identity_id, canonical_number in session.execute(
-        select(
-            CatalogChapterRelease.source_series_id,
-            CatalogChapter.canonical_number,
-        )
-        .join(CatalogChapter, CatalogChapter.id == CatalogChapterRelease.chapter_id)
-        .where(
-            CatalogChapterRelease.source_series_id.in_(identity_ids or {-1}),
-            CatalogChapter.sort_number.is_not(None),
-        )
-    ):
-        chapters[identity_id].add(canonical_number)
     external_ids: dict[int, dict[str, str]] = {
         identity_id: {} for identity_id in identity_ids
     }
@@ -205,33 +192,45 @@ def provider_duplicate_groups(
             tuple(sorted((left.id, right.id))) for left, right in combinations(rows, 2)
         )
 
-    cover_buckets: dict[tuple[str, int, str], list[int]] = {}
     identities_by_id = {row.id: row for row in identities}
+    token_pair_buckets: dict[tuple[str, str, str], list[int]] = {}
     for identity in identities:
-        signature = signatures.get(identity.id)
-        hashes = [
-            str(value)
-            for value in (signature.feature_json if signature else {}).get("hashes", [])
-        ]
-        for hash_value in hashes:
-            if len(hash_value) != 16:
-                continue
-            # Nine disjoint bands make this an exhaustive candidate filter for the eight-bit
-            # Hamming threshold: at least one band must be identical. The final full-hash
-            # comparison still decides equivalence, so a shared short band is never evidence.
-            try:
-                bits = f"{int(hash_value, 16):064b}"
-            except ValueError:
-                continue
-            for band_index in range(9):
-                start = band_index * 7
-                end = 64 if band_index == 8 else start + 7
-                band = bits[start:end]
-                cover_buckets.setdefault((identity.source, band_index, band), []).append(
-                    identity.id
-                )
-    for ids in cover_buckets.values():
-        candidate_pairs.update(tuple(sorted(pair)) for pair in combinations(sorted(set(ids)), 2))
+        # Cover-based equivalence ultimately requires two shared title tokens. Generate on that
+        # selective requirement first, then perform the exact Hamming comparison. The former
+        # nine-band cover index could put hundreds of near-identical placeholder covers in one
+        # bucket and materialize millions of pairs that evidence would immediately reject.
+        for left_token, right_token in combinations(sorted(_title_tokens(identity.title)), 2):
+            token_pair_buckets.setdefault(
+                (identity.source, left_token, right_token), []
+            ).append(identity.id)
+    for ids in token_pair_buckets.values():
+        for pair in combinations(sorted(set(ids)), 2):
+            if _signature_distance(
+                signatures.get(pair[0]), signatures.get(pair[1])
+            ) <= MAXIMUM_EQUIVALENT_COVER_HASH_DISTANCE:
+                candidate_pairs.add(pair)
+
+    # Chapter releases are by far the largest matching table. Candidate generation only needs
+    # identity/title/cover metadata, so do not scan fingerprints for thousands of identities that
+    # can never be compared. This keeps the review queue comfortably below the web statement
+    # timeout even with hundreds of thousands of chapter releases.
+    candidate_identity_ids = {
+        identity_id for pair in candidate_pairs for identity_id in pair
+    }
+    chapters: dict[int, set[str]] = {identity_id: set() for identity_id in identity_ids}
+    if candidate_identity_ids:
+        for identity_id, canonical_number in session.execute(
+            select(
+                CatalogChapterRelease.source_series_id,
+                CatalogChapter.canonical_number,
+            )
+            .join(CatalogChapter, CatalogChapter.id == CatalogChapterRelease.chapter_id)
+            .where(
+                CatalogChapterRelease.source_series_id.in_(candidate_identity_ids),
+                CatalogChapter.sort_number.is_not(None),
+            )
+        ):
+            chapters[identity_id].add(canonical_number)
 
     pair_evidence: dict[tuple[int, int], dict[str, Any]] = {}
     for pair in sorted(candidate_pairs):

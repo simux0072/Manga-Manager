@@ -6,10 +6,11 @@ from datetime import datetime, timedelta, timezone
 from collections.abc import Callable
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status as http_status
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import String, and_, case, func, or_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased, sessionmaker
 from starlette.concurrency import run_in_threadpool
 
@@ -24,9 +25,12 @@ from manga_manager.domain.jobs import (
 from manga_manager.application.download_plans import DownloadPlanCoordinator
 from manga_manager.application.kavita_sync import KavitaSyncPlanner
 from manga_manager.application.library_repair import enqueue_library_repair
-from manga_manager.application.match_training import record_training_label
 from manga_manager.application.matching_score import score_candidate_set
 from manga_manager.application.provider_duplicates import equivalent_series_clusters
+from manga_manager.application.match_operations import (
+    enqueue_match_operation,
+    serialize_match_operation,
+)
 from manga_manager.application.cover_evidence import (
     ensure_cover_thumbnail,
     thumbnail_relative_path,
@@ -39,6 +43,8 @@ from manga_manager.infrastructure.db_models import (
     CatalogCoverAsset,
     CatalogCoverSignature,
     CatalogMatchDecision,
+    MatchOperation,
+    MatchOperationSeries,
     CatalogSeries,
     CatalogSeriesAlias,
     CatalogSourceSeries,
@@ -412,6 +418,13 @@ def proposal_blockers(session: Session, series_ids: list[int]) -> list[str]:
     )
     if active is not None:
         blockers.append("active jobs")
+    reserved = session.scalar(
+        select(MatchOperationSeries.series_id)
+        .where(MatchOperationSeries.series_id.in_(series_ids))
+        .limit(1)
+    )
+    if reserved is not None:
+        blockers.append("merge or split already processing")
     return blockers
 
 
@@ -984,6 +997,24 @@ def create_api_router(
                     for value in provider_merge_conflicts(session, row["series_ids"])
                 )
             blockers_by_proposal[row["id"]] = blockers
+        visible_proposal_ids = {row["id"] for row in rows}
+        operations_by_proposal: dict[int, MatchOperation] = {}
+        if visible_proposal_ids:
+            operation_rows = session.scalars(
+                select(MatchOperation)
+                .where(MatchOperation.status.in_(("queued", "running", "failed")))
+                .order_by(MatchOperation.id.desc())
+                .limit(500)
+            ).all()
+            for operation in operation_rows:
+                for proposal_id in operation.proposal_ids or []:
+                    if proposal_id in visible_proposal_ids:
+                        operations_by_proposal.setdefault(proposal_id, operation)
+                if operation.status in {"queued", "running"}:
+                    reserved_ids = set(operation.series_ids or [])
+                    for proposal in rows:
+                        if reserved_ids.intersection(proposal["series_ids"]):
+                            operations_by_proposal.setdefault(proposal["id"], operation)
         display_identities = {
             row["id"]: (
                 matched_identity(row, row["left"].series_id, row["left"]),
@@ -999,6 +1030,9 @@ def create_api_router(
                     "confidence": row["confidence"],
                     "evidence": human_evidence(row["evidence_json"]),
                     "blocked_reasons": blockers_by_proposal[row["id"]],
+                    "operation": serialize_match_operation(operations_by_proposal[row["id"]])
+                    if row["id"] in operations_by_proposal
+                    else None,
                     "left": {
                         **canonical[row["left"].series_id],
                         "source_title": display_identities[row["id"]][0].title,
@@ -1277,12 +1311,10 @@ def create_api_router(
             "can_merge": not conflicts,
         }
 
-    @router.post("/series/merge")
+    @router.post("/series/merge", status_code=http_status.HTTP_202_ACCEPTED)
     def merge_series(change: MergeSeriesChange, session: SessionDep):
         if change.confirmation != "MERGE":
             raise HTTPException(422, "MERGE confirmation required")
-        from manga_manager.web.app import merge_canonical_series
-
         with session.begin():
             ids = sorted(set(change.series_ids))
             provider_count = len(provider_names())
@@ -1293,60 +1325,61 @@ def create_api_router(
                 raise HTTPException(404, "one or more manga no longer exist")
             if any(row.status not in TRACKED_STATES for row in rows):
                 raise HTTPException(422, "manual merges are limited to manga in the library")
-            identities = session.scalars(
-                select(CatalogSourceSeries).where(
-                    CatalogSourceSeries.series_id.in_(set(change.series_ids))
-                )
-            ).all()
-            for index, left in enumerate(identities):
-                for right in identities[index + 1 :]:
-                    if left.series_id == right.series_id or left.source == right.source:
-                        continue
-                    record_training_label(
+            blockers = [
+                reason
+                for reason in proposal_blockers(session, ids)
+                if reason != "merge or split already processing"
+            ]
+            if blockers:
+                raise HTTPException(409, "; ".join(blockers))
+            try:
+                with session.begin_nested():
+                    operation, created = enqueue_match_operation(
                         session,
-                        left_source_series_id=left.id,
-                        right_source_series_id=right.id,
-                        label=1,
-                        origin="manual_merge",
+                        action="accepted",
+                        representative_id=0,
+                        decision_ids=[],
+                        proposal_ids=[],
+                        series_ids=ids,
                     )
-            target_id = merge_canonical_series(session, change.series_ids)
-        return {"target_id": target_id, "merged_ids": sorted(set(change.series_ids))}
+            except IntegrityError as error:
+                raise HTTPException(
+                    409, "another merge or split claimed one of these manga"
+                ) from error
+        return {"operation": serialize_match_operation(operation), "created": created}
 
-    @router.post("/matches/{decision_id}")
+    @router.post("/matches/{decision_id}", status_code=http_status.HTTP_202_ACCEPTED)
     def decide_match(decision_id: int, change: MatchChange, session: SessionDep):
         if change.decision not in {"accepted", "rejected"}:
             raise HTTPException(422, "invalid match decision")
         if change.decision == "accepted" and change.confirmation != "MERGE":
             raise HTTPException(422, "MERGE confirmation required")
-        from manga_manager.web.app import merge_canonical_series
-
         with session.begin():
             proposal = pending_match_proposal(session, decision_id)
             if proposal is None:
                 raise HTTPException(404, "match not found")
-            blockers = proposal_blockers(session, proposal["series_ids"])
+            blockers = [
+                reason
+                for reason in proposal_blockers(session, proposal["series_ids"])
+                if reason != "merge or split already processing"
+            ]
             if change.decision == "accepted" and blockers:
                 raise HTTPException(409, "; ".join(blockers))
-            decisions = session.scalars(
-                select(CatalogMatchDecision).where(
-                    CatalogMatchDecision.id.in_(proposal["decision_ids"])
-                )
-            ).all()
-            for decision in decisions:
-                record_training_label(
-                    session,
-                    left_source_series_id=decision.left_source_series_id,
-                    right_source_series_id=decision.right_source_series_id,
-                    label=int(change.decision == "accepted"),
-                    origin="suggested_review",
-                    decision=decision,
-                )
-                decision.decision = change.decision
-                decision.decided_by = "operator"
-                decision.decided_at = utcnow()
-            if change.decision == "accepted":
-                merge_canonical_series(session, proposal["series_ids"])
-        return {"id": decision_id, "decision": change.decision}
+            try:
+                with session.begin_nested():
+                    operation, created = enqueue_match_operation(
+                        session,
+                        action=change.decision,
+                        representative_id=decision_id,
+                        decision_ids=proposal["decision_ids"],
+                        proposal_ids=[proposal["id"]],
+                        series_ids=proposal["series_ids"],
+                    )
+            except IntegrityError as error:
+                raise HTTPException(
+                    409, "another merge or split claimed one of these manga"
+                ) from error
+        return {"operation": serialize_match_operation(operation), "created": created}
 
     @router.post("/match-batch/preview")
     def preview_match_batch(change: BatchMatchChange, session: SessionDep):
@@ -1371,7 +1404,7 @@ def create_api_router(
             "items": items,
         }
 
-    @router.post("/match-batch")
+    @router.post("/match-batch", status_code=http_status.HTTP_202_ACCEPTED)
     def decide_match_batch(change: BatchMatchChange, session: SessionDep):
         if (not change.ids and not change.entire_queue) or change.decision not in {
             "accepted",
@@ -1380,8 +1413,6 @@ def create_api_router(
             raise HTTPException(422, "select matches and a valid decision")
         if change.decision == "accepted" and change.confirmation != "MERGE":
             raise HTTPException(422, "MERGE confirmation required")
-        from manga_manager.web.app import merge_canonical_series
-
         with session.begin():
             proposals = pending_match_proposal_index(session)
             excluded_ids = set(change.excluded_ids)
@@ -1390,12 +1421,18 @@ def create_api_router(
                 if change.entire_queue
                 else [row for row in proposals if row["id"] in set(change.ids)]
             )
-            applied: list[int] = []
+            queued: list[MatchOperation] = []
             blocked: list[dict[str, Any]] = []
             components = connected_proposal_components(selected)
             for component in components:
                 reasons = (
-                    proposal_component_blockers(session, component["series_ids"])
+                    [
+                        reason
+                        for reason in proposal_component_blockers(
+                            session, component["series_ids"]
+                        )
+                        if reason != "merge or split already processing"
+                    ]
                     if change.decision == "accepted"
                     else []
                 )
@@ -1407,38 +1444,38 @@ def create_api_router(
                     continue
                 try:
                     with session.begin_nested():
-                        decision_ids = {
+                        proposal_ids = [row["id"] for row in component["proposals"]]
+                        decision_ids = [
                             decision_id
                             for proposal in component["proposals"]
                             for decision_id in proposal["decision_ids"]
-                        }
-                        rows = session.scalars(
-                            select(CatalogMatchDecision).where(
-                                CatalogMatchDecision.id.in_(decision_ids)
-                            )
-                        ).all()
-                        for row in rows:
-                            record_training_label(
-                                session,
-                                left_source_series_id=row.left_source_series_id,
-                                right_source_series_id=row.right_source_series_id,
-                                label=int(change.decision == "accepted"),
-                                origin="batch_review",
-                                decision=row,
-                            )
-                            row.decision = change.decision
-                            row.decided_by = "operator"
-                            row.decided_at = utcnow()
-                        if change.decision == "accepted":
-                            merge_canonical_series(session, component["series_ids"])
-                except HTTPException as error:
+                        ]
+                        operation, _created = enqueue_match_operation(
+                            session,
+                            action=change.decision,
+                            representative_id=min(proposal_ids),
+                            decision_ids=decision_ids,
+                            proposal_ids=proposal_ids,
+                            series_ids=component["series_ids"],
+                        )
+                except (HTTPException, IntegrityError) as error:
+                    detail = (
+                        str(error.detail)
+                        if isinstance(error, HTTPException)
+                        else "another merge or split claimed one of these manga"
+                    )
                     blocked.extend(
-                        {"id": proposal["id"], "reasons": [str(error.detail)]}
+                        {"id": proposal["id"], "reasons": [detail]}
                         for proposal in component["proposals"]
                     )
                     continue
-                applied.extend(proposal["id"] for proposal in component["proposals"])
-        return {"ids": applied, "blocked": blocked, "decision": change.decision}
+                queued.append(operation)
+        return {
+            "operations": [serialize_match_operation(row) for row in queued],
+            "ids": [proposal_id for row in queued for proposal_id in row.proposal_ids],
+            "blocked": blocked,
+            "decision": change.decision,
+        }
 
     @router.get("/jobs")
     def jobs(
@@ -2071,24 +2108,29 @@ def create_api_router(
         def load_event_batch(cursor: int) -> tuple[list[dict[str, Any]], dict[str, int]]:
             with factory_provider()() as session:
                 rows = session.execute(
-                    select(JobEvent, WorkJob.kind)
+                    select(JobEvent, WorkJob)
                     .outerjoin(WorkJob, WorkJob.id == JobEvent.job_id)
                     .where(JobEvent.id > cursor)
                     .order_by(JobEvent.id)
                     .limit(100)
                 ).all()
-                payloads = [
-                    {
+                payloads = []
+                for event, job in rows:
+                    payload = {
                         "event_id": event.id,
                         "job_id": event.job_id,
-                        "kind": kind or "",
+                        "kind": job.kind if job is not None else "",
                         "state": event.status,
                         "type": event.event_type,
                         "message": event.message,
                         "timestamp": event.created_at.isoformat(),
                     }
-                    for event, kind in rows
-                ]
+                    if job is not None and job.kind == JobKind.MATCH_OPERATION.value:
+                        operation_id = int(job.payload.get("operation_id", 0))
+                        operation = session.get(MatchOperation, operation_id)
+                        if operation is not None:
+                            payload["operation"] = serialize_match_operation(operation)
+                    payloads.append(payload)
                 counts = (
                     {
                         str(status): int(count)
@@ -2251,6 +2293,21 @@ def serialize_jobs(session: Session, rows: list[WorkJob]) -> list[dict[str, Any]
     for row in rows:
         if row.kind == "kavita_sync":
             series_ids.update(int(value) for value in row.payload.get("series_ids", []) if value)
+    match_operation_ids = {
+        int(row.payload.get("operation_id", 0))
+        for row in rows
+        if row.kind == JobKind.MATCH_OPERATION.value and row.payload.get("operation_id")
+    }
+    match_operations = {
+        operation.id: operation
+        for operation in session.scalars(
+            select(MatchOperation).where(
+                MatchOperation.id.in_(match_operation_ids or {-1})
+            )
+        )
+    }
+    for operation in match_operations.values():
+        series_ids.update(int(value) for value in operation.series_ids or [])
     series_context = {
         series.id: {
             "series_id": series.id,
@@ -2312,6 +2369,24 @@ def serialize_jobs(session: Session, rows: list[WorkJob]) -> list[dict[str, Any]
             description = (
                 f"Build cover evidence · source series #{row.payload.get('source_series_id', '?')}"
             )
+        elif row.kind == JobKind.MATCH_OPERATION.value:
+            operation = match_operations.get(int(row.payload.get("operation_id", 0)))
+            if operation is not None:
+                titles = [
+                    series_context[series_id]["title"]
+                    for series_id in operation.series_ids
+                    if series_id in series_context
+                ]
+                context = {
+                    "operation_id": operation.id,
+                    "proposal_ids": list(operation.proposal_ids or []),
+                    "series_ids": list(operation.series_ids or []),
+                    "title": " + ".join(titles[:2]),
+                }
+                verb = "Merge" if operation.action == "accepted" else "Keep separate"
+                description = f"{verb} · {context['title'] or 'suggested manga'}"
+            else:
+                description = "Process manga match decision"
         elif row.kind == "maintenance":
             action = str(row.payload.get("action", ""))
             if action.startswith("provider_probe_"):

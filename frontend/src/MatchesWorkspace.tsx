@@ -1,10 +1,10 @@
 import {useEffect, useMemo, useRef, useState} from 'react'
 import {useInfiniteQuery, useMutation, useQuery, useQueryClient} from '@tanstack/react-query'
 import type {InfiniteData} from '@tanstack/react-query'
-import {AlertTriangle, ArrowUpDown, BookOpen, Check, ExternalLink, Merge, Search, Split, X} from 'lucide-react'
+import {AlertTriangle, ArrowUpDown, BookOpen, Check, ExternalLink, LoaderCircle, Merge, Search, Split, X} from 'lucide-react'
 
 import {api} from './api'
-import type {Match, MatchSide, MergeCandidate, MergePreview, Page, Series} from './types'
+import type {Match, MatchOperation, MatchSide, MergeCandidate, MergePreview, Page, Series} from './types'
 
 const fallbackProviders = ['asura', 'mangadex', 'mangafire', 'kingofshojo']
 
@@ -41,6 +41,11 @@ function SuggestedMatches() {
   const [batchPreview, setBatchPreview] = useState<{selected:number;eligible:number;blocked:number;items:{id:number;blocked_reasons:string[]}[]}|null>(null)
   const [confirmBatch, setConfirmBatch] = useState(false)
   const [previewBusy, setPreviewBusy] = useState(false)
+  const [operations, setOperations] = useState<Record<number, MatchOperation>>({})
+  const [submitting, setSubmitting] = useState<number[]>([])
+  const [failureNotices, setFailureNotices] = useState<MatchOperation[]>([])
+  const cardRefs = useRef(new Map<number, HTMLElement>())
+  const noticeTimers = useRef(new Map<number, {timer:number;deadline:number;remaining:number}>())
   const queryKey = ['matches', order] as const
   const query = useInfiniteQuery({
     queryKey,
@@ -48,6 +53,7 @@ function SuggestedMatches() {
     initialPageParam: 0,
     getNextPageParam: page => page.next_cursor || undefined,
     maxPages: 10,
+    retry: 3,
   })
   const updateCachedMatches = (remove: (match: Match) => boolean) => {
     client.setQueryData<InfiniteData<Page<Match, number>>>(queryKey, current => current && ({
@@ -58,70 +64,126 @@ function SuggestedMatches() {
       })),
     }))
   }
+  const operationRemoves = (operation: MatchOperation, match: Match) => {
+    if (operation.proposal_ids.includes(match.id)) return true
+    if (operation.action === 'rejected' && operation.series_ids.length === 2
+      && [match.left.id, match.right.id].every(id => operation.series_ids.includes(id))) return true
+    return operation.action === 'accepted'
+      && operation.series_ids.some(id => id === match.left.id || id === match.right.id)
+  }
+  const removeCompleted = (operation: MatchOperation) => {
+    const cached = client.getQueryData<InfiniteData<Page<Match, number>>>(queryKey)
+    const current = deduplicateMatches(cached?.pages.flatMap(page => page.items) || [])
+    const anchor = current.find(match => !operationRemoves(operation, match)
+      && (cardRefs.current.get(match.id)?.getBoundingClientRect().bottom || 0) > 80)
+    const anchorTop = anchor ? cardRefs.current.get(anchor.id)?.getBoundingClientRect().top : undefined
+    updateCachedMatches(match => operationRemoves(operation, match))
+    if (anchor && anchorTop !== undefined) requestAnimationFrame(() => {
+      const nextTop = cardRefs.current.get(anchor.id)?.getBoundingClientRect().top
+      if (nextTop !== undefined) window.scrollBy({top: nextTop - anchorTop, behavior: 'auto'})
+    })
+  }
+  const dismissNotice = (id: number) => {
+    const state = noticeTimers.current.get(id)
+    if (state) window.clearTimeout(state.timer)
+    noticeTimers.current.delete(id)
+    setFailureNotices(current => current.filter(item => item.id !== id))
+  }
+  const scheduleNotice = (id: number, delay = 15_000) => {
+    const timer = window.setTimeout(() => dismissNotice(id), delay)
+    noticeTimers.current.set(id, {timer, deadline: Date.now() + delay, remaining: delay})
+  }
+  const pauseNotice = (id: number) => {
+    const state = noticeTimers.current.get(id)
+    if (!state) return
+    window.clearTimeout(state.timer)
+    state.remaining = Math.max(state.deadline - Date.now(), 500)
+  }
+  const resumeNotice = (id: number) => {
+    const state = noticeTimers.current.get(id)
+    if (!state) return
+    scheduleNotice(id, state.remaining)
+  }
+  const showFailure = (operation: MatchOperation) => {
+    dismissNotice(operation.id)
+    setFailureNotices(current => [operation, ...current.filter(item => item.id !== operation.id)].slice(0, 3))
+    scheduleNotice(operation.id)
+  }
   const decision = useMutation({
     mutationFn: ({id, value}: {id: number; value: 'accepted' | 'rejected'}) =>
       api.decideMatch(id, value, value === 'accepted' ? 'MERGE' : ''),
-    onMutate: async ({id}) => {
-      await client.cancelQueries({queryKey, exact: true})
-      const previous = client.getQueryData<InfiniteData<Page<Match, number>>>(queryKey)
-      const reviewed = previous?.pages.flatMap(page => page.items).find(match => match.id === id)
-      const reviewedPair = reviewed && matchPairKey(reviewed)
-      updateCachedMatches(match => match.id === id || (!!reviewedPair && matchPairKey(match) === reviewedPair))
-      return {previous, reviewed}
+    onMutate: ({id}) => {
+      setSubmitting(current => current.includes(id) ? current : [...current, id])
+      const cached = client.getQueryData<InfiniteData<Page<Match, number>>>(queryKey)
+      return {reviewed: cached?.pages.flatMap(page => page.items).find(match => match.id === id)}
     },
-    onError: (error, _variables, context) => {
-      if (context?.previous) client.setQueryData(queryKey, context.previous)
+    onError: error => {
       window.dispatchEvent(new CustomEvent('manga-toast', {detail: {message: error.message, tone: 'error'}}))
     },
-    onSuccess: (_result, variables, context) => {
+    onSuccess: (result, variables, context) => {
       setConfirm(null)
-      if (variables.value === 'accepted' && context?.reviewed) {
-        const affectedSeries = new Set([context.reviewed.left.id, context.reviewed.right.id])
-        // Connected proposals can become obsolete after a merge. Remove them from the current
-        // view without collapsing the infinite list or moving a deep-scroll viewport to page one.
-        updateCachedMatches(match => affectedSeries.has(match.left.id) || affectedSeries.has(match.right.id))
-      }
-      client.invalidateQueries({queryKey: ['library']})
+      setOperations(current => ({...current, [result.operation.id]: result.operation}))
       const titles = context?.reviewed
         ? `${context.reviewed.left.title} and ${context.reviewed.right.title}`
         : `Match #${variables.id}`
       window.dispatchEvent(new CustomEvent('manga-toast', {detail: {message:
-        variables.value === 'accepted' ? `Merged ${titles}` : `Kept ${titles} separate`,
+        `${variables.value === 'accepted' ? 'Merge' : 'Split'} queued for ${titles}`,
       }}))
     },
+    onSettled: (_data, _error, variables) => setSubmitting(current => current.filter(id => id !== variables.id)),
   })
   const batch = useMutation({
     mutationFn: ({value}:{value:'accepted'|'rejected'}) => api.decideMatches(selected,value,value==='accepted'?'MERGE':'',entireQueue,excluded),
     onSuccess: (result, variables) => {
-      const applied = new Set(result.ids)
-      const cached = client.getQueryData<InfiniteData<Page<Match, number>>>(queryKey)
-      const appliedPairs = new Set(
-        cached?.pages.flatMap(page => page.items)
-          .filter(match => applied.has(match.id)).map(matchPairKey) || [],
-      )
-      const affectedSeries = new Set<number>()
-      if (variables.value === 'accepted') {
-        cached?.pages.flatMap(page => page.items).filter(match => applied.has(match.id)).forEach(match => {
-          affectedSeries.add(match.left.id); affectedSeries.add(match.right.id)
-        })
-      }
-      updateCachedMatches(match => applied.has(match.id) || appliedPairs.has(matchPairKey(match))
-        || affectedSeries.has(match.left.id) || affectedSeries.has(match.right.id))
+      setOperations(current => Object.fromEntries([
+        ...Object.entries(current),
+        ...result.operations.map(operation => [String(operation.id), operation] as const),
+      ]))
       setSelected([]); setExcluded([]); setEntireQueue(false); setBatchPreview(null); setConfirmBatch(false)
-      client.invalidateQueries({queryKey:['library']})
       window.dispatchEvent(new CustomEvent('manga-toast',{detail:{message:
-        `${result.ids.length} proposal${result.ids.length===1?'':'s'} ${variables.value==='accepted'?'merged':'kept separate'}`,
+        `${result.operations.length} ${variables.value==='accepted'?'merge':'split'} operation${result.operations.length===1?'':'s'} queued`,
       }}))
       if(result.blocked.length) window.dispatchEvent(new CustomEvent('manga-toast',{detail:{message:`${result.blocked.length} blocked proposals remain pending`}}))
     },
     onError: error => window.dispatchEvent(new CustomEvent('manga-toast',{detail:{message:error.message,tone:'error'}})),
   })
-  const reviewBusy = decision.isPending || batch.isPending || previewBusy
+  const reviewBusy = batch.isPending || previewBusy
   const items = useMemo(
     () => deduplicateMatches(query.data?.pages.flatMap(page => page.items) || []),
     [query.data],
   )
   const visibleIds = items.map(match => match.id).join(',')
+  const knownOperations = useMemo(() => {
+    const result = new Map<number, MatchOperation>()
+    items.forEach(match => { if (match.operation) result.set(match.operation.id, match.operation) })
+    Object.values(operations).forEach(operation => result.set(operation.id, operation))
+    return [...result.values()].sort((left, right) => right.id - left.id)
+  }, [items, operations])
+  const activeOperations = knownOperations.filter(operation => operation.status === 'queued' || operation.status === 'running')
+  const operationFor = (match: Match) => activeOperations.find(operation =>
+    operation.series_ids.some(id => id === match.left.id || id === match.right.id))
+  const failedOperationFor = (match: Match) => knownOperations.find(operation =>
+    operation.status === 'failed' && operation.proposal_ids.includes(match.id))
+  useEffect(() => {
+    const receive = (event: Event) => {
+      const detail = (event as CustomEvent<{kind?:string;operation?:MatchOperation}>).detail
+      const operation = detail?.kind === 'match_operation' ? detail.operation : undefined
+      if (!operation) return
+      setOperations(current => ({...current, [operation.id]: operation}))
+      if (operation.status === 'succeeded') {
+        removeCompleted(operation)
+        const verb = operation.action === 'accepted' ? 'Merge completed' : 'Titles kept separate'
+        window.dispatchEvent(new CustomEvent('manga-toast', {detail: {message: verb}}))
+      } else if (operation.status === 'failed') {
+        showFailure(operation)
+      }
+    }
+    window.addEventListener('manga-job-event', receive)
+    return () => window.removeEventListener('manga-job-event', receive)
+  }, [order])
+  useEffect(() => () => {
+    noticeTimers.current.forEach(state => window.clearTimeout(state.timer))
+  }, [])
   useEffect(() => {
     if (entireQueue) return
     const currentIds = new Set(items.map(match => match.id))
@@ -149,9 +211,10 @@ function SuggestedMatches() {
     }
   }
   if (query.isLoading) return <Loading />
-  if (query.isError) return <Message icon={<AlertTriangle />} title="Could not load matches" detail={query.error.message} />
+  if (query.isError && !items.length) return <Message icon={<AlertTriangle />} title="Could not load matches" detail={query.error.message} />
   if (!items.length) return <Message icon={<Check />} title="No matches need review" detail="Use Manual merge when you already know two titles belong together." />
   return <>
+    {query.isError&&<div className="inline-notice error" role="status">The latest refresh failed. Your loaded matches are still available; retrying automatically.</div>}
     <section className="match-batch-bar">
       <label><input type="checkbox" checked={entireQueueChecked} disabled={reviewBusy} onChange={event=>{setEntireQueue(event.target.checked);setSelected([]);setExcluded([]);setBatchPreview(null)}}/> Select entire queue</label>
       <span>{entireQueue?(excluded.length?`Entire queue except ${excluded.length}`:'Entire queue'):`${selected.length} selected`}</span>
@@ -163,20 +226,22 @@ function SuggestedMatches() {
     </section>
     {batchPreview?.items.some(item=>item.blocked_reasons.length>0)&&<div className="inline-notice" role="status">Blocked proposals remain pending: {batchPreview.items.filter(item=>item.blocked_reasons.length).map(item=>`#${item.id} ${item.blocked_reasons.join(', ')}`).join(' · ')}</div>}
     <div className="match-list">
-      {items.map(match => <article className="match-card" key={match.id}>
-        <label className="match-select"><input type="checkbox" checked={entireQueue?!excluded.includes(match.id):selected.includes(match.id)} disabled={reviewBusy} onChange={()=>{setBatchPreview(null);if(entireQueue){setExcluded(current=>current.includes(match.id)?current.filter(id=>id!==match.id):[...current,match.id])}else{setSelected(current=>current.includes(match.id)?current.filter(id=>id!==match.id):[...current,match.id])}}}/>Select</label>
+      {items.map(match => { const activeOperation=operationFor(match); const ownOperation=activeOperation?.proposal_ids.includes(match.id); const failedOperation=failedOperationFor(match); const isSubmitting=submitting.includes(match.id); const disabled=!!activeOperation||isSubmitting; return <article className={`match-card ${activeOperation?'processing':''} ${failedOperation?'operation-failed':''}`} key={match.id} tabIndex={-1} ref={node=>{if(node)cardRefs.current.set(match.id,node);else cardRefs.current.delete(match.id)}} aria-busy={!!activeOperation}>
+        <label className="match-select"><input type="checkbox" checked={entireQueue?!excluded.includes(match.id):selected.includes(match.id)} disabled={reviewBusy||disabled} onChange={()=>{setBatchPreview(null);if(entireQueue){setExcluded(current=>current.includes(match.id)?current.filter(id=>id!==match.id):[...current,match.id])}else{setSelected(current=>current.includes(match.id)?current.filter(id=>id!==match.id):[...current,match.id])}}}/>Select</label>
+        {(activeOperation||isSubmitting)&&<div className="match-operation-state"><LoaderCircle />{isSubmitting?'Queueing…':ownOperation?(activeOperation?.action==='accepted'?'Merging…':'Splitting…'):'Waiting for related operation'}</div>}
+        {failedOperation&&<div className="match-operation-state failed"><AlertTriangle />Last operation failed · retry when ready</div>}
         <Side side={match.left} />
         <div className="match-evidence">
           <div className="confidence"><b>{Math.round(match.confidence * 100)}%</b><span>confidence</span></div>
           {match.evidence.map(item => <span className={`evidence evidence-${item.tone}`} key={item.label}>{item.label}</span>)}
           {match.blocked_reasons.map(reason=><span className="evidence evidence-warning" key={reason}>{reason}</span>)}
           <div className="match-actions">
-            <button className="secondary" disabled={reviewBusy} onClick={() => decision.mutate({id: match.id, value: 'rejected'})}><Split />Keep separate</button>
-            <button className="primary" disabled={reviewBusy} onClick={() => setConfirm(match.id)}><Merge />Merge</button>
+            <button className="secondary" disabled={disabled} onClick={() => decision.mutate({id: match.id, value: 'rejected'})}><Split />Keep separate</button>
+            <button className="primary" disabled={disabled} onClick={() => setConfirm(match.id)}><Merge />Merge</button>
           </div>
         </div>
         <Side side={match.right} />
-      </article>)}
+      </article>})}
     </div>
     <Pager hasNext={!!query.hasNextPage} loading={query.isFetchingNextPage} load={() => query.fetchNextPage()} />
     {confirm !== null && <ConfirmModal
@@ -196,6 +261,11 @@ function SuggestedMatches() {
       confirm={()=>batch.mutate({value:'accepted'})}
       disabled={batchPreview.eligible===0}
     />}
+    <div className="match-failure-stack" aria-live="polite">
+      {failureNotices.map(operation => <div className="match-failure-toast" key={operation.id} role="alert" tabIndex={0} onMouseEnter={()=>pauseNotice(operation.id)} onMouseLeave={()=>resumeNotice(operation.id)} onFocus={()=>pauseNotice(operation.id)} onBlur={()=>resumeNotice(operation.id)} onClick={()=>{const id=operation.proposal_ids[0]||operation.representative_id;cardRefs.current.get(id)?.scrollIntoView({behavior:'smooth',block:'center'});cardRefs.current.get(id)?.focus()}} onContextMenu={event=>{event.preventDefault();dismissNotice(operation.id)}}>
+        <AlertTriangle/><div><b>{operation.action==='accepted'?'Merge':'Split'} failed</b><span>{operation.error_message||'The operation could not be completed.'}</span><small>Click to locate · right-click to dismiss</small></div><button aria-label="Dismiss notification" onClick={event=>{event.stopPropagation();dismissNotice(operation.id)}}><X/></button>
+      </div>)}
+    </div>
   </>
 }
 
@@ -256,7 +326,7 @@ function ManualMerge({providers}: {providers: string[]}) {
     onSuccess: result => {
       setPreview(null)
       setSelected([])
-      setNotice(`Merged into series #${result.target_id}. Library repair has been queued.`)
+      setNotice(`Merge #${result.operation.id} is queued. You can continue selecting manga.`)
       client.invalidateQueries({queryKey: ['library']})
       client.invalidateQueries({queryKey: ['matches']})
     },

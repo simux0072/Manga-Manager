@@ -1400,6 +1400,8 @@ def default_pool(kind: JobKind, source: str = "") -> str:
         return "cover_backfill"
     if kind is JobKind.NOTIFICATION:
         return "notification"
+    if kind is JobKind.MATCH_OPERATION:
+        return "catalog_mutation"
     return "maintenance"
 
 

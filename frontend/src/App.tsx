@@ -35,11 +35,17 @@ export function App(){
     stream.addEventListener('job',event=>{
       last=Math.max(last,Number((event as MessageEvent).lastEventId||0))
       sessionStorage.setItem('eventCursor',String(last))
-      let payload:{kind?:string;type?:string;state?:string}={}
+      let payload:{kind?:string;type?:string;state?:string;operation?:unknown}={}
       try{payload=JSON.parse((event as MessageEvent).data)}catch{}
+      window.dispatchEvent(new CustomEvent('manga-job-event',{detail:payload}))
       scheduleRefresh('jobs','job-groups','job-group-children')
       if(payload.type!=='progress')scheduleRefresh('workload-cycle','operations','activity')
       if(payload.kind==='kavita_sync'&&['succeeded','failed','cancelled'].includes(payload.state||''))scheduleRefresh('library','updates')
+      if(payload.kind==='match_operation'){
+        scheduleRefresh('matches','library','merge-library','merge-candidates')
+        const operation=payload.operation as {proposal_ids?:number[];error_message?:string}|undefined
+        if(payload.state==='failed'&&operation&&!operation.proposal_ids?.length)window.dispatchEvent(new CustomEvent('manga-toast',{detail:{message:operation.error_message||'Manual merge failed',tone:'error'}}))
+      }
     })
     stream.addEventListener('counts',()=>scheduleRefresh('operations','workload-cycle'))
     return()=>{

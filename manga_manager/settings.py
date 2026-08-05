@@ -24,6 +24,7 @@ class V2Settings(BaseSettings):
     worker_concurrency: int = Field(default=24, ge=4, le=64)
     global_chapter_concurrency: int = Field(default=20, ge=1, le=64)
     network_worker_concurrency: int = Field(default=20, ge=1, le=64)
+    match_operation_concurrency: int = Field(default=3, ge=1, le=8)
     provider_pacing_window_seconds: float = Field(default=2.0, ge=0.25, le=30.0)
     # Retained as provider-learning seed values and for benchmark compatibility.
     # Normal runtime download permits are elastic up to network_global.
@@ -114,6 +115,7 @@ class V2Settings(BaseSettings):
             "health": 1,
             "cover_backfill": 1,
             "notification": 1,
+            "catalog_mutation": self.match_operation_concurrency,
         }
 
     def source_cooldown(self, source: str) -> timedelta:

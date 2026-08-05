@@ -47,6 +47,14 @@ class WorkerService:
         self.pools = pools
 
     async def run(self, stop: asyncio.Event) -> None:
+        from manga_manager.application.match_operations import (
+            reconcile_stranded_match_operations,
+        )
+
+        with self.session_factory() as session, session.begin():
+            recovered = reconcile_stranded_match_operations(session)
+        if recovered:
+            logger.warning("released %s stranded match operation reservations", recovered)
         specs = self._pool_specs()
         slot_wakeups = {spec.slot: asyncio.Event() for spec in specs}
         pool_wakeups: dict[str, list[asyncio.Event]] = {}
@@ -58,6 +66,9 @@ class WorkerService:
             for spec in specs
         ]
         listener = asyncio.create_task(self._listen_for_jobs(stop, pool_wakeups))
+        operation_reconciler = asyncio.create_task(
+            self._reconcile_match_operations(stop)
+        )
         await stop.wait()
         grace = self.settings.worker_shutdown_grace_seconds
         try:
@@ -68,7 +79,27 @@ class WorkerService:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
         listener.cancel()
-        await asyncio.gather(listener, return_exceptions=True)
+        operation_reconciler.cancel()
+        await asyncio.gather(listener, operation_reconciler, return_exceptions=True)
+
+    async def _reconcile_match_operations(self, stop: asyncio.Event) -> None:
+        from manga_manager.application.match_operations import (
+            reconcile_stranded_match_operations,
+        )
+
+        while not stop.is_set():
+            try:
+                await asyncio.wait_for(stop.wait(), timeout=30)
+            except TimeoutError:
+                try:
+                    with self.session_factory() as session, session.begin():
+                        recovered = reconcile_stranded_match_operations(session)
+                    if recovered:
+                        logger.warning(
+                            "released %s stranded match operation reservations", recovered
+                        )
+                except Exception:
+                    logger.exception("match operation reconciliation failed")
 
     def _pool_specs(self) -> list[WorkerSlotSpec]:
         network_kinds = frozenset(
@@ -98,6 +129,7 @@ class WorkerService:
             ("maintenance", {JobKind.LIBRARY_REPAIR, JobKind.MAINTENANCE}),
             ("health", {JobKind.MAINTENANCE}),
             ("cover_backfill", {JobKind.COVER_BACKFILL}),
+            ("catalog_mutation", {JobKind.MATCH_OPERATION}),
         ]
         shared_pools = set(network_pools)
         shared_kinds = set(network_kinds)

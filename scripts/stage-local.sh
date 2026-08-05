@@ -216,6 +216,7 @@ docker run -d --name "$web" --network "$network" --restart unless-stopped --memo
   -e "V2_ENABLE_MANGAFIRE=$sources_enabled" \
   -e "V2_ENABLE_KINGOFSHOJO=$sources_enabled" \
   -e "V2_MIN_FREE_BYTES=$stage_min_free_bytes" \
+  -e "V2_MATCH_OPERATION_CONCURRENCY=${V2_MATCH_OPERATION_CONCURRENCY:-3}" \
   -e MALLOC_ARENA_MAX=2 -e MALLOC_TRIM_THRESHOLD_=131072 \
   -e "KAVITA_URL=${KAVITA_URL:-}" -e "KAVITA_API_KEY=${KAVITA_API_KEY:-}" \
   -e "KAVITA_LIBRARY_ROOT=${KAVITA_LIBRARY_ROOT:-}" \
@@ -230,6 +231,7 @@ docker run -d --name "$worker" --network "$network" --restart unless-stopped --m
   -e "V2_ENABLE_MANGAFIRE=$sources_enabled" \
   -e "V2_ENABLE_KINGOFSHOJO=$sources_enabled" \
   -e "V2_MIN_FREE_BYTES=$stage_min_free_bytes" \
+  -e "V2_MATCH_OPERATION_CONCURRENCY=${V2_MATCH_OPERATION_CONCURRENCY:-3}" \
   -e MALLOC_ARENA_MAX=2 -e MALLOC_TRIM_THRESHOLD_=131072 \
   -e "KAVITA_URL=${KAVITA_URL:-}" -e "KAVITA_API_KEY=${KAVITA_API_KEY:-}" \
   -e "KAVITA_LIBRARY_ROOT=${KAVITA_LIBRARY_ROOT:-}" \

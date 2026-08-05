@@ -215,3 +215,21 @@ def test_maintenance_worker_claims_repairs_and_catalog_rescores(
     assert specs[0].name == "shared"
     assert specs[0].claim_pools == {"maintenance"}
     assert specs[0].kinds == {JobKind.LIBRARY_REPAIR, JobKind.MAINTENANCE}
+
+
+def test_catalog_mutation_pool_uses_three_shared_slots(
+    sessions: TrackingSessionFactory,
+) -> None:
+    async def handler(_context) -> None:
+        return None
+
+    service = WorkerService(
+        session_factory=sessions,
+        handlers={JobKind.MATCH_OPERATION: handler},
+        settings=V2Settings(match_operation_concurrency=3),
+        pools={"catalog_mutation"},
+    )
+    specs = service._pool_specs()
+    assert len(specs) == 3
+    assert all(spec.claim_pools == {"catalog_mutation"} for spec in specs)
+    assert all(spec.kinds == {JobKind.MATCH_OPERATION} for spec in specs)

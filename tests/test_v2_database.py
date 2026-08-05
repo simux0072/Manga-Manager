@@ -89,6 +89,8 @@ def test_v2_migration_builds_job_constraints_and_indexes(tmp_path: Path) -> None
         "kavita_projection",
         "artifact_metadata_rewrite",
             "match_training_label",
+            "match_operation",
+            "match_operation_series",
             "workload_cycle",
             "job_daily_aggregate",
     } == set(inspector.get_table_names())
@@ -120,7 +122,7 @@ def test_v2_migration_builds_job_constraints_and_indexes(tmp_path: Path) -> None
     sessions = create_session_factory(engine)
     with sessions() as session:
         version = session.scalar(text("SELECT version_num FROM alembic_version"))
-    assert version == "0025_shared_worker_fairness"
+    assert version == "0026_async_match_operations"
 
 
 def test_catalog_recovery_migration_downgrades_and_reapplies_on_sqlite(tmp_path: Path) -> None:
@@ -136,7 +138,7 @@ def test_catalog_recovery_migration_downgrades_and_reapplies_on_sqlite(tmp_path:
 
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0025_shared_worker_fairness"
+            "0026_async_match_operations"
         )
 
 

@@ -1,4 +1,4 @@
-import type {ActivityEvent, Job, JobGroup, Match, MergeCandidate, MergePreview, Operations, Page, Series, UpdateSeries, WorkloadCycle} from './types'
+import type {ActivityEvent, Job, JobGroup, Match, MatchOperation, MergeCandidate, MergePreview, Operations, Page, Series, UpdateSeries, WorkloadCycle} from './types'
 
 async function request<T>(url:string, init?:RequestInit):Promise<T>{
   const response=await fetch(url,{...init,headers:{'Content-Type':'application/json',...(init?.headers||{})}})
@@ -15,12 +15,12 @@ export const api={
   changeChapter:(id:number,status:string)=>request(`/api/v2/chapters/${id}`,{method:'PATCH',body:JSON.stringify({status})}),
   readAll:(id:number)=>request(`/api/v2/series/${id}/chapters/read`,{method:'POST'}),
   matches:(order:'asc'|'desc'='desc',cursor?:number,signal?:AbortSignal)=>request<Page<Match,number>>(`/api/v2/matches?${params({order,cursor})}`,{signal}),
-  decideMatch:(id:number,decision:string,confirmation='')=>request(`/api/v2/matches/${id}`,{method:'POST',body:JSON.stringify({decision,confirmation})}),
+  decideMatch:(id:number,decision:string,confirmation='')=>request<{operation:MatchOperation;created:boolean}>(`/api/v2/matches/${id}`,{method:'POST',body:JSON.stringify({decision,confirmation})}),
   previewMatches:(ids:number[],entireQueue=false,excludedIds:number[]=[])=>request<{selected:number;eligible:number;blocked:number;items:{id:number;blocked_reasons:string[]}[]}>('/api/v2/match-batch/preview',{method:'POST',body:JSON.stringify({ids,excluded_ids:excludedIds,entire_queue:entireQueue,decision:'rejected'})}),
-  decideMatches:(ids:number[],decision:string,confirmation='',entireQueue=false,excludedIds:number[]=[])=>request<{ids:number[];blocked:{id:number;reasons:string[]}[]}>('/api/v2/match-batch',{method:'POST',body:JSON.stringify({ids,excluded_ids:excludedIds,decision,confirmation,entire_queue:entireQueue})}),
+  decideMatches:(ids:number[],decision:string,confirmation='',entireQueue=false,excludedIds:number[]=[])=>request<{operations:MatchOperation[];ids:number[];blocked:{id:number;reasons:string[]}[]}>('/api/v2/match-batch',{method:'POST',body:JSON.stringify({ids,excluded_ids:excludedIds,decision,confirmation,entire_queue:entireQueue})}),
   mergeCandidates:(selectedIds:number[],q:string,sources:string[],cursor?:number,signal?:AbortSignal)=>request<Page<MergeCandidate,number>>(`/api/v2/merge-candidates?${params({selected_id:selectedIds,q,source:sources,cursor})}`,{signal}),
   mergePreview:(seriesIds:number[])=>request<MergePreview>('/api/v2/series/merge-preview',{method:'POST',body:JSON.stringify({series_ids:seriesIds})}),
-  mergeSeries:(seriesIds:number[])=>request<{target_id:number;merged_ids:number[]}>('/api/v2/series/merge',{method:'POST',body:JSON.stringify({series_ids:seriesIds,confirmation:'MERGE'})}),
+  mergeSeries:(seriesIds:number[])=>request<{operation:MatchOperation;created:boolean}>('/api/v2/series/merge',{method:'POST',body:JSON.stringify({series_ids:seriesIds,confirmation:'MERGE'})}),
   jobs:(states:string[]=[],cursor?:number,limit=30,signal?:AbortSignal)=>request<Page<Job,number>>(`/api/v2/jobs?${params({state:states,cursor,limit})}`,{signal}),
   jobGroups:(states:string[]=[],cursor?:string,signal?:AbortSignal)=>request<Page<JobGroup>>(`/api/v2/job-groups?${params({state:states,cursor})}`,{signal}),
   jobGroupChildren:(key:string,states:string[]=[],cursor?:string,signal?:AbortSignal)=>request<Page<Job>>(`/api/v2/job-groups/${encodeURIComponent(key)}/children?${params({state:states,cursor})}`,{signal}),

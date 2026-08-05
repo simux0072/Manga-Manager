@@ -17,6 +17,7 @@ from manga_manager.infrastructure.db_models import (
     JobBase,
     JobEvent,
     MatchTrainingLabel,
+    MatchOperation,
     WorkerHeartbeat,
     WorkJob,
     WorkloadCycle,
@@ -30,6 +31,19 @@ from manga_manager.web.api import (
     workload_cycle_summary,
 )
 from manga_manager.web.app import create_app
+from manga_manager.application.match_operations import MatchOperationHandler
+
+
+def execute_match_operations(sessions) -> None:
+    handler = MatchOperationHandler(session_factory=sessions)
+    with sessions() as session:
+        operation_ids = list(
+            session.scalars(
+                select(MatchOperation.id).where(MatchOperation.status == "queued")
+            )
+        )
+    for operation_id in operation_ids:
+        handler._execute(operation_id)
 
 
 def app_with_catalog():
@@ -254,8 +268,9 @@ async def test_manual_merge_candidates_are_ranked_and_merge_uses_best_provider()
     assert candidates.json()["items"][0]["score_breakdown"]["title"] == 1
     assert preview.json()["target_id"] == asura_id
     assert preview.json()["can_merge"] is True
-    assert merged.status_code == 200, merged.text
-    assert merged.json()["target_id"] == asura_id
+    assert merged.status_code == 202, merged.text
+    assert merged.json()["operation"]["status"] == "queued"
+    execute_match_operations(sessions)
     with sessions() as session:
         assert session.query(CatalogSeries).count() == 1
         assert session.get(CatalogSeries, asura_id).status == "reading"
@@ -415,7 +430,8 @@ async def test_matches_collapse_multiple_identity_decisions_per_canonical_pair()
         )
     assert response.json()["total"] == 1
     assert len(response.json()["items"][0]["decision_ids"]) == 2
-    assert rejected.status_code == 200
+    assert rejected.status_code == 202
+    execute_match_operations(sessions)
     with sessions() as session:
         assert {row.decision for row in session.query(CatalogMatchDecision)} == {"rejected"}
 
@@ -546,8 +562,8 @@ def test_matches_collapse_alternate_same_provider_titles_with_cover_and_chapters
                 CatalogCoverSignature(
                     source_series_id=duplicate.id,
                     algorithm_version="test",
-                    # One bit in each old 16-bit band differs. The nine-band candidate index
-                    # must still find this Hamming-distance-four duplicate.
+                    # The token-first candidate index must retain this Hamming-distance-four
+                    # cover match even though the translated titles are not identical.
                     feature_json={"hashes": ["0001000100010001"]},
                     keypoints_blob=b"",
                     descriptors_blob=b"",
@@ -674,7 +690,7 @@ async def test_match_cursor_survives_reviewing_the_preceding_proposal() -> None:
             f"/api/v2/matches/{cursor}", json={"decision": "rejected"}
         )
         second_page = await client.get(f"/api/v2/matches?limit=1&cursor={cursor}")
-    assert reviewed.status_code == 200
+    assert reviewed.status_code == 202
     assert len(second_page.json()["items"]) == 1
     assert second_page.json()["items"][0]["confidence"] == 0.5
 
@@ -763,8 +779,9 @@ async def test_connected_batch_matches_merge_once() -> None:
                 "confirmation": "MERGE",
             },
         )
-    assert response.status_code == 200, response.text
+    assert response.status_code == 202, response.text
     assert len(response.json()["ids"]) == 2
+    execute_match_operations(sessions)
     with sessions() as session:
         assert session.query(CatalogSeries).count() == 1
         assert session.query(WorkJob).filter_by(kind="library_repair").count() == 1
@@ -880,9 +897,10 @@ async def test_connected_batch_consolidates_equivalent_duplicate_provider_record
     assert preview.json()["selected"] == 3
     assert preview.json()["eligible"] == 3
     assert preview.json()["blocked"] == 0
-    assert result.status_code == 200
+    assert result.status_code == 202
     assert len(result.json()["ids"]) == 3
     assert result.json()["blocked"] == []
+    execute_match_operations(sessions)
     with sessions() as session:
         assert session.query(CatalogSeries).count() == 1
         assert session.query(CatalogSourceSeries).count() == 3
@@ -932,7 +950,8 @@ async def test_confirmed_match_merges_complete_groups() -> None:
             f"/api/v2/matches/{decision_id}",
             json={"decision": "accepted", "confirmation": "MERGE"},
         )
-    assert response.status_code == 200
+    assert response.status_code == 202
+    execute_match_operations(sessions)
     with sessions() as session:
         assert session.query(CatalogSeries).count() == 1
         assert len({row.series_id for row in session.query(CatalogSourceSeries).all()}) == 1
@@ -995,7 +1014,8 @@ async def test_merge_consolidates_strong_same_provider_duplicate_before_group_me
             f"/api/v2/matches/{decision_id}",
             json={"decision": "accepted", "confirmation": "MERGE"},
         )
-    assert response.status_code == 200, response.text
+    assert response.status_code == 202, response.text
+    execute_match_operations(sessions)
     with sessions() as session:
         assert session.query(CatalogSeries).count() == 1
         assert session.query(CatalogSourceSeries).filter_by(source="mangafire").count() == 1
@@ -1007,7 +1027,7 @@ async def test_merge_consolidates_strong_same_provider_duplicate_before_group_me
         assert len({row.primary_source_series_id for row in alternates}) == 1
         label = session.query(MatchTrainingLabel).one()
         assert label.label == 1
-        assert label.origin == "suggested_review"
+        assert label.origin == "async_review"
         assert label.left_identity_json["title"]
 
 

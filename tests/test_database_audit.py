@@ -22,7 +22,7 @@ def test_database_audit_is_read_only_and_reports_latest_mismatch(tmp_path: Path)
 
     report = tmp_path / "audit.json"
     write_database_audit(report, payload)
-    assert json.loads(report.read_text())["migration"] == "0025_shared_worker_fairness"
+    assert json.loads(report.read_text())["migration"] == "0026_async_match_operations"
 
 
 def test_database_audit_writes_markdown(tmp_path: Path) -> None:

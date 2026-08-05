@@ -17,6 +17,7 @@ class JobKind(StrEnum):
     COVER_BACKFILL = "cover_backfill"
     MAINTENANCE = "maintenance"
     NOTIFICATION = "notification"
+    MATCH_OPERATION = "match_operation"
 
 
 class JobState(StrEnum):
@@ -99,6 +100,10 @@ class NotificationPayload(JobPayload):
     activity_event_id: int = Field(gt=0)
 
 
+class MatchOperationPayload(JobPayload):
+    operation_id: int = Field(gt=0)
+
+
 JOB_PAYLOAD_TYPES: dict[JobKind, type[JobPayload]] = {
     JobKind.SOURCE_PULL: SourcePullPayload,
     JobKind.SOURCE_REFRESH: SourceRefreshPayload,
@@ -108,6 +113,7 @@ JOB_PAYLOAD_TYPES: dict[JobKind, type[JobPayload]] = {
     JobKind.COVER_BACKFILL: CoverBackfillPayload,
     JobKind.MAINTENANCE: MaintenancePayload,
     JobKind.NOTIFICATION: NotificationPayload,
+    JobKind.MATCH_OPERATION: MatchOperationPayload,
 }
 
 

@@ -21,6 +21,7 @@ def test_provider_seed_limits_do_not_cap_the_shared_runtime_pool() -> None:
     settings = V2Settings(asura_download_concurrency=2)
     assert settings.asura_download_concurrency == 2
     assert settings.pool_limits()["download:asura"] == settings.network_worker_concurrency
+    assert settings.pool_limits()["catalog_mutation"] == 3
 
 
 def test_cli_exposes_transition_commands() -> None:

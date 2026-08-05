@@ -193,7 +193,7 @@ describe('media library frontend',()=>{
       if(url.includes('/api/v2/merge-candidates'))return response({items:[{...matchingSeries,similarity:.93,compatible:true,conflicting_sources:[]}],next_cursor:null})
       if(url.includes('/api/v2/library'))return response({items:[{...series,status:'interested'}],next_cursor:null})
       if(url.endsWith('/api/v2/series/merge-preview'))return response({target_id:7,target_title:series.title,items:[series,matchingSeries],conflicting_sources:[],can_merge:true})
-      if(url.endsWith('/api/v2/series/merge')&&init?.method==='POST')return response({target_id:7,merged_ids:[7,9]})
+      if(url.endsWith('/api/v2/series/merge')&&init?.method==='POST')return response({operation:{id:70,action:'accepted',status:'queued',representative_id:0,decision_ids:[],proposal_ids:[],series_ids:[7,9],job_id:170,error_code:'',error_message:'',created_at:'2026-08-05T12:00:00Z',updated_at:'2026-08-05T12:00:00Z',completed_at:null},created:true})
       if(url.includes('/api/v2/matches'))return response({items:[],next_cursor:null})
       return response({items:[],next_cursor:null})
     }))
@@ -204,7 +204,7 @@ describe('media library frontend',()=>{
     await userEvent.click(screen.getByRole('button',{name:'Review merge'}))
     expect(await screen.findByText(`Merge into ${series.title}?`)).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button',{name:'Confirm merge'}))
-    expect(await screen.findByText(/Merged into series #7/)).toBeInTheDocument()
+    expect(await screen.findByText(/Merge #70 is queued/)).toBeInTheDocument()
   })
 
   it('reviews deep suggestions without resetting or refetching loaded pages',async()=>{
@@ -219,12 +219,20 @@ describe('media library frontend',()=>{
       right:{...match.right,id:12,title:'The Other Hero'},
     }
     const duplicateMatch={...match,id:43,decision_ids:[43],confidence:.90}
+    const submitted=new Map<number,Record<string,unknown>>()
+    const completed=new Set<number>()
     vi.stubGlobal('fetch',vi.fn((input:string|URL|Request,init?:RequestInit)=>{
       const url=String(input)
       if(url.includes('/api/v2/operations'))return response({job_counts:{},health:{series:2,chapters:1,active_artifacts:0,missing_projections:0},sources:[],workers:[],permits:{}})
       if(url.includes('/api/v2/providers'))return response({items:['asura','mangadex','mangafire','kingofshojo']})
-      if(url.includes('/api/v2/matches/')&&init?.method==='POST')return response({id:Number(url.split('/').at(-1)),decision:'reviewed'})
-      if(url.includes('/api/v2/matches'))return response({items:[match,duplicateMatch,secondMatch],next_cursor:null,total:3})
+      if(url.includes('/api/v2/matches/')&&init?.method==='POST'){
+        const id=Number(url.split('/').at(-1));const value=JSON.parse(String(init.body)).decision
+        const target=id===41?match:secondMatch
+        const operation={id:100+id,action:value,status:'queued',representative_id:id,decision_ids:[id],proposal_ids:[id],series_ids:[target.left.id,target.right.id],job_id:200+id,error_code:'',error_message:'',created_at:'2026-08-05T12:00:00Z',updated_at:'2026-08-05T12:00:00Z',completed_at:null}
+        submitted.set(id,operation)
+        return response({operation,created:true})
+      }
+      if(url.includes('/api/v2/matches'))return response({items:[match,duplicateMatch,secondMatch].filter(item=>!completed.has(item.id)&&!(completed.has(41)&&item.id===43)),next_cursor:null,total:3})
       return response({items:[],next_cursor:null})
     }))
     renderApp('/matches')
@@ -235,12 +243,18 @@ describe('media library frontend',()=>{
       String(input).includes('/api/v2/matches?')&&(!init||!(init as RequestInit).method),
     ).length
     await userEvent.click(keepSeparate)
+    await screen.findByText(/Split queued for/)
+    completed.add(41)
+    window.dispatchEvent(new CustomEvent('manga-job-event',{detail:{kind:'match_operation',operation:{...submitted.get(41),status:'succeeded',completed_at:'2026-08-05T12:00:02Z'}}}))
     await waitFor(()=>expect(document.querySelectorAll('.match-card')).toHaveLength(1))
-    expect(screen.getByText(`Kept ${series.title} and ${matchingSeries.title} separate`)).toBeInTheDocument()
+    expect(screen.getByText('Titles kept separate')).toBeInTheDocument()
     await userEvent.click(screen.getByRole('button',{name:'Merge'}))
     await userEvent.click(await screen.findByRole('button',{name:'Confirm merge'}))
+    await screen.findByText(/Merge queued for/)
+    completed.add(42)
+    window.dispatchEvent(new CustomEvent('manga-job-event',{detail:{kind:'match_operation',operation:{...submitted.get(42),status:'succeeded',completed_at:'2026-08-05T12:00:03Z'}}}))
     await waitFor(()=>expect(document.querySelectorAll('.match-card')).toHaveLength(0))
-    expect(screen.getByText('Merged Another Hero and The Other Hero')).toBeInTheDocument()
+    expect(screen.getByText('Merge completed')).toBeInTheDocument()
     const requestsAfter=(fetch as ReturnType<typeof vi.fn>).mock.calls.filter(([input,init])=>
       String(input).includes('/api/v2/matches?')&&(!init||!(init as RequestInit).method),
     ).length
@@ -279,6 +293,32 @@ describe('media library frontend',()=>{
     await userEvent.click(screen.getByRole('button',{name:'Merge eligible'}))
     expect(await screen.findByText('Merge 2 eligible proposals?')).toBeInTheDocument()
     expect(previewBody).toEqual({ids:[51,53],excluded_ids:[],entire_queue:false,decision:'rejected'})
+  })
+
+  it('keeps failed async match cards actionable and shows a dismissible locator',async()=>{
+    const match={
+      id:71,decision_ids:[71],confidence:.91,evidence:[],blocked_reasons:[],operation:null,
+      left:{...series,source_title:series.title,source:'asura',url:'https://asura.test/painter',cover_evidence_used:true},
+      right:{...matchingSeries,source_title:matchingSeries.title,source:'mangafire',url:'https://mangafire.test/painter',cover_evidence_used:true},
+    }
+    const operation={id:171,action:'rejected',status:'queued',representative_id:71,decision_ids:[71],proposal_ids:[71],series_ids:[series.id,matchingSeries.id],job_id:271,error_code:'',error_message:'',created_at:'2026-08-05T12:00:00Z',updated_at:'2026-08-05T12:00:00Z',completed_at:null}
+    vi.stubGlobal('fetch',vi.fn((input:string|URL|Request,init?:RequestInit)=>{
+      const url=String(input)
+      if(url.includes('/api/v2/operations'))return response({job_counts:{},health:{series:2,chapters:1,active_artifacts:0,missing_projections:0},sources:[],workers:[],permits:{}})
+      if(url.includes('/api/v2/providers'))return response({items:['asura','mangafire']})
+      if(url.includes('/api/v2/matches/')&&init?.method==='POST')return response({operation,created:true})
+      if(url.includes('/api/v2/matches'))return response({items:[match],next_cursor:null,total:1})
+      return response({items:[],next_cursor:null})
+    }))
+    renderApp('/matches')
+    await userEvent.click((await screen.findAllByRole('button',{name:'Keep separate'})).find(button=>!button.hasAttribute('disabled'))!)
+    await screen.findByText('Splitting…')
+    window.dispatchEvent(new CustomEvent('manga-job-event',{detail:{kind:'match_operation',operation:{...operation,status:'failed',error_code:'match_operation_failed',error_message:'Database conflict',completed_at:'2026-08-05T12:00:02Z'}}}))
+    expect(await screen.findByText('Split failed')).toBeInTheDocument()
+    expect(document.querySelector('.match-card')).toHaveClass('operation-failed')
+    expect(screen.getByRole('button',{name:'Merge'})).not.toBeDisabled()
+    await userEvent.click(screen.getByRole('button',{name:'Dismiss notification'}))
+    expect(screen.queryByText('Split failed')).not.toBeInTheDocument()
   })
 
   it('keeps queue-wide selection editable and reflects exclusions in the master checkbox',async()=>{

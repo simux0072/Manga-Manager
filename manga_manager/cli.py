@@ -792,6 +792,7 @@ async def run_worker(settings: V2Settings, engine) -> int:
         ProviderTelemetry,
     )
     from manga_manager.application.cover_backfill import CoverBackfillHandler
+    from manga_manager.application.match_operations import MatchOperationHandler
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
@@ -839,6 +840,7 @@ async def run_worker(settings: V2Settings, engine) -> int:
         close_adapter=False,
     )
     cover_backfill = CoverBackfillHandler(session_factory=sessions)
+    match_operation = MatchOperationHandler(session_factory=sessions)
     service = WorkerService(
         session_factory=sessions,
         handlers={
@@ -849,6 +851,7 @@ async def run_worker(settings: V2Settings, engine) -> int:
             JobKind.LIBRARY_REPAIR: library_repair,
             JobKind.COVER_BACKFILL: cover_backfill,
             JobKind.MAINTENANCE: maintenance,
+            JobKind.MATCH_OPERATION: match_operation,
         },
         settings=settings,
     )

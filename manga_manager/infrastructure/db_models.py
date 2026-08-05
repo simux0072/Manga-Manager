@@ -773,6 +773,59 @@ class CatalogMatchDecision(JobBase):
     decided_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
+class MatchOperation(JobBase):
+    __tablename__ = "match_operation"
+    __table_args__ = (
+        CheckConstraint("action IN ('accepted', 'rejected')", name="ck_match_operation_action"),
+        CheckConstraint(
+            "status IN ('queued', 'running', 'succeeded', 'failed')",
+            name="ck_match_operation_status",
+        ),
+        Index("ix_match_operation_status_created", "status", "created_at"),
+        Index("ix_match_operation_representative", "representative_id", "created_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    action: Mapped[str] = mapped_column(String(20))
+    status: Mapped[str] = mapped_column(String(20), default="queued", index=True)
+    representative_id: Mapped[int] = mapped_column(Integer, index=True)
+    decision_ids: Mapped[list[int]] = mapped_column(
+        JSON().with_variant(JSONB(none_as_null=True), "postgresql"), default=list
+    )
+    series_ids: Mapped[list[int]] = mapped_column(
+        JSON().with_variant(JSONB(none_as_null=True), "postgresql"), default=list
+    )
+    proposal_ids: Mapped[list[int]] = mapped_column(
+        JSON().with_variant(JSONB(none_as_null=True), "postgresql"), default=list
+    )
+    job_id: Mapped[int | None] = mapped_column(
+        ForeignKey("job.id", ondelete="SET NULL"), nullable=True, index=True
+    )
+    error_code: Mapped[str] = mapped_column(String(100), default="")
+    error_message: Mapped[str] = mapped_column(Text, default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class MatchOperationSeries(JobBase):
+    """An early, durable reservation for every canonical record an operation touches."""
+
+    __tablename__ = "match_operation_series"
+    __table_args__ = (
+        UniqueConstraint("series_id", name="uq_match_operation_series_active"),
+        Index("ix_match_operation_series_operation", "operation_id"),
+    )
+
+    operation_id: Mapped[int] = mapped_column(
+        ForeignKey("match_operation.id", ondelete="CASCADE"), primary_key=True
+    )
+    series_id: Mapped[int] = mapped_column(
+        ForeignKey("series_v2.id", ondelete="CASCADE"), primary_key=True
+    )
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
 class MatchTrainingLabel(JobBase):
     __tablename__ = "match_training_label"
     __table_args__ = (
