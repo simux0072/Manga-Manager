@@ -31,6 +31,14 @@ from manga_manager.application.library_repair import (
 )
 from manga_manager.application.catalog_recovery import CatalogRecovery, write_recovery_report
 from manga_manager.application.match_training import export_training_data
+from manga_manager.application.portable_state import (
+    PortableStateConflict,
+    apply_portable_import,
+    export_portable_state,
+    load_portable_state,
+    plan_portable_import,
+    write_portable_state,
+)
 from manga_manager.application.maintenance import MaintenanceHandler
 from manga_manager.application.diagnostics import build_diagnostic_bundle
 from manga_manager.application.database_audit import (
@@ -208,6 +216,19 @@ def build_parser() -> argparse.ArgumentParser:
         "export-match-training", help="export reviewed match labels and cached covers"
     )
     training.add_argument("output", type=Path)
+    portable_export = subcommands.add_parser(
+        "export-portable-state",
+        help="export metadata-only library state without media, credentials, or runtime jobs",
+    )
+    portable_export.add_argument("output", type=Path)
+    portable_import = subcommands.add_parser(
+        "import-portable-state",
+        help="preview or restore a metadata-only library snapshot",
+    )
+    portable_import.add_argument("source", type=Path)
+    portable_import.add_argument(
+        "--apply", action="store_true", help="apply the import and queue fresh provider downloads"
+    )
     library_repair = subcommands.add_parser(
         "enqueue-library-repair", help="queue canonical CBZ/Kavita repair"
     )
@@ -294,6 +315,34 @@ def main(argv: Sequence[str] | None = None) -> int:
     engine = create_database_engine(
         database_url, role="worker" if args.command == "worker" else "cli"
     )
+    if args.command == "export-portable-state":
+        sessions = create_session_factory(engine)
+        with sessions() as session:
+            state = export_portable_state(session)
+        write_portable_state(state, args.output)
+        print(
+            f"output={args.output} series={len(state.series)} "
+            f"sources={sum(len(series.sources) for series in state.series)} "
+            f"separations={len(state.separations)} providers={len(state.providers)}"
+        )
+        return 0
+    if args.command == "import-portable-state":
+        try:
+            state = load_portable_state(args.source)
+        except ValueError as exc:
+            parser.error(str(exc))
+        sessions = create_session_factory(engine)
+        try:
+            if args.apply:
+                with sessions() as session, session.begin():
+                    report = apply_portable_import(session, state)
+            else:
+                with sessions() as session:
+                    report = plan_portable_import(session, state)
+        except PortableStateConflict as exc:
+            parser.error(str(exc))
+        print(json.dumps(report.model_dump(mode="json"), sort_keys=True))
+        return 0 if not report.conflicts else 2
     if args.command == "diagnostic-bundle":
         try:
             payload = build_diagnostic_bundle(

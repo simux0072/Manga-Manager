@@ -45,7 +45,7 @@ jobs:
         run: |
           cp .env.example .env
           docker compose config --quiet
-          sh -n scripts/stage-local.sh scripts/reset-local-data.sh
+          sh -n scripts/stage-local.sh scripts/reset-local-data.sh scripts/portable-state.sh
       - run: uv run ruff check .
       - run: uv run pytest -q
 
