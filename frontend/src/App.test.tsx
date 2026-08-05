@@ -280,6 +280,10 @@ describe('media library frontend',()=>{
       left:{...match.left,id:21,title:'Another Left'},
       right:{...match.right,id:22,title:'Another Right'},
     }
+    const batchOperations=[
+      {id:151,action:'accepted' as const,status:'queued' as const,representative_id:51,decision_ids:[51],proposal_ids:[51],series_ids:[series.id,matchingSeries.id],job_id:251,error_code:'',error_message:'',created_at:'2026-08-05T12:00:00Z',updated_at:'2026-08-05T12:00:00Z',completed_at:null},
+      {id:153,action:'accepted' as const,status:'queued' as const,representative_id:53,decision_ids:[53],proposal_ids:[53],series_ids:[21,22],job_id:253,error_code:'',error_message:'',created_at:'2026-08-05T12:00:00Z',updated_at:'2026-08-05T12:00:00Z',completed_at:null},
+    ]
     let previewBody:{ids:number[];entire_queue:boolean}|null=null
     vi.stubGlobal('fetch',vi.fn((input:string|URL|Request,init?:RequestInit)=>{
       const url=String(input)
@@ -289,6 +293,7 @@ describe('media library frontend',()=>{
         previewBody=JSON.parse(String(init?.body))
         return response({selected:previewBody!.ids.length,eligible:previewBody!.ids.length,blocked:0,items:[]})
       }
+      if(url.endsWith('/api/v2/match-batch')&&init?.method==='POST')return response({operations:batchOperations,ids:[51,53],blocked:[]})
       if(url.includes('/api/v2/matches'))return response({items:[match,duplicate,other],next_cursor:null,total:3})
       return response({items:[],next_cursor:null})
     }))
@@ -300,6 +305,18 @@ describe('media library frontend',()=>{
     await userEvent.click(screen.getByRole('button',{name:'Merge eligible'}))
     expect(await screen.findByText('Merge 2 eligible proposals?')).toBeInTheDocument()
     expect(previewBody).toEqual({ids:[51,53],excluded_ids:[],entire_queue:false,decision:'rejected'})
+    await userEvent.click(screen.getByRole('button',{name:'Confirm merge'}))
+    expect(await screen.findByText('Merge batch · 0 of 2 complete')).toBeInTheDocument()
+    let progress=screen.getByRole('progressbar',{name:'Batch operation progress'})
+    expect(progress).toHaveAttribute('aria-valuenow','0')
+    act(()=>window.dispatchEvent(new CustomEvent('manga-job-event',{detail:{kind:'match_operation',type:'succeeded',state:'succeeded',operation:{...batchOperations[0],status:'succeeded',completed_at:'2026-08-05T12:00:02Z'}}})))
+    expect(await screen.findByText('Merge batch · 1 of 2 complete')).toBeInTheDocument()
+    expect(document.querySelectorAll('.toast')).toHaveLength(1)
+    act(()=>window.dispatchEvent(new CustomEvent('manga-job-event',{detail:{kind:'match_operation',type:'succeeded',state:'succeeded',operation:{...batchOperations[1],status:'succeeded',completed_at:'2026-08-05T12:00:03Z'}}})))
+    expect(await screen.findByText('Merge batch completed · 2 of 2')).toBeInTheDocument()
+    progress=screen.getByRole('progressbar',{name:'Batch operation progress'})
+    expect(progress).toHaveAttribute('aria-valuenow','2')
+    expect(document.querySelectorAll('.toast')).toHaveLength(1)
   })
 
   it('keeps failed async match cards actionable and shows a dismissible locator',async()=>{

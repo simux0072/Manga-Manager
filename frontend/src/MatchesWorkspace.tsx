@@ -9,6 +9,14 @@ import type {Match, MatchOperation, MatchSide, MergeCandidate, MergePreview, Pag
 const fallbackProviders = ['asura', 'mangadex', 'mangafire', 'kingofshojo']
 const operationNoticeKey = (operation: Pick<MatchOperation, 'series_ids'>) =>
   `match:${[...operation.series_ids].sort((left, right) => left - right).join(':')}`
+type BatchNotice = {
+  key:string
+  action:'accepted'|'rejected'
+  total:number
+  blocked:number
+  finished:Set<number>
+  failed:Set<number>
+}
 
 export function MatchesWorkspace() {
   const [tab, setTab] = useState<'suggested' | 'manual'>('suggested')
@@ -49,6 +57,9 @@ function SuggestedMatches() {
   const cardRefs = useRef(new Map<number, HTMLElement>())
   const noticeTimers = useRef(new Map<number, {timer:number;deadline:number;remaining:number}>())
   const handledTerminalOperations = useRef(new Set<string>())
+  const terminalOperationStates = useRef(new Map<number, 'succeeded'|'failed'>())
+  const batchByOperation = useRef(new Map<number, BatchNotice>())
+  const batchSequence = useRef(0)
   const queryKey = ['matches', order] as const
   const query = useInfiniteQuery({
     queryKey,
@@ -134,6 +145,40 @@ function SuggestedMatches() {
     })
     scheduleNotice(operation.id)
   }
+  const publishBatchNotice = (batchNotice: BatchNotice) => {
+    const current = batchNotice.finished.size
+    const failures = batchNotice.failed.size
+    const complete = current === batchNotice.total
+    const action = batchNotice.action === 'accepted' ? 'Merge' : 'Split'
+    const blocked = batchNotice.blocked
+      ? ` · ${batchNotice.blocked} blocked still pending`
+      : ''
+    const message = complete
+      ? failures
+        ? `${action} batch finished · ${batchNotice.total - failures} succeeded · ${failures} failed${blocked}`
+        : `${action} batch completed · ${current} of ${batchNotice.total}${blocked}`
+      : `${action} batch · ${current} of ${batchNotice.total} complete${blocked}`
+    window.dispatchEvent(new CustomEvent('manga-toast', {detail: {
+      key: batchNotice.key,
+      message,
+      tone: failures ? 'error' : 'normal',
+      duration: complete ? 6500 : 15_000,
+      progress: {current, total: batchNotice.total},
+    }}))
+    if (complete) {
+      batchByOperation.current.forEach((candidate, operationId) => {
+        if (candidate === batchNotice) batchByOperation.current.delete(operationId)
+      })
+    }
+  }
+  const updateBatchNotice = (operation: MatchOperation) => {
+    const batchNotice = batchByOperation.current.get(operation.id)
+    if (!batchNotice) return false
+    batchNotice.finished.add(operation.id)
+    if (operation.status === 'failed') batchNotice.failed.add(operation.id)
+    publishBatchNotice(batchNotice)
+    return true
+  }
   const decision = useMutation({
     mutationFn: ({id, value}: {id: number; value: 'accepted' | 'rejected'}) =>
       api.decideMatch(id, value, value === 'accepted' ? 'MERGE' : ''),
@@ -167,10 +212,33 @@ function SuggestedMatches() {
       ]))
       result.operations.forEach(dismissRelatedFailures)
       setSelected([]); setExcluded([]); setEntireQueue(false); setBatchPreview(null); setConfirmBatch(false)
-      window.dispatchEvent(new CustomEvent('manga-toast',{detail:{message:
-        `${result.operations.length} ${variables.value==='accepted'?'merge':'split'} operation${result.operations.length===1?'':'s'} queued`,
-      }}))
-      if(result.blocked.length) window.dispatchEvent(new CustomEvent('manga-toast',{detail:{message:`${result.blocked.length} blocked proposals remain pending`}}))
+      if (result.operations.length) {
+        const batchNotice:BatchNotice = {
+          key:`match-batch:${Date.now()}:${++batchSequence.current}`,
+          action:variables.value,
+          total:result.operations.length,
+          blocked:result.blocked.length,
+          finished:new Set(),
+          failed:new Set(),
+        }
+        result.operations.forEach(operation => {
+          batchByOperation.current.set(operation.id, batchNotice)
+          const terminalState = terminalOperationStates.current.get(operation.id)
+          if (terminalState) {
+            batchNotice.finished.add(operation.id)
+            if (terminalState === 'failed') batchNotice.failed.add(operation.id)
+            window.dispatchEvent(new CustomEvent('manga-toast', {detail: {
+              key: operationNoticeKey(operation),
+              dismiss: true,
+            }}))
+          }
+        })
+        publishBatchNotice(batchNotice)
+      } else {
+        window.dispatchEvent(new CustomEvent('manga-toast',{detail:{message:
+          result.blocked.length ? `${result.blocked.length} blocked proposals remain pending` : 'No match operations were queued',
+        }}))
+      }
     },
     onError: error => window.dispatchEvent(new CustomEvent('manga-toast',{detail:{message:error.message,tone:'error'}})),
   })
@@ -202,13 +270,17 @@ function SuggestedMatches() {
       const terminalKey = `${operation.id}:${operation.status}`
       if (handledTerminalOperations.current.has(terminalKey)) return
       handledTerminalOperations.current.add(terminalKey)
+      terminalOperationStates.current.set(operation.id, operation.status)
       if (operation.status === 'succeeded') {
         dismissRelatedFailures(operation)
         removeCompleted(operation)
-        const verb = operation.action === 'accepted' ? 'Merge completed' : 'Titles kept separate'
-        window.dispatchEvent(new CustomEvent('manga-toast', {detail: {key: operationNoticeKey(operation), message: verb}}))
+        if (!updateBatchNotice(operation)) {
+          const verb = operation.action === 'accepted' ? 'Merge completed' : 'Titles kept separate'
+          window.dispatchEvent(new CustomEvent('manga-toast', {detail: {key: operationNoticeKey(operation), message: verb}}))
+        }
       } else if (operation.status === 'failed') {
         window.dispatchEvent(new CustomEvent('manga-toast', {detail: {key: operationNoticeKey(operation), dismiss: true}}))
+        updateBatchNotice(operation)
         showFailure(operation)
       }
     }
