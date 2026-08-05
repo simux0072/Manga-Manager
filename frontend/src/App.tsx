@@ -7,11 +7,12 @@ import type {ActivityEvent, Job, JobGroup, Operations as OperationsData, Series,
 
 const MatchesWorkspace=lazy(()=>import('./MatchesWorkspace').then(module=>({default:module.MatchesWorkspace})))
 
-type Toast={id:number;message:string;tone?:'normal'|'error';action?:()=>void;actionLabel?:string}
+type Toast={id:number;message:string;key?:string;tone?:'normal'|'error';action?:()=>void;actionLabel?:string}
 const ToastContext=createContext<(toast:Omit<Toast,'id'>)=>void>(()=>{})
 const fallbackSources=['asura','mangadex','mangafire','kingofshojo']
 const states=['interested','reading','caught_up','paused']
 const eventRefreshDelayMs=250
+const matchToastKey=(seriesIds?:number[])=>seriesIds?.length?`match:${[...seriesIds].sort((left,right)=>left-right).join(':')}`:undefined
 
 export function App(){
   const [drawer,setDrawer]=useState(false),[toasts,setToasts]=useState<Toast[]>([])
@@ -43,8 +44,8 @@ export function App(){
       if(payload.kind==='kavita_sync'&&['succeeded','failed','cancelled'].includes(payload.state||''))scheduleRefresh('library','updates')
       if(payload.kind==='match_operation'){
         scheduleRefresh('matches','library','merge-library','merge-candidates')
-        const operation=payload.operation as {proposal_ids?:number[];error_message?:string}|undefined
-        if(payload.state==='failed'&&operation&&!operation.proposal_ids?.length)window.dispatchEvent(new CustomEvent('manga-toast',{detail:{message:operation.error_message||'Manual merge failed',tone:'error'}}))
+        const operation=payload.operation as {proposal_ids?:number[];series_ids?:number[];error_message?:string}|undefined
+        if(payload.state==='failed'&&operation&&!operation.proposal_ids?.length)window.dispatchEvent(new CustomEvent('manga-toast',{detail:{message:operation.error_message||'Manual merge failed',key:matchToastKey(operation.series_ids),tone:'error'}}))
       }
     })
     stream.addEventListener('counts',()=>scheduleRefresh('operations','workload-cycle'))
@@ -54,8 +55,8 @@ export function App(){
     }
   },[queryClient])
   useEffect(()=>{document.documentElement.classList.toggle('drawer-open',drawer);return()=>document.documentElement.classList.remove('drawer-open')},[drawer])
-  const push=(toast:Omit<Toast,'id'>)=>{const id=Date.now()+Math.random();setToasts(current=>[...current,{...toast,id}]);setTimeout(()=>setToasts(current=>current.filter(item=>item.id!==id)),6500)}
-  useEffect(()=>{const show=(event:Event)=>{const toast=(event as CustomEvent<Omit<Toast,'id'>>).detail;if(toast?.message)push(toast)};window.addEventListener('manga-toast',show);return()=>window.removeEventListener('manga-toast',show)},[])
+  const push=(toast:Omit<Toast,'id'>)=>{const id=Date.now()+Math.random();setToasts(current=>[...current.filter(item=>!toast.key||item.key!==toast.key),{...toast,id}]);setTimeout(()=>setToasts(current=>current.filter(item=>item.id!==id)),6500)}
+  useEffect(()=>{const show=(event:Event)=>{const toast=(event as CustomEvent<Partial<Omit<Toast,'id'>>&{dismiss?:boolean}>).detail;if(toast?.dismiss&&toast.key){setToasts(current=>current.filter(item=>item.key!==toast.key));return}if(toast?.message)push(toast as Omit<Toast,'id'>)};window.addEventListener('manga-toast',show);return()=>window.removeEventListener('manga-toast',show)},[])
   const active=(operations.data?.job_counts.queued||0)+(operations.data?.job_counts.leased||0)+(operations.data?.job_counts.retry_wait||0)
   const failed=operations.data?.job_counts.failed||0
   return <ToastContext.Provider value={push}><div className="app-shell"><Sidebar/><Topbar active={active} failed={failed} onJobs={()=>setDrawer(true)}/><main className="workspace"><Routes><Route path="/" element={<Discovery/>}/><Route path="/discovery" element={<Discovery/>}/><Route path="/library" element={<LibraryPage/>}/><Route path="/updates" element={<Updates/>}/><Route path="/matches" element={<Suspense fallback={<SkeletonGrid/>}><MatchesWorkspace/></Suspense>}/><Route path="/activity" element={<ActivityPage/>}/><Route path="/operations" element={<Operations/>}/></Routes></main><BottomNav/>{drawer&&<JobDrawer onClose={()=>setDrawer(false)}/>}<div className="toast-stack" role="status">{toasts.map(toast=><div key={toast.id} className={`toast ${toast.tone==='error'?'toast-error':''}`}><span>{toast.message}</span>{toast.action&&<button className="text-button" onClick={toast.action}>{toast.actionLabel}</button>}</div>)}</div></div></ToastContext.Provider>

@@ -7,6 +7,8 @@ import {api} from './api'
 import type {Match, MatchOperation, MatchSide, MergeCandidate, MergePreview, Page, Series} from './types'
 
 const fallbackProviders = ['asura', 'mangadex', 'mangafire', 'kingofshojo']
+const operationNoticeKey = (operation: Pick<MatchOperation, 'series_ids'>) =>
+  `match:${[...operation.series_ids].sort((left, right) => left - right).join(':')}`
 
 export function MatchesWorkspace() {
   const [tab, setTab] = useState<'suggested' | 'manual'>('suggested')
@@ -46,6 +48,7 @@ function SuggestedMatches() {
   const [failureNotices, setFailureNotices] = useState<MatchOperation[]>([])
   const cardRefs = useRef(new Map<number, HTMLElement>())
   const noticeTimers = useRef(new Map<number, {timer:number;deadline:number;remaining:number}>())
+  const handledTerminalOperations = useRef(new Set<string>())
   const queryKey = ['matches', order] as const
   const query = useInfiniteQuery({
     queryKey,
@@ -89,6 +92,16 @@ function SuggestedMatches() {
     noticeTimers.current.delete(id)
     setFailureNotices(current => current.filter(item => item.id !== id))
   }
+  const dismissRelatedFailures = (operation: MatchOperation) => {
+    const pairKey = operationNoticeKey(operation)
+    setFailureNotices(current => current.filter(item => {
+      if (operationNoticeKey(item) !== pairKey) return true
+      const state = noticeTimers.current.get(item.id)
+      if (state) window.clearTimeout(state.timer)
+      noticeTimers.current.delete(item.id)
+      return false
+    }))
+  }
   const scheduleNotice = (id: number, delay = 15_000) => {
     const timer = window.setTimeout(() => dismissNotice(id), delay)
     noticeTimers.current.set(id, {timer, deadline: Date.now() + delay, remaining: delay})
@@ -105,8 +118,20 @@ function SuggestedMatches() {
     scheduleNotice(id, state.remaining)
   }
   const showFailure = (operation: MatchOperation) => {
-    dismissNotice(operation.id)
-    setFailureNotices(current => [operation, ...current.filter(item => item.id !== operation.id)].slice(0, 3))
+    const pairKey = operationNoticeKey(operation)
+    const previousTimer = noticeTimers.current.get(operation.id)
+    if (previousTimer) window.clearTimeout(previousTimer.timer)
+    noticeTimers.current.delete(operation.id)
+    setFailureNotices(current => {
+      const next = [operation, ...current.filter(item =>
+        item.id !== operation.id && operationNoticeKey(item) !== pairKey)].slice(0, 3)
+      current.filter(item => !next.some(candidate => candidate.id === item.id)).forEach(item => {
+        const state = noticeTimers.current.get(item.id)
+        if (state) window.clearTimeout(state.timer)
+        noticeTimers.current.delete(item.id)
+      })
+      return next
+    })
     scheduleNotice(operation.id)
   }
   const decision = useMutation({
@@ -123,10 +148,11 @@ function SuggestedMatches() {
     onSuccess: (result, variables, context) => {
       setConfirm(null)
       setOperations(current => ({...current, [result.operation.id]: result.operation}))
+      dismissRelatedFailures(result.operation)
       const titles = context?.reviewed
         ? `${context.reviewed.left.title} and ${context.reviewed.right.title}`
         : `Match #${variables.id}`
-      window.dispatchEvent(new CustomEvent('manga-toast', {detail: {message:
+      window.dispatchEvent(new CustomEvent('manga-toast', {detail: {key: operationNoticeKey(result.operation), message:
         `${variables.value === 'accepted' ? 'Merge' : 'Split'} queued for ${titles}`,
       }}))
     },
@@ -139,6 +165,7 @@ function SuggestedMatches() {
         ...Object.entries(current),
         ...result.operations.map(operation => [String(operation.id), operation] as const),
       ]))
+      result.operations.forEach(dismissRelatedFailures)
       setSelected([]); setExcluded([]); setEntireQueue(false); setBatchPreview(null); setConfirmBatch(false)
       window.dispatchEvent(new CustomEvent('manga-toast',{detail:{message:
         `${result.operations.length} ${variables.value==='accepted'?'merge':'split'} operation${result.operations.length===1?'':'s'} queued`,
@@ -166,15 +193,22 @@ function SuggestedMatches() {
     operation.status === 'failed' && operation.proposal_ids.includes(match.id))
   useEffect(() => {
     const receive = (event: Event) => {
-      const detail = (event as CustomEvent<{kind?:string;operation?:MatchOperation}>).detail
+      const detail = (event as CustomEvent<{kind?:string;state?:string;type?:string;operation?:MatchOperation}>).detail
       const operation = detail?.kind === 'match_operation' ? detail.operation : undefined
       if (!operation) return
       setOperations(current => ({...current, [operation.id]: operation}))
+      if (operation.status !== 'succeeded' && operation.status !== 'failed') return
+      if ((detail.type && detail.type !== operation.status) || (detail.state && detail.state !== operation.status)) return
+      const terminalKey = `${operation.id}:${operation.status}`
+      if (handledTerminalOperations.current.has(terminalKey)) return
+      handledTerminalOperations.current.add(terminalKey)
       if (operation.status === 'succeeded') {
+        dismissRelatedFailures(operation)
         removeCompleted(operation)
         const verb = operation.action === 'accepted' ? 'Merge completed' : 'Titles kept separate'
-        window.dispatchEvent(new CustomEvent('manga-toast', {detail: {message: verb}}))
+        window.dispatchEvent(new CustomEvent('manga-toast', {detail: {key: operationNoticeKey(operation), message: verb}}))
       } else if (operation.status === 'failed') {
+        window.dispatchEvent(new CustomEvent('manga-toast', {detail: {key: operationNoticeKey(operation), dismiss: true}}))
         showFailure(operation)
       }
     }
@@ -431,7 +465,9 @@ function Pager({hasNext, loading, load}: {hasNext: boolean; loading: boolean; lo
     if (!node || !hasNext) return
     const observer = new IntersectionObserver(entries => {
       if (entries[0]?.isIntersecting && !loading) load()
-    }, {rootMargin: '600px'})
+    // Match cards are tall, so begin fetching roughly four cards before the sentinel is visible.
+    // This keeps one page arriving in the background while the operator reviews the current one.
+    }, {rootMargin: '2400px 0px'})
     observer.observe(node)
     return () => observer.disconnect()
   }, [hasNext, loading, load])

@@ -6,7 +6,7 @@ from datetime import datetime, timedelta, timezone
 from collections.abc import Callable
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request, status as http_status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status as http_status
 from fastapi.responses import FileResponse, Response, StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import String, and_, case, func, or_, select
@@ -70,6 +70,13 @@ from manga_manager.domain.matching import provider_identities_equivalent
 
 TRACKED_STATES = ("interested", "reading", "caught_up", "paused")
 ACTIVE_JOB_STATES = ("queued", "leased", "retry_wait")
+
+
+def event_resume_cursor(after: int, last_event_id: str | None) -> int:
+    try:
+        return max(after, int(last_event_id or 0), 0)
+    except ValueError:
+        return after
 
 
 def job_state_predicate(states: list[str]):
@@ -2104,7 +2111,11 @@ def create_api_router(
         return {"job": serialize_jobs(session, [job])[0]}
 
     @router.get("/events")
-    async def events(request: Request, after: int = Query(default=0, ge=0)):
+    async def events(
+        request: Request,
+        after: int = Query(default=0, ge=0),
+        last_event_id: str | None = Header(default=None, alias="Last-Event-ID"),
+    ):
         def load_event_batch(cursor: int) -> tuple[list[dict[str, Any]], dict[str, int]]:
             with factory_provider()() as session:
                 rows = session.execute(
@@ -2143,8 +2154,10 @@ def create_api_router(
                 )
                 return payloads, counts
 
+        resume_after = event_resume_cursor(after, last_event_id)
+
         async def stream():
-            cursor = after
+            cursor = resume_after
             while not await request.is_disconnected():
                 # This route is intentionally async for streaming, but SQLAlchemy is synchronous.
                 # Keep pool waits and queries off the event loop just like the normal sync routes.

@@ -23,6 +23,7 @@ from manga_manager.infrastructure.db_models import (
     WorkloadCycle,
 )
 from manga_manager.web.api import (
+    event_resume_cursor,
     human_evidence,
     operational_error_message,
     pending_match_proposal_index,
@@ -32,6 +33,12 @@ from manga_manager.web.api import (
 )
 from manga_manager.web.app import create_app
 from manga_manager.application.match_operations import MatchOperationHandler
+
+
+def test_event_resume_cursor_prefers_the_latest_valid_cursor() -> None:
+    assert event_resume_cursor(12, "18") == 18
+    assert event_resume_cursor(20, "18") == 20
+    assert event_resume_cursor(12, "not-an-event-id") == 12
 
 
 def execute_match_operations(sessions) -> None:

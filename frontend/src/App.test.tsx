@@ -245,14 +245,21 @@ describe('media library frontend',()=>{
     await userEvent.click(keepSeparate)
     await screen.findByText(/Split queued for/)
     completed.add(41)
-    window.dispatchEvent(new CustomEvent('manga-job-event',{detail:{kind:'match_operation',operation:{...submitted.get(41),status:'succeeded',completed_at:'2026-08-05T12:00:02Z'}}}))
+    const splitCompleted={...submitted.get(41),status:'succeeded',completed_at:'2026-08-05T12:00:02Z'}
+    act(()=>{
+      window.dispatchEvent(new CustomEvent('manga-job-event',{detail:{kind:'match_operation',type:'enqueued',state:'queued',operation:splitCompleted}}))
+      window.dispatchEvent(new CustomEvent('manga-job-event',{detail:{kind:'match_operation',type:'leased',state:'leased',operation:splitCompleted}}))
+      window.dispatchEvent(new CustomEvent('manga-job-event',{detail:{kind:'match_operation',type:'succeeded',state:'succeeded',operation:splitCompleted}}))
+      window.dispatchEvent(new CustomEvent('manga-job-event',{detail:{kind:'match_operation',type:'succeeded',state:'succeeded',operation:splitCompleted}}))
+    })
     await waitFor(()=>expect(document.querySelectorAll('.match-card')).toHaveLength(1))
-    expect(screen.getByText('Titles kept separate')).toBeInTheDocument()
+    expect(screen.getAllByText('Titles kept separate')).toHaveLength(1)
+    expect(screen.queryByText(/Split queued for/)).not.toBeInTheDocument()
     await userEvent.click(screen.getByRole('button',{name:'Merge'}))
     await userEvent.click(await screen.findByRole('button',{name:'Confirm merge'}))
     await screen.findByText(/Merge queued for/)
     completed.add(42)
-    window.dispatchEvent(new CustomEvent('manga-job-event',{detail:{kind:'match_operation',operation:{...submitted.get(42),status:'succeeded',completed_at:'2026-08-05T12:00:03Z'}}}))
+    window.dispatchEvent(new CustomEvent('manga-job-event',{detail:{kind:'match_operation',type:'succeeded',state:'succeeded',operation:{...submitted.get(42),status:'succeeded',completed_at:'2026-08-05T12:00:03Z'}}}))
     await waitFor(()=>expect(document.querySelectorAll('.match-card')).toHaveLength(0))
     expect(screen.getByText('Merge completed')).toBeInTheDocument()
     const requestsAfter=(fetch as ReturnType<typeof vi.fn>).mock.calls.filter(([input,init])=>
@@ -315,6 +322,7 @@ describe('media library frontend',()=>{
     await screen.findByText('Splitting…')
     window.dispatchEvent(new CustomEvent('manga-job-event',{detail:{kind:'match_operation',operation:{...operation,status:'failed',error_code:'match_operation_failed',error_message:'Database conflict',completed_at:'2026-08-05T12:00:02Z'}}}))
     expect(await screen.findByText('Split failed')).toBeInTheDocument()
+    expect(screen.queryByText(/Split queued for/)).not.toBeInTheDocument()
     expect(document.querySelector('.match-card')).toHaveClass('operation-failed')
     expect(screen.getByRole('button',{name:'Merge'})).not.toBeDisabled()
     await userEvent.click(screen.getByRole('button',{name:'Dismiss notification'}))
@@ -355,5 +363,35 @@ describe('media library frontend',()=>{
     await userEvent.click(screen.getByRole('button',{name:'Reverse merge result order'}))
     await waitFor(()=>expect(fetch).toHaveBeenCalledWith(expect.stringContaining('order=asc'),expect.anything()))
     expect(screen.getByRole('button',{name:'Reverse merge result order'})).toHaveTextContent('Lowest first')
+  })
+
+  it('prefetches the next match page well before the current page ends',async()=>{
+    const first={
+      id:81,decision_ids:[81],confidence:.91,evidence:[],blocked_reasons:[],operation:null,
+      left:{...series,source_title:series.title,source:'asura',url:'https://asura.test/painter',cover_evidence_used:true},
+      right:{...matchingSeries,source_title:matchingSeries.title,source:'mangafire',url:'https://mangafire.test/painter',cover_evidence_used:true},
+    }
+    const second={...first,id:82,decision_ids:[82],left:{...first.left,id:41,title:'Prefetched Left',source_title:'Prefetched Left'},right:{...first.right,id:42,title:'Prefetched Right',source_title:'Prefetched Right'}}
+    let observerCallback:IntersectionObserverCallback|undefined
+    let observerOptions:IntersectionObserverInit|undefined
+    vi.stubGlobal('IntersectionObserver',class{
+      constructor(callback:IntersectionObserverCallback,options?:IntersectionObserverInit){observerCallback=callback;observerOptions=options}
+      observe=vi.fn();disconnect=vi.fn();unobserve=vi.fn();takeRecords=()=>[]
+    })
+    vi.stubGlobal('fetch',vi.fn((input:string|URL|Request)=>{
+      const url=String(input)
+      if(url.includes('/api/v2/operations'))return response({job_counts:{},health:{series:2,chapters:1,active_artifacts:0,missing_projections:0},sources:[],workers:[],permits:{}})
+      if(url.includes('/api/v2/providers'))return response({items:['asura','mangafire']})
+      if(url.includes('/api/v2/matches'))return url.includes('cursor=82')
+        ? response({items:[second],next_cursor:null})
+        : response({items:[first],next_cursor:82})
+      return response({items:[],next_cursor:null})
+    }))
+    renderApp('/matches')
+    await waitFor(()=>expect(observerCallback).toBeDefined())
+    expect(observerOptions?.rootMargin).toBe('2400px 0px')
+    act(()=>observerCallback?.([{isIntersecting:true} as IntersectionObserverEntry],{} as IntersectionObserver))
+    await waitFor(()=>expect(fetch).toHaveBeenCalledWith(expect.stringContaining('cursor=82'),expect.anything()))
+    expect(await screen.findByText('Prefetched Left')).toBeInTheDocument()
   })
 })
