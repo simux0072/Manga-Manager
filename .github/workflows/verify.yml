@@ -43,6 +43,7 @@ jobs:
         working-directory: frontend
       - name: Validate container and deployment configuration
         run: |
+          cp .env.example .env
           docker compose config --quiet
           sh -n scripts/stage-local.sh scripts/reset-local-data.sh
       - run: uv run ruff check .
