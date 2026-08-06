@@ -514,6 +514,55 @@ async def test_matches_show_the_provider_covers_used_by_the_scorer() -> None:
     assert item["right"]["cover_evidence_used"] is True
 
 
+async def test_catalog_cards_use_the_highest_resolution_cached_cover() -> None:
+    app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        series = session.query(CatalogSeries).filter_by(status="untracked").one()
+        low_resolution = session.query(CatalogSourceSeries).filter_by(series_id=series.id).one()
+        high_resolution = CatalogSourceSeries(
+            series_id=series.id,
+            source="mangafire",
+            source_id="higher-resolution-cover",
+            title=series.title,
+            normalized_title=series.normalized_title,
+            url="https://mangafire.test/higher-resolution-cover",
+            cover_url="https://images.test/high-resolution.jpg",
+        )
+        session.add(high_resolution)
+        session.flush()
+        low_checksum = "c" * 64
+        high_checksum = "d" * 64
+        session.add_all(
+            [
+                CatalogCoverAsset(
+                    source_series_id=low_resolution.id,
+                    content_checksum=low_checksum,
+                    relative_path=f"covers/{low_checksum}.jpg",
+                    source_url="https://images.test/low-resolution.jpg",
+                    width=400,
+                    height=600,
+                ),
+                CatalogCoverAsset(
+                    source_series_id=high_resolution.id,
+                    content_checksum=high_checksum,
+                    relative_path=f"covers/{high_checksum}.jpg",
+                    source_url=high_resolution.cover_url,
+                    width=1200,
+                    height=1800,
+                ),
+            ]
+        )
+        series_id = series.id
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.get("/api/v2/discovery")
+
+    item = next(row for row in response.json()["items"] if row["id"] == series_id)
+    assert item["cover_url"].endswith(f"/{high_checksum}.webp")
+
+
 def test_matches_collapse_alternate_same_provider_titles_with_cover_and_chapters() -> None:
     _app, sessions = app_with_catalog()
     with sessions() as session, session.begin():

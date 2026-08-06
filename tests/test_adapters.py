@@ -307,7 +307,9 @@ def test_kingofshojo_extracts_aliases_from_description_prefix_and_cleans_cover()
           Read manhwa Sashimi Master / Conquering the Academy with Just a Sashimi Knife / Sashimi Blade
           Synopsis A student survives with a sashimi knife.
         </div>
-        <div class="summary_image"><img data-src="/wp-content/uploads/cover.webp"></div>
+        <div class="summary_image">
+          <img data-src="https://i0.wp.com/kingofshojo.com/wp-content/uploads/cover.webp?resize=600%2C1000&amp;ssl=1">
+        </div>
         """,
         "html.parser",
     )
@@ -324,7 +326,7 @@ def test_kingofshojo_extracts_aliases_from_description_prefix_and_cleans_cover()
 
     assert "Conquering the Academy with Just a Sashimi Knife" in item.aliases
     assert not item.description.startswith("Read manhwa")
-    assert item.cover_url == "https://kingofshojo.com/wp-content/uploads/cover.webp"
+    assert item.cover_url == "https://i0.wp.com/kingofshojo.com/wp-content/uploads/cover.webp?ssl=1"
 
 
 def test_mangafire_uses_api_payloads_for_titles_chapters_and_pages():
@@ -780,6 +782,46 @@ async def test_mangadex_recovery_probe_uses_lightweight_ping() -> None:
         await adapter.aclose()
 
     assert requested_paths == ["/ping"]
+
+
+async def test_mangadex_detail_uses_original_cover_asset() -> None:
+    async def handler(request):
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "id": "manga-id",
+                    "attributes": {"title": {"en": "Example Manga"}},
+                    "relationships": [
+                        {
+                            "type": "cover_art",
+                            "attributes": {"fileName": "cover-file.jpg"},
+                        }
+                    ],
+                }
+            },
+            request=request,
+        )
+
+    adapter = MangaDexAdapter()
+    adapter.client = HttpSourceClient(
+        "https://api.mangadex.org",
+        transport=httpx.MockTransport(handler),
+        source="mangadex",
+    )
+    try:
+        result = await adapter.get_series_detail(
+            SeriesItem(
+                source="mangadex",
+                source_id="manga-id",
+                title="Example Manga",
+                url="https://mangadex.org/title/manga-id",
+            )
+        )
+    finally:
+        await adapter.aclose()
+
+    assert result.cover_url == "https://uploads.mangadex.org/covers/manga-id/cover-file.jpg"
 
 
 def test_mangadex_duplicate_chapters_prefer_official_then_verified_release():

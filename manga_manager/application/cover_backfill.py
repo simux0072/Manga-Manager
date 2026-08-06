@@ -5,7 +5,11 @@ from datetime import timedelta
 
 from sqlalchemy import or_, select
 
-from manga_manager.application.cover_evidence import ALGORITHM, CoverEvidenceService
+from manga_manager.application.cover_evidence import (
+    ALGORITHM,
+    CoverEvidenceService,
+    reconcile_canonical_cover_choices,
+)
 from manga_manager.application.download_activity import has_runnable_or_leased_downloads
 from manga_manager.application.job_handlers import (
     DeferredJobError,
@@ -70,6 +74,9 @@ class CoverBackfillPlanner:
         self.queue = queue or JobQueue()
 
     def enqueue_pending(self, session, *, limit: int = 10, chapter_threshold: int = 1) -> int:
+        # Existing decoded assets already contain real dimensions. Reconcile a bounded number of
+        # old provider-priority choices on every sweep without any network or image work.
+        reconcile_canonical_cover_choices(session, limit=250)
         if chapter_threshold > 0 and has_runnable_or_leased_downloads(session):
             return 0
         rows = session.execute(

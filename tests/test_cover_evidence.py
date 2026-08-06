@@ -15,11 +15,13 @@ from sqlalchemy.pool import StaticPool
 from manga_manager.application.cover_evidence import (
     ALGORITHM,
     CoverEvidenceService,
+    best_cover_choices,
     compare_signatures,
     cover_signature,
     fingerprint_cover,
     hamming_distance,
     process_cover_content,
+    reconcile_canonical_cover_choices,
     signature_bands,
     thumbnail_relative_path,
 )
@@ -63,6 +65,69 @@ def cover(*, badge: bool = False, inverted: bool = False) -> bytes:
     output = io.BytesIO()
     image.save(output, format="JPEG", quality=90)
     return output.getvalue()
+
+
+def test_highest_resolution_cover_becomes_canonical_before_provider_priority() -> None:
+    engine = create_engine("sqlite://")
+    JobBase.metadata.create_all(engine)
+    with Session(engine) as session, session.begin():
+        series = CatalogSeries(
+            title="Resolution Test",
+            normalized_title="resolution test",
+            cover_url="https://covers.test/old.jpg",
+        )
+        session.add(series)
+        session.flush()
+        preferred_provider = CatalogSourceSeries(
+            series_id=series.id,
+            source="asura",
+            source_id="resolution-low",
+            title=series.title,
+            normalized_title=series.normalized_title,
+            url="https://asurascans.test/resolution-low",
+            cover_url="https://covers.test/low.jpg",
+        )
+        sharper_provider = CatalogSourceSeries(
+            series_id=series.id,
+            source="mangafire",
+            source_id="resolution-high",
+            title=series.title,
+            normalized_title=series.normalized_title,
+            url="https://mangafire.test/resolution-high",
+            cover_url="https://covers.test/high.jpg",
+        )
+        session.add_all([preferred_provider, sharper_provider])
+        session.flush()
+        session.add_all(
+            [
+                CatalogCoverAsset(
+                    source_series_id=preferred_provider.id,
+                    content_checksum="a" * 64,
+                    relative_path="covers/low.jpg",
+                    source_url=preferred_provider.cover_url,
+                    width=400,
+                    height=600,
+                ),
+                CatalogCoverAsset(
+                    source_series_id=sharper_provider.id,
+                    content_checksum="b" * 64,
+                    relative_path="covers/high.jpg",
+                    source_url=sharper_provider.cover_url,
+                    width=1200,
+                    height=1800,
+                ),
+            ]
+        )
+        session.flush()
+
+        choice = best_cover_choices(session, [series.id])[series.id]
+        assert choice.source == "mangafire"
+        assert (choice.width, choice.height) == (1200, 1800)
+        assert reconcile_canonical_cover_choices(session, series_ids=[series.id]) == 1
+        assert series.cover_url == "https://covers.test/high.jpg"
+        assert series.cover_checksum == "b" * 64
+        assert series.cover_relative_path == "covers/high.jpg"
+        assert reconcile_canonical_cover_choices(session, series_ids=[series.id]) == 0
 
 
 def test_fingerprint_ignores_small_edge_badges_but_rejects_different_art() -> None:

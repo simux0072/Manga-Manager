@@ -110,6 +110,10 @@ storage by default. Local staging uses 1 GiB (`STAGE_MIN_FREE_BYTES` overrides i
   eligible again when that URL or signature algorithm changes. Outdated signatures are rebuilt
   from cached originals when possible. A temporarily unavailable cover does not prevent Kavita
   mapping or reading-progress synchronization.
+- Canonical covers are selected dynamically from cached provider images by their decoded pixel
+  resolution, with provider preference used only to break equal-resolution ties. Provider refreshes
+  request original MangaDex and WordPress cover assets, and the maintenance sweep upgrades legacy
+  choices so the web UI and Kavita converge on the sharpest available cover.
 - Matches are review-only; scores never merge records automatically. Suggested matches prioritize
   normalized local ORB/hash cover evidence, then stricter title/alias evidence, descriptions,
   chapter overlap, and latest numeric chapters with a two-chapter provider-delay tolerance. Manual

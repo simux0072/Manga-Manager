@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 import re
-from urllib.parse import unquote, urljoin, urlparse
+from urllib.parse import parse_qsl, unquote, urlencode, urljoin, urlparse, urlunparse
 
 from app.adapters.asura import (
     clean_series_title,
@@ -104,7 +104,7 @@ class KingOfShojoAdapter(SourceAdapter):
                     source_id=urlparse(url).path.strip("/"),
                     title=title,
                     url=url,
-                    cover_url=urljoin(self.base_url, cover)
+                    cover_url=original_kingofshojo_cover(urljoin(self.base_url, cover))
                     if valid_kingofshojo_cover(cover)
                     else "",
                     metadata={
@@ -157,7 +157,9 @@ class KingOfShojoAdapter(SourceAdapter):
             source_id=source_id,
             title=title,
             url=url,
-            cover_url=urljoin(self.base_url, cover) if valid_kingofshojo_cover(cover) else "",
+            cover_url=original_kingofshojo_cover(urljoin(self.base_url, cover))
+            if valid_kingofshojo_cover(cover)
+            else "",
             metadata={"recent_chapters": recent_metadata} if recent_metadata else {},
         )
     def parse_card_chapters(self, link, source_id: str, series_url: str) -> list[ChapterItem]:
@@ -234,7 +236,9 @@ class KingOfShojoAdapter(SourceAdapter):
             url=source_series.url,
             aliases=aliases or source_series.aliases,
             description=description,
-            cover_url=urljoin(self.base_url, cover or source_series.cover_url)
+            cover_url=original_kingofshojo_cover(
+                urljoin(self.base_url, cover or source_series.cover_url)
+            )
             if valid_kingofshojo_cover(cover or source_series.cover_url)
             else "",
             genres=genres or source_series.genres,
@@ -328,6 +332,23 @@ def valid_kingofshojo_cover(url: str) -> bool:
     if "cdn.kingofshojo.com/king-bucket/images/" in value:
         return True
     return any(token in value for token in ("/wp-content/uploads/", "/covers/", "king-bucket"))
+
+
+def original_kingofshojo_cover(url: str) -> str:
+    """Remove WordPress image-proxy resizing while preserving unrelated delivery options."""
+
+    parsed = urlparse(url)
+    if "/wp-content/uploads/" not in parsed.path:
+        return url
+    resize_keys = {"crop", "fit", "h", "height", "quality", "resize", "w", "width"}
+    query = urlencode(
+        [
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if key.lower() not in resize_keys
+        ]
+    )
+    return urlunparse(parsed._replace(query=query))
 
 
 def frontier_hits(items: list[SeriesItem], sentinels: dict[str, str]) -> int:

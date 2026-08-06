@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -12,13 +14,13 @@ from sqlalchemy import or_, select, tuple_
 
 from app.adapters.http import HttpSourceClient
 from app.domain import title_similarity
-from manga_manager.domain.providers import PROVIDER_ORIGINS
-from manga_manager.domain.providers import KNOWN_SOURCES
+from manga_manager.domain.providers import KNOWN_SOURCES, PROVIDER_ORIGINS, SOURCE_PRIORITY
 from manga_manager.infrastructure.db_models import (
     CatalogCoverAsset,
     CatalogCoverFingerprint,
     CatalogCoverSignature,
     CatalogMatchDecision,
+    CatalogSeries,
     CatalogSourceSeries,
 )
 from manga_manager.infrastructure.bounded_executor import AsyncBoundedExecutor
@@ -31,6 +33,117 @@ ALGORITHM = "orb-normalized-multihash-v2"
 THUMBNAIL_MAX_SIZE = (480, 720)
 FEATURE_LONG_EDGE = 720
 _COVER_EXECUTOR = AsyncBoundedExecutor(workers=1, thread_name_prefix="manga-cover")
+
+
+@dataclass(frozen=True, slots=True)
+class CoverChoice:
+    series_id: int
+    source_series_id: int
+    source: str
+    source_url: str
+    checksum: str
+    relative_path: str
+    width: int
+    height: int
+
+
+_SOURCE_COVER_PRIORITY = {
+    source: len(SOURCE_PRIORITY) - index for index, source in enumerate(SOURCE_PRIORITY)
+}
+
+
+def cover_quality_key(choice: CoverChoice) -> tuple[int, int, int, int, int]:
+    """Rank real decoded pixels first and use provider order only as a stable tie-breaker."""
+
+    width, height = max(choice.width, 0), max(choice.height, 0)
+    return (
+        width * height,
+        min(width, height),
+        max(width, height),
+        _SOURCE_COVER_PRIORITY.get(choice.source, 0),
+        -choice.source_series_id,
+    )
+
+
+def ranked_cover_choices(
+    session, series_ids: list[int] | set[int] | tuple[int, ...]
+) -> dict[int, list[CoverChoice]]:
+    ids = sorted(set(series_ids))
+    result: dict[int, list[CoverChoice]] = {}
+    if not ids:
+        return result
+    for identity, asset in session.execute(
+        select(CatalogSourceSeries, CatalogCoverAsset)
+        .join(
+            CatalogCoverAsset,
+            CatalogCoverAsset.source_series_id == CatalogSourceSeries.id,
+        )
+        .where(CatalogSourceSeries.series_id.in_(ids))
+    ):
+        result.setdefault(identity.series_id, []).append(
+            CoverChoice(
+                series_id=identity.series_id,
+                source_series_id=identity.id,
+                source=identity.source,
+                source_url=asset.source_url or identity.cover_url,
+                checksum=asset.content_checksum,
+                relative_path=asset.relative_path,
+                width=asset.width,
+                height=asset.height,
+            )
+        )
+    for choices in result.values():
+        choices.sort(key=cover_quality_key, reverse=True)
+    return result
+
+
+def best_cover_choices(
+    session, series_ids: list[int] | set[int] | tuple[int, ...]
+) -> dict[int, CoverChoice]:
+    return {
+        series_id: choices[0]
+        for series_id, choices in ranked_cover_choices(session, series_ids).items()
+        if choices
+    }
+
+
+def reconcile_canonical_cover_choices(
+    session,
+    *,
+    series_ids: list[int] | set[int] | tuple[int, ...] | None = None,
+    limit: int | None = None,
+) -> int:
+    """Persist resolution-ranked choices so jobs and Kavita observe the same canonical cover."""
+
+    candidate_ids = (
+        set(series_ids)
+        if series_ids is not None
+        else set(session.scalars(select(CatalogSourceSeries.series_id).distinct()).all())
+    )
+    choices = best_cover_choices(session, candidate_ids)
+    changed = 0
+    now = datetime.now(timezone.utc)
+    for series_id in sorted(choices):
+        choice = choices[series_id]
+        series = session.get(CatalogSeries, series_id)
+        if series is None:
+            continue
+        desired_url = choice.source_url
+        if (
+            series.cover_checksum == choice.checksum
+            and series.cover_relative_path == choice.relative_path
+            and (not desired_url or series.cover_url == desired_url)
+        ):
+            continue
+        series.cover_checksum = choice.checksum
+        series.cover_relative_path = choice.relative_path
+        if desired_url:
+            series.cover_url = desired_url
+        series.updated_at = now
+        changed += 1
+        if limit is not None and changed >= limit:
+            break
+    return changed
 
 
 @lru_cache(maxsize=1)
@@ -449,6 +562,7 @@ class CoverEvidenceService:
                 and existing_asset is not None
                 and existing_asset.source_url == identity.cover_url
             ):
+                changed = False
                 original = self.storage_root / existing_asset.relative_path
                 if original.is_file():
                     await run_cover_cpu(
@@ -465,6 +579,12 @@ class CoverEvidenceService:
                         existing.hash_band_2,
                         existing.hash_band_3,
                     ) = bands
+                    changed = True
+                if reconcile_canonical_cover_choices(
+                    session, series_ids=[identity.series_id]
+                ):
+                    changed = True
+                if changed:
                     session.commit()
                 return
             cover_url, source = identity.cover_url, identity.source
@@ -513,6 +633,7 @@ class CoverEvidenceService:
             asset.source_url = cover_url
             asset.width = width
             asset.height = height
+            asset.fetched_at = datetime.now(timezone.utc)
             session.add(asset)
             signature = session.get(
                 CatalogCoverSignature, source_series_id
@@ -547,4 +668,10 @@ class CoverEvidenceService:
                         width=width,
                         height=height,
                     )
+                )
+            session.flush()
+            identity = session.get(CatalogSourceSeries, source_series_id)
+            if identity is not None:
+                reconcile_canonical_cover_choices(
+                    session, series_ids=[identity.series_id]
                 )

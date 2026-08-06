@@ -114,7 +114,7 @@ class MangaDexAdapter(SourceAdapter):
         relationships = row.get("relationships") or []
         cover_name = relationship_attribute(relationships, "cover_art", "fileName")
         cover_url = (
-            f"https://uploads.mangadex.org/covers/{source_series.source_id}/{cover_name}.512.jpg"
+            f"https://uploads.mangadex.org/covers/{source_series.source_id}/{cover_name}"
             if cover_name
             else source_series.cover_url
         )

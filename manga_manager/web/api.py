@@ -33,6 +33,7 @@ from manga_manager.application.match_operations import (
     serialize_match_operation,
 )
 from manga_manager.application.cover_evidence import (
+    best_cover_choices,
     ensure_cover_thumbnail,
     thumbnail_relative_path,
 )
@@ -2205,27 +2206,10 @@ def serialize_series(
     ids = [row.id for row in rows]
     cover_assets: dict[int, str] = {}
     if ids:
-        priority = {source: index for index, source in enumerate(SOURCE_PRIORITY)}
-        candidates = session.execute(
-            select(
-                CatalogSourceSeries.series_id,
-                CatalogSourceSeries.source,
-                CatalogCoverAsset.content_checksum,
-            )
-            .join(
-                CatalogCoverAsset,
-                CatalogCoverAsset.source_series_id == CatalogSourceSeries.id,
-            )
-            .where(CatalogSourceSeries.series_id.in_(ids))
-        ).all()
-        for series_id, source, checksum in sorted(
-            candidates,
-            key=lambda value: (value[0], priority.get(value[1], len(priority))),
-        ):
-            cover_assets.setdefault(
-                series_id,
-                f"/api/v2/covers/{series_id}/{checksum}.webp",
-            )
+        cover_assets = {
+            series_id: f"/api/v2/covers/{series_id}/{choice.checksum}.webp"
+            for series_id, choice in best_cover_choices(session, ids).items()
+        }
     sources: dict[int, list[dict[str, str]]] = defaultdict(list)
     for source in session.scalars(
         select(CatalogSourceSeries)

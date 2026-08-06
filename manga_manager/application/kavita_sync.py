@@ -20,7 +20,11 @@ from app.kavita import (
     KavitaSeries,
     configured_kavita_client,
 )
-from manga_manager.application.cover_evidence import fingerprint_cover, hamming_distance
+from manga_manager.application.cover_evidence import (
+    fingerprint_cover,
+    hamming_distance,
+    ranked_cover_choices,
+)
 from manga_manager.application.job_handlers import (
     DeferredJobError,
     JobContext,
@@ -33,7 +37,6 @@ from manga_manager.domain.providers import SOURCE_PRIORITY
 from manga_manager.infrastructure.db_models import (
     CatalogChapter,
     CatalogChapterReadingState,
-    CatalogCoverAsset,
     CatalogExternalIdentifier,
     CatalogSeries,
     CatalogSeriesAlias,
@@ -636,8 +639,8 @@ class KavitaSyncHandler:
                 )
             ).all()
         )
-        source_covers = session.execute(
-            select(CatalogSourceSeries.source, CatalogSourceSeries.cover_url).where(
+        source_covers = session.scalars(
+            select(CatalogSourceSeries).where(
                 CatalogSourceSeries.series_id == series.id,
                 CatalogSourceSeries.cover_url != "",
             )
@@ -645,37 +648,27 @@ class KavitaSyncHandler:
         priorities = {
             source: len(SOURCE_PRIORITY) - index for index, source in enumerate(SOURCE_PRIORITY)
         }
-        ordered_covers = [
-            row[1]
+        ranked_choices = ranked_cover_choices(session, [series.id]).get(series.id, [])
+        ranked_source_ids = {choice.source_series_id for choice in ranked_choices}
+        ordered_covers = [choice.source_url for choice in ranked_choices if choice.source_url]
+        ordered_covers.extend(
+            row.cover_url
             for row in sorted(
-                source_covers, key=lambda row: priorities.get(row[0], 0), reverse=True
+                source_covers,
+                key=lambda row: priorities.get(row.source, 0),
+                reverse=True,
             )
-            if row[1]
-        ]
+            if row.id not in ranked_source_ids and row.cover_url
+        )
         if series.cover_url and series.cover_url not in ordered_covers:
             ordered_covers.append(series.cover_url)
-        cached_covers = session.execute(
-            select(
-                CatalogSourceSeries.source,
-                CatalogCoverAsset.relative_path,
-            )
-            .join(
-                CatalogCoverAsset,
-                CatalogCoverAsset.source_series_id == CatalogSourceSeries.id,
-            )
-            .where(CatalogSourceSeries.series_id == series.id)
-        ).all()
-        ordered_cached_covers = tuple(
-            row[1]
-            for row in sorted(
-                cached_covers, key=lambda row: priorities.get(row[0], 0), reverse=True
-            )
-        )
-        if series.cover_relative_path:
-            ordered_cached_covers = (
-                series.cover_relative_path,
-                *(path for path in ordered_cached_covers if path != series.cover_relative_path),
-            )
+        ordered_covers = list(dict.fromkeys(ordered_covers))
+        ordered_cached_covers = [choice.relative_path for choice in ranked_choices]
+        if (
+            series.cover_relative_path
+            and series.cover_relative_path not in ordered_cached_covers
+        ):
+            ordered_cached_covers.append(series.cover_relative_path)
         chapter_cover_checksums = dict(
             session.execute(
                 select(
@@ -712,7 +705,7 @@ class KavitaSyncHandler:
             kavita_cover_checksum=series.kavita_cover_checksum,
             chapter_cover_checksums=chapter_cover_checksums,
             expected_chapters=tuple(sorted(chapter_cover_checksums)),
-            cached_cover_paths=ordered_cached_covers,
+            cached_cover_paths=tuple(ordered_cached_covers),
             chapter_kavita_ids=chapter_kavita_ids,
         )
 
