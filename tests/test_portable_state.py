@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from io import StringIO
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,7 @@ from manga_manager.application.portable_state import (
     plan_portable_import,
     write_portable_state,
 )
+from manga_manager.cli import portable_import_progress
 from manga_manager.infrastructure.db_models import (
     ArtifactBlob,
     CatalogAlternateSourceListing,
@@ -35,14 +37,14 @@ from manga_manager.infrastructure.db_models import (
 )
 
 
-def database_factory():
+def database_factory(*, autoflush: bool = True):
     engine = create_engine(
         "sqlite://",
         connect_args={"check_same_thread": False},
         poolclass=StaticPool,
     )
     JobBase.metadata.create_all(engine)
-    return sessionmaker(engine, expire_on_commit=False)
+    return sessionmaker(engine, autoflush=autoflush, expire_on_commit=False)
 
 
 def seed_portable_source(sessions) -> None:
@@ -186,6 +188,9 @@ def test_portable_export_omits_media_runtime_and_secrets(tmp_path: Path) -> None
     assert len(state.series) == 4
     merged = next(row for row in state.series if row.title == "Merged Story")
     assert {source.source for source in merged.sources} == {"asura", "mangafire"}
+    assert merged.aliases == []
+    asura = next(source for source in merged.sources if source.source == "asura")
+    assert asura.aliases == ["Merged Alias"]
     assert merged.reading[0].chapter == "8"
     assert merged.reading[0].status == "read"
     downloaded = next(row for row in state.series if row.title == "Downloaded Cache")
@@ -261,6 +266,73 @@ def test_portable_import_is_idempotent_and_rebuilds_download_intent() -> None:
         assert session.query(CatalogSourceSeries).count() == 5
         assert session.query(CatalogMatchDecision).count() == 1
         assert session.query(WorkJob).filter_by(kind="source_refresh").count() == 5
+
+
+def test_portable_import_allows_separated_series_with_the_same_title() -> None:
+    source = database_factory()
+    seed_portable_source(source)
+    with source() as session:
+        state = export_portable_state(session)
+
+    left = next(
+        series
+        for series in state.series
+        if any(identity.source_id == "left-uuid" for identity in series.sources)
+    )
+    right = next(
+        series
+        for series in state.series
+        if any(identity.source_id == "similar-right" for identity in series.sources)
+    )
+    right.title = left.title
+
+    target = database_factory()
+    with target() as session:
+        preview = plan_portable_import(session, state)
+
+    assert preview.conflicts == []
+
+
+def test_portable_import_deduplicates_pending_aliases_without_autoflush() -> None:
+    source = database_factory()
+    seed_portable_source(source)
+    with source() as session:
+        state = export_portable_state(session)
+
+    merged = next(row for row in state.series if row.title == "Merged Story")
+    merged.aliases.append("Merged Alias")
+
+    target = database_factory(autoflush=False)
+    with target() as session, session.begin():
+        apply_portable_import(session, state)
+
+    with target() as session:
+        aliases = session.scalars(
+            select(CatalogSeriesAlias).where(
+                CatalogSeriesAlias.normalized_value == "merged alias"
+            )
+        ).all()
+    assert len(aliases) == 1
+
+
+def test_portable_import_reports_phases_and_noninteractive_progress() -> None:
+    source = database_factory()
+    seed_portable_source(source)
+    with source() as session:
+        state = export_portable_state(session)
+
+    output = StringIO()
+    progress = portable_import_progress(output)
+    target = database_factory(autoflush=False)
+    with target() as session, session.begin():
+        apply_portable_import(session, state, progress=progress)
+
+    rendered = output.getvalue()
+    assert "phase=planning progress=0/1 percent=0" in rendered
+    assert f"phase=series progress={len(state.series)}/{len(state.series)} percent=100" in rendered
+    assert "phase=separations" in rendered
+    assert "phase=providers" in rendered
+    assert "phase=finalizing progress=1/1 percent=100" in rendered
 
 
 def test_portable_import_merges_existing_provider_records() -> None:

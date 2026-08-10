@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Literal
@@ -36,6 +37,7 @@ FORMAT_NAME = "manga-manager-portable-state"
 FORMAT_VERSION = 1
 STATUS_RANK = {"untracked": 0, "paused": 1, "caught_up": 2, "interested": 3, "reading": 4}
 READING_RANK = {"unread": 0, "reading": 1, "read": 2}
+PortableImportProgress = Callable[[str, int, int], None]
 
 
 def utcnow() -> datetime:
@@ -279,7 +281,10 @@ def export_portable_state(session: Session) -> PortableState:
         aliases = list(
             session.scalars(
                 select(CatalogSeriesAlias.display_value)
-                .where(CatalogSeriesAlias.series_id == series.id)
+                .where(
+                    CatalogSeriesAlias.series_id == series.id,
+                    CatalogSeriesAlias.source_series_id.is_(None),
+                )
                 .order_by(CatalogSeriesAlias.normalized_value)
             ).all()
         )
@@ -462,8 +467,8 @@ def plan_portable_import(session: Session, state: PortableState) -> PortableImpo
                 )
             claimed_series[series_id] = portable_series.title
     portable_owners = {
-        source.key: portable_series.title
-        for portable_series in state.series
+        source.key: series_index
+        for series_index, portable_series in enumerate(state.series)
         for source in portable_series.sources
     }
     for separation in state.separations:
@@ -507,6 +512,18 @@ def _upsert_alias(
 ) -> None:
     normalized = normalize_title(value)
     if not normalized:
+        return
+    pending = next(
+        (
+            alias
+            for alias in session.new
+            if isinstance(alias, CatalogSeriesAlias)
+            and alias.series_id == series_id
+            and alias.normalized_value == normalized
+        ),
+        None,
+    )
+    if pending is not None:
         return
     existing = session.scalar(
         select(CatalogSeriesAlias).where(
@@ -625,9 +642,17 @@ def _upsert_reading_state(
 
 
 def apply_portable_import(
-    session: Session, state: PortableState, *, queue: JobQueue | None = None
+    session: Session,
+    state: PortableState,
+    *,
+    queue: JobQueue | None = None,
+    progress: PortableImportProgress | None = None,
 ) -> PortableImportReport:
+    if progress is not None:
+        progress("planning", 0, 1)
     report = plan_portable_import(session, state)
+    if progress is not None:
+        progress("planning", 1, 1)
     if report.conflicts:
         raise PortableStateConflict("; ".join(report.conflicts))
     queue = queue or JobQueue()
@@ -639,7 +664,9 @@ def apply_portable_import(
         json.dumps(state.model_dump(mode="json"), sort_keys=True).encode()
     ).hexdigest()[:12]
     workflow_key = f"portable-import:{digest}"
-    for portable_series in state.series:
+    if progress is not None:
+        progress("series", 0, len(state.series))
+    for series_number, portable_series in enumerate(state.series, start=1):
         resolved = {
             source.key: _resolve_existing_identity(source, identities)
             for source in portable_series.sources
@@ -728,8 +755,12 @@ def apply_portable_import(
         if canonical.status in TRACKED_STATES:
             DownloadPlanCoordinator(queue).track(session, canonical.id)
             download_plans += 1
+        if progress is not None:
+            progress("series", series_number, len(state.series))
 
-    for separation in state.separations:
+    if progress is not None:
+        progress("separations", 0, len(state.separations))
+    for separation_number, separation in enumerate(state.separations, start=1):
         left = restored[separation.left.key]
         right = restored[separation.right.key]
         if left.series_id == right.series_id:
@@ -755,15 +786,25 @@ def apply_portable_import(
         decision.decided_at = utcnow()
         decision.scorer_version = "portable-v1"
         decision.evidence_json = {"origin": "portable_import"}
+        if progress is not None:
+            progress("separations", separation_number, len(state.separations))
 
-    for preference in state.providers:
+    if progress is not None:
+        progress("providers", 0, len(state.providers))
+    for provider_number, preference in enumerate(state.providers, start=1):
         provider = session.get(CatalogSourceState, preference.source)
         if provider is None:
             provider = CatalogSourceState(source=preference.source)
             session.add(provider)
         provider.manual_enabled = preference.enabled
         provider.updated_at = utcnow()
+        if progress is not None:
+            progress("providers", provider_number, len(state.providers))
+    if progress is not None:
+        progress("finalizing", 0, 1)
     session.flush()
+    if progress is not None:
+        progress("finalizing", 1, 1)
     return report.model_copy(
         update={
             "applied": True,

@@ -8,10 +8,11 @@ import signal
 import sys
 import time
 import zipfile
-from dataclasses import asdict
-from xml.etree import ElementTree
 from collections.abc import Sequence
+from dataclasses import asdict
 from pathlib import Path
+from typing import TextIO
+from xml.etree import ElementTree
 
 from sqlalchemy import exists, select, text
 from sqlalchemy.engine import Connection
@@ -32,6 +33,7 @@ from manga_manager.application.library_repair import (
 from manga_manager.application.catalog_recovery import CatalogRecovery, write_recovery_report
 from manga_manager.application.match_training import export_training_data
 from manga_manager.application.portable_state import (
+    PortableImportProgress,
     PortableStateConflict,
     apply_portable_import,
     export_portable_state,
@@ -76,6 +78,41 @@ from manga_manager.worker.scheduler import SourcePollScheduler
 
 STAGE_MUTATING_JOB_KINDS = ("chapter_download", "library_repair", "kavita_sync")
 STAGE_ACTIVE_JOB_STATES = ("queued", "leased", "retry_wait")
+
+
+def portable_import_progress(stream: TextIO) -> PortableImportProgress:
+    interactive = stream.isatty()
+    last_reported: dict[str, int] = {}
+
+    def update(phase: str, current: int, total: int) -> None:
+        label = phase.replace("_", " ").title()
+        ratio = 1.0 if total == 0 else min(1.0, current / total)
+        percent = round(ratio * 100)
+        if interactive:
+            width = 30
+            filled = round(width * ratio)
+            bar = "#" * filled + "-" * (width - filled)
+            ending = "\n" if current >= total else ""
+            print(
+                f"\r{label:<12} [{bar}] {current}/{total} ({percent:3d}%)",
+                end=ending,
+                file=stream,
+                flush=True,
+            )
+            return
+
+        interval = max(1, (total + 9) // 10)
+        previous = last_reported.get(phase)
+        if current not in {0, total} and previous is not None and current - previous < interval:
+            return
+        print(
+            f"portable-import phase={phase} progress={current}/{total} percent={percent}",
+            file=stream,
+            flush=True,
+        )
+        last_reported[phase] = current
+
+    return update
 
 
 def stage_active_mutations(connection: Connection) -> list[dict[str, object]]:
@@ -327,15 +364,22 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
         return 0
     if args.command == "import-portable-state":
+        progress = portable_import_progress(sys.stderr) if args.apply else None
         try:
+            if progress is not None:
+                progress("loading", 0, 1)
             state = load_portable_state(args.source)
+            if progress is not None:
+                progress("loading", 1, 1)
         except ValueError as exc:
             parser.error(str(exc))
         sessions = create_session_factory(engine)
         try:
             if args.apply:
                 with sessions() as session, session.begin():
-                    report = apply_portable_import(session, state)
+                    report = apply_portable_import(session, state, progress=progress)
+                assert progress is not None
+                progress("complete", 1, 1)
             else:
                 with sessions() as session:
                     report = plan_portable_import(session, state)
