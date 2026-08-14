@@ -20,6 +20,7 @@ db_volume="$project-db"
 database_url="postgresql+psycopg://manga:manga@$postgres:5432/manga_manager"
 stage_min_free_bytes="${STAGE_MIN_FREE_BYTES:-1073741824}"
 stage_bind_address="${STAGE_BIND_ADDRESS:-0.0.0.0}"
+stage_port="${STAGE_PORT:-18000}"
 stage_cli_memory="${STAGE_CLI_MEMORY:-384m}"
 
 # A direct application rebuild must not silently detach an already provisioned Kavita
@@ -88,6 +89,54 @@ teardown() {
   fi
 }
 
+check_stage_port() {
+  owners=$(docker ps --filter "publish=$stage_port" --format '{{.Names}}')
+  unexpected=""
+  for owner in $owners; do
+    [ "$owner" = "$web" ] || unexpected="$unexpected $owner"
+  done
+  if [ -n "$unexpected" ]; then
+    echo "cannot start $web: host port $stage_bind_address:$stage_port is already published by:$unexpected" >&2
+    echo "stop that container, select another STAGE_PORT, or bind loopback with STAGE_BIND_ADDRESS=127.0.0.1" >&2
+    echo "the current stack was not changed" >&2
+    exit 1
+  fi
+  if [ -n "$owners" ]; then
+    return
+  fi
+  python_command=""
+  if command -v python3 >/dev/null 2>&1; then
+    python_command=python3
+  elif command -v python >/dev/null 2>&1; then
+    python_command=python
+  fi
+  if [ -n "$python_command" ] && ! "$python_command" -c '
+import socket
+import sys
+
+address, port = sys.argv[1], int(sys.argv[2])
+last_error = None
+for family, kind, protocol, _, target in socket.getaddrinfo(
+    address, port, type=socket.SOCK_STREAM, flags=socket.AI_PASSIVE
+):
+    probe = socket.socket(family, kind, protocol)
+    try:
+        probe.bind(target)
+    except OSError as exc:
+        last_error = exc
+    else:
+        probe.close()
+        raise SystemExit(0)
+    probe.close()
+raise SystemExit(str(last_error or "address is unavailable"))
+' "$stage_bind_address" "$stage_port"; then
+    echo "cannot start $web: host port $stage_bind_address:$stage_port is already in use" >&2
+    echo "for WSL with Tailscale Serve, set STAGE_BIND_ADDRESS=127.0.0.1" >&2
+    echo "otherwise stop the owning process or select another STAGE_PORT; the current stack was not changed" >&2
+    exit 1
+  fi
+}
+
 wait_for_job() {
   job_id="$1"
   attempts=0
@@ -130,6 +179,8 @@ if [ "$mode" = "down" ]; then
   exit 0
 fi
 
+check_stage_port
+
 mkdir -p "$data_dir"
 if [ -n "${STAGE_LEGACY_DATABASE:-}" ]; then
   legacy_storage_preflight=$(cd "${STAGE_LEGACY_STORAGE_ROOT:-storage}" && pwd)
@@ -162,7 +213,7 @@ docker network inspect "$network" >/dev/null 2>&1 || docker network create "$net
 docker volume inspect "$db_volume" >/dev/null 2>&1 || docker volume create "$db_volume" >/dev/null
 docker rm -f "$web" "$worker" >/dev/null 2>&1 || true
 remove_postgres
-docker run -d --name "$postgres" --network "$network" --memory 256m \
+docker run -d --name "$postgres" --network "$network" --restart unless-stopped --memory 256m \
   --log-opt max-size=10m --log-opt max-file=3 \
   -e POSTGRES_DB=manga_manager -e POSTGRES_USER=manga -e POSTGRES_PASSWORD=manga \
   -v "$db_volume:/var/lib/postgresql/data" postgres:16-alpine postgres \
@@ -241,7 +292,7 @@ if [ "$run_repairs" = true ]; then
     reconcile-refresh-queue --report /data/refresh-queue-applied.json --apply
 fi
 docker run -d --name "$web" --network "$network" --restart unless-stopped --memory 256m \
-  -p "$stage_bind_address:${STAGE_PORT:-18000}:8000" \
+  -p "$stage_bind_address:$stage_port:8000" \
   --log-opt max-size=10m --log-opt max-file=3 \
   -e "V2_DATABASE_URL=$database_url" -e V2_STORAGE_ROOT=/data \
   -e "V2_ENABLE_ASURA=$sources_enabled" -e "V2_ENABLE_MANGADEX=$sources_enabled" \
@@ -281,8 +332,8 @@ done
 if [ "$mode" = "serve" ]; then
   lan_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
   [ -n "$lan_ip" ] || lan_ip='<host-ip>'
-  printf '%s\n' "Manga Manager (this computer): http://127.0.0.1:${STAGE_PORT:-18000}" \
-    "Manga Manager (local network): http://$lan_ip:${STAGE_PORT:-18000}" \
+  printf '%s\n' "Manga Manager (this computer): http://127.0.0.1:$stage_port" \
+    "Manga Manager (local network): http://$lan_ip:$stage_port" \
     "Stop: scripts/stage-local.sh down"
   exit 0
 fi
@@ -334,6 +385,6 @@ recovery_id=$(printf '%s\n' "$recovery_output" | sed -n 's/^job_id=\([0-9][0-9]*
 [ -n "$recovery_id" ] && wait_for_job "$recovery_id"
 lan_ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
 [ -n "$lan_ip" ] || lan_ip='<host-ip>'
-printf '%s\n' "staging ready: http://127.0.0.1:${STAGE_PORT:-18000}" \
-  "local network: http://$lan_ip:${STAGE_PORT:-18000}" \
+printf '%s\n' "staging ready: http://127.0.0.1:$stage_port" \
+  "local network: http://$lan_ip:$stage_port" \
   "teardown: scripts/stage-local.sh down"

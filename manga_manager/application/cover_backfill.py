@@ -51,14 +51,16 @@ class CoverBackfillHandler:
                 message="fetching and fingerprinting cover",
                 details={"phase": "cover", "processed": 0, "total": 1, "unit": "covers"},
             )
-        await self.service.refresh_for_source_series(payload.source_series_id)
+        failure = await self.service.refresh_for_source_series(payload.source_series_id)
         context.ensure_lease()
         with self.service.session_factory() as session, session.begin():
             signature = session.get(CatalogCoverSignature, payload.source_series_id)
             if signature is None or signature.algorithm_version != ALGORITHM:
                 raise RetryableJobError(
-                    "cover_fetch_failed",
-                    "provider cover could not be downloaded or decoded",
+                    failure.code if failure is not None else "cover_fetch_failed",
+                    failure.message
+                    if failure is not None
+                    else "provider cover could not be downloaded or decoded",
                 )
             JobQueue().progress(
                 session,

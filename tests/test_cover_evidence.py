@@ -7,6 +7,7 @@ import sys
 
 import numpy as np
 import pytest
+import httpx
 from PIL import Image, ImageDraw
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session, sessionmaker
@@ -15,6 +16,7 @@ from sqlalchemy.pool import StaticPool
 from manga_manager.application.cover_evidence import (
     ALGORITHM,
     CoverEvidenceService,
+    describe_cover_failure,
     best_cover_choices,
     compare_signatures,
     cover_signature,
@@ -227,6 +229,72 @@ def test_cover_processing_keeps_original_and_creates_bounded_webp(tmp_path) -> N
         assert image.format == "WEBP"
         assert image.width <= 480
         assert image.height <= 720
+
+
+def test_cover_failure_diagnostic_omits_signed_url_query() -> None:
+    request = httpx.Request("GET", "https://covers.test/image.jpg?secret=do-not-store")
+    response = httpx.Response(403, request=request)
+
+    failure = describe_cover_failure(
+        httpx.HTTPStatusError("forbidden", request=request, response=response),
+        str(request.url),
+    )
+
+    assert failure.code == "cover_http_403"
+    assert failure.message == "cover request to covers.test returned HTTP 403"
+    assert "secret" not in failure.message
+
+
+@pytest.mark.asyncio
+async def test_cover_download_uses_series_page_as_referer(monkeypatch, tmp_path) -> None:
+    engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    sessions = sessionmaker(engine, autoflush=False, expire_on_commit=False)
+    JobBase.metadata.create_all(engine)
+    with sessions() as session, session.begin():
+        series = CatalogSeries(title="Example", normalized_title="example")
+        session.add(series)
+        session.flush()
+        identity = CatalogSourceSeries(
+            series_id=series.id,
+            source="asura",
+            source_id="example",
+            title="Example",
+            normalized_title="example",
+            url="https://asurascans.com/comics/example",
+            cover_url="https://cdn.asurascans.com/example.webp",
+        )
+        session.add(identity)
+        session.flush()
+        identity_id = identity.id
+
+    observed: dict[str, str] = {}
+
+    class CoverClient:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        async def get_bytes(self, url: str, referer: str = "") -> bytes:
+            observed.update(url=url, referer=referer)
+            return detailed_cover()
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr("manga_manager.application.cover_evidence.HttpSourceClient", CoverClient)
+
+    failure = await CoverEvidenceService(sessions, tmp_path).refresh_for_source_series(identity_id)
+
+    assert failure is None
+    assert observed == {
+        "url": "https://cdn.asurascans.com/example.webp",
+        "referer": "https://asurascans.com/comics/example",
+    }
+    with sessions() as session:
+        assert session.get(CatalogCoverSignature, identity_id) is not None
 
 
 def test_cover_backfill_does_not_requeue_an_exhausted_url_forever() -> None:

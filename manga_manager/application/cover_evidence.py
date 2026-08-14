@@ -9,9 +9,11 @@ from functools import lru_cache
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from PIL import Image, ImageOps
+import httpx
+from PIL import Image, ImageOps, UnidentifiedImageError
 from sqlalchemy import or_, select, tuple_
 
+from app.adapters.base import SourceRateLimited
 from app.adapters.http import HttpSourceClient
 from app.domain import title_similarity
 from manga_manager.domain.providers import KNOWN_SOURCES, PROVIDER_ORIGINS, SOURCE_PRIORITY
@@ -45,6 +47,47 @@ class CoverChoice:
     relative_path: str
     width: int
     height: int
+
+
+@dataclass(frozen=True, slots=True)
+class CoverRefreshFailure:
+    code: str
+    message: str
+
+
+def describe_cover_failure(exc: BaseException, cover_url: str) -> CoverRefreshFailure:
+    """Return actionable cover diagnostics without persisting signed URL query strings."""
+
+    host = urlsplit(cover_url).hostname or "provider host"
+    if isinstance(exc, SourceRateLimited):
+        return CoverRefreshFailure("cover_rate_limited", f"cover host {host} rate limited the request")
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return CoverRefreshFailure(
+            f"cover_http_{status}",
+            f"cover request to {host} returned HTTP {status}",
+        )
+    if isinstance(exc, httpx.TransportError):
+        return CoverRefreshFailure(
+            "cover_network_error",
+            f"cover request to {host} failed: {type(exc).__name__}",
+        )
+    if isinstance(exc, UnidentifiedImageError):
+        return CoverRefreshFailure(
+            "cover_decode_failed",
+            f"response from {host} was not a supported image",
+        )
+    if isinstance(exc, ValueError):
+        return CoverRefreshFailure("cover_invalid", str(exc)[:300])
+    if isinstance(exc, RuntimeError):
+        # HttpSourceClient includes the complete URL after "for" in validation errors. Keep the
+        # useful content-type/size reason but avoid storing expiring tokens in the job history.
+        reason = str(exc).split(" for http", 1)[0].strip() or type(exc).__name__
+        return CoverRefreshFailure("cover_response_invalid", f"{host}: {reason[:300]}")
+    return CoverRefreshFailure(
+        "cover_processing_failed",
+        f"cover processing for {host} failed: {type(exc).__name__}",
+    )
 
 
 _SOURCE_COVER_PRIORITY = {
@@ -436,17 +479,25 @@ class CoverEvidenceService:
         self.session_factory = session_factory
         self.storage_root = storage_root or V2Settings().storage_root
 
-    async def refresh_for_source_series(self, source_series_id: int) -> None:
-        await self._ensure_signature(source_series_id)
+    async def refresh_for_source_series(
+        self, source_series_id: int
+    ) -> CoverRefreshFailure | None:
+        failure = await self._ensure_signature(source_series_id)
+        if failure is not None:
+            return failure
         # Fetches happen through each provider scheduler as its series is refreshed. Do not fan out
         # arbitrary network traffic here; compare current series with already cached signatures.
         with self.session_factory() as session:
             source = session.get(CatalogSourceSeries, source_series_id)
             signature = session.get(CatalogCoverSignature, source_series_id)
             if source is None:
-                return
+                return CoverRefreshFailure(
+                    "cover_source_missing", "cover source identity no longer exists"
+                )
             if signature is None:
-                return
+                return CoverRefreshFailure(
+                    "cover_signature_missing", "cover signature was not created"
+                )
             bands = signature_bands(signature.feature_json or {})
             title_prefix = source.normalized_title[:12]
             shortlist_ids = session.scalars(
@@ -498,7 +549,7 @@ class CoverEvidenceService:
             candidate_rows,
         )
         if not candidates:
-            return
+            return None
         candidate_series_ids = sorted({candidate[1] for candidate in candidates})
         features_by_series = await run_cover_cpu(
             _score_cover_candidates,
@@ -546,16 +597,22 @@ class CoverEvidenceService:
                     decision.scorer_version = str(features["scorer_version"])
                     decision.feature_vector_json = features
 
-    async def _ensure_signature(self, source_series_id: int) -> None:
+        return None
+
+    async def _ensure_signature(self, source_series_id: int) -> CoverRefreshFailure | None:
         cached_original: Path | None = None
         with self.session_factory() as session:
             identity = session.get(CatalogSourceSeries, source_series_id)
             existing = session.get(CatalogCoverSignature, source_series_id)
             existing_asset = session.get(CatalogCoverAsset, source_series_id)
             if identity is None or not identity.cover_url:
-                return
+                return CoverRefreshFailure(
+                    "cover_url_missing", "provider source has no cover URL"
+                )
             if identity.source not in KNOWN_SOURCES:
-                return
+                return CoverRefreshFailure(
+                    "cover_source_unknown", f"unknown cover provider {identity.source}"
+                )
             if (
                 existing is not None
                 and existing.algorithm_version == ALGORITHM
@@ -586,8 +643,8 @@ class CoverEvidenceService:
                     changed = True
                 if changed:
                     session.commit()
-                return
-            cover_url, source = identity.cover_url, identity.source
+                return None
+            cover_url, source, referer_url = identity.cover_url, identity.source, identity.url
             if existing_asset is not None and existing_asset.source_url == cover_url:
                 candidate = self.storage_root / existing_asset.relative_path
                 if candidate.is_file():
@@ -603,7 +660,7 @@ class CoverEvidenceService:
                     provider_origin_url=PROVIDER_ORIGINS.get(source),
                 )
                 try:
-                    content = await client.get_bytes(cover_url)
+                    content = await client.get_bytes(cover_url, referer=referer_url)
                 finally:
                     await client.aclose()
             if not content or len(content) > 5 * 1024 * 1024:
@@ -619,8 +676,8 @@ class CoverEvidenceService:
                 image_format,
                 relative,
             ) = await run_cover_cpu(process_cover_content, content, self.storage_root)
-        except Exception:
-            return
+        except Exception as exc:
+            return describe_cover_failure(exc, cover_url)
         with self.session_factory() as session, session.begin():
             asset = session.get(CatalogCoverAsset, source_series_id) or CatalogCoverAsset(
                 source_series_id=source_series_id,
@@ -675,3 +732,4 @@ class CoverEvidenceService:
                 reconcile_canonical_cover_choices(
                     session, series_ids=[identity.series_id]
                 )
+        return None

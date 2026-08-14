@@ -102,6 +102,8 @@ def test_runtime_entrypoints_do_not_reinvoke_uv() -> None:
     assert "max-size: 10m" in compose
     assert 'docker stop --time "${STAGE_POSTGRES_STOP_SECONDS:-300}"' in stage
     assert 'docker rm -f "$postgres"' not in stage
+    assert 'docker ps --filter "publish=$stage_port"' in stage
+    assert '"$postgres" --network "$network" --restart unless-stopped' in stage
     assert 'STAGE_BIND_ADDRESS:-0.0.0.0' in stage
     assert 'kavita_env_file="$state_dir/$project-kavita.env"' in stage
     assert 'saved_kavita_api_key=$(sed' in stage
@@ -134,6 +136,43 @@ def test_runtime_entrypoints_do_not_reinvoke_uv() -> None:
     assert "X-SQL-Query-Count" in scale_verifier
     assert "max-route-queries" in scale_verifier
     assert '\"operations\": \"/api/v2/operations\"' in scale_verifier
+
+
+def test_stage_refuses_port_owned_by_another_container_before_mutation(tmp_path: Path) -> None:
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    calls = tmp_path / "docker-calls"
+    docker = fake_bin / "docker"
+    docker.write_text(
+        "#!/bin/sh\n"
+        f"printf '%s\\n' \"$*\" >> {calls}\n"
+        "if [ \"$1\" = ps ]; then\n"
+        "  printf '%s\\n' other-stack-web\n"
+        "  exit 0\n"
+        "fi\n"
+        "exit 91\n"
+    )
+    docker.chmod(0o755)
+    environment = {
+        **os.environ,
+        "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        "STAGE_STATE_DIR": str(tmp_path / "state"),
+        "STAGE_STORAGE_ROOT": str(tmp_path / "storage"),
+    }
+
+    result = subprocess.run(
+        ["sh", str(ROOT / "scripts" / "stage-local.sh"), "serve"],
+        cwd=ROOT,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "already published by: other-stack-web" in result.stderr
+    assert "the current stack was not changed" in result.stderr
+    assert calls.read_text().splitlines() == ["ps --filter publish=18000 --format {{.Names}}"]
 
 
 def test_scale_parser_accepts_database_only_chapter_fixture_size() -> None:

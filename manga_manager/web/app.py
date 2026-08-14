@@ -328,7 +328,9 @@ def merge_match_groups(session: Session, decision: CatalogMatchDecision) -> None
         if duplicate is None:
             alias.series_id = target_series_id
         else:
-            session.delete(alias)
+            # Execute before deleting the canonical parent; its database cascade would otherwise
+            # remove the row first and leave the ORM to warn about a zero-row DELETE at flush.
+            session.execute(delete(CatalogSeriesAlias).where(CatalogSeriesAlias.id == alias.id))
     session.execute(
         update(CatalogExternalIdentifier)
         .where(CatalogExternalIdentifier.series_id == source_series_id)

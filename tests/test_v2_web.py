@@ -1,6 +1,8 @@
+import warnings
 from datetime import datetime, timedelta, timezone
 
 import httpx
+from sqlalchemy.exc import SAWarning
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
@@ -13,6 +15,7 @@ from manga_manager.infrastructure.db_models import (
     CatalogCoverSignature,
     CatalogMatchDecision,
     CatalogSeries,
+    CatalogSeriesAlias,
     CatalogSourceSeries,
     JobBase,
     JobEvent,
@@ -32,7 +35,7 @@ from manga_manager.web.api import (
     proposal_component_blockers,
     workload_cycle_summary,
 )
-from manga_manager.web.app import create_app
+from manga_manager.web.app import create_app, merge_canonical_series
 from manga_manager.application.match_operations import MatchOperationHandler
 
 
@@ -818,6 +821,31 @@ def test_match_rescore_jobs_do_not_block_catalog_merges() -> None:
         )
         session.flush()
         assert "active jobs" not in proposal_blockers(session, series_ids)
+
+
+def test_canonical_merge_deletes_duplicate_aliases_before_parent_cascade() -> None:
+    _app, sessions = app_with_catalog()
+    with sessions() as session, session.begin():
+        series = session.scalars(select(CatalogSeries).order_by(CatalogSeries.id)).all()
+        for row in series:
+            session.add(
+                CatalogSeriesAlias(
+                    series_id=row.id,
+                    display_value="Shared Alias",
+                    normalized_value="shared alias",
+                )
+            )
+
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", SAWarning)
+        with sessions() as session, session.begin():
+            series_ids = list(session.scalars(select(CatalogSeries.id).order_by(CatalogSeries.id)))
+            merge_canonical_series(session, series_ids)
+
+    with sessions() as session:
+        assert session.query(CatalogSeriesAlias).filter_by(
+            normalized_value="shared alias"
+        ).count() == 1
 
 
 async def test_connected_batch_matches_merge_once() -> None:
