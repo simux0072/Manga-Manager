@@ -43,6 +43,8 @@ def test_event_resume_cursor_prefers_the_latest_valid_cursor() -> None:
     assert event_resume_cursor(12, "18") == 18
     assert event_resume_cursor(20, "18") == 20
     assert event_resume_cursor(12, "not-an-event-id") == 12
+    assert event_resume_cursor(1200, None, 47) == 47
+    assert event_resume_cursor(12, "1800", 47) == 47
 
 
 def test_match_operation_groups_use_work_labels_instead_of_manga_titles() -> None:

@@ -74,11 +74,21 @@ TRACKED_STATES = ("interested", "reading", "caught_up", "paused")
 ACTIVE_JOB_STATES = ("queued", "leased", "retry_wait")
 
 
-def event_resume_cursor(after: int, last_event_id: str | None) -> int:
+def event_resume_cursor(
+    after: int,
+    last_event_id: str | None,
+    maximum_event_id: int | None = None,
+) -> int:
     try:
-        return max(after, int(last_event_id or 0), 0)
+        cursor = max(after, int(last_event_id or 0), 0)
     except ValueError:
-        return after
+        cursor = max(after, 0)
+    # Browsers persist the cursor longer than a restored/recreated database. Without this bound,
+    # a client whose old cursor is ahead of the new sequence receives heartbeats forever and never
+    # observes completion events.
+    if maximum_event_id is not None:
+        cursor = min(cursor, max(maximum_event_id, 0))
+    return cursor
 
 
 def match_operation_group_title(group_key: str, action: str) -> str:
@@ -2174,7 +2184,9 @@ def create_api_router(
                 )
                 return payloads, counts
 
-        resume_after = event_resume_cursor(after, last_event_id)
+        with factory_provider()() as session:
+            maximum_event_id = int(session.scalar(select(func.max(JobEvent.id))) or 0)
+        resume_after = event_resume_cursor(after, last_event_id, maximum_event_id)
 
         async def stream():
             cursor = resume_after

@@ -268,6 +268,38 @@ describe('media library frontend',()=>{
     expect(requestsAfter).toBe(requestsBefore)
   })
 
+  it('reconciles completed matches when the browser misses the SSE event',async()=>{
+    const match={
+      id:81,decision_ids:[81],confidence:.91,evidence:[],blocked_reasons:[],operation:null,
+      left:{...series,source_title:series.title,source:'asura',url:'https://asura.test/painter',cover_evidence_used:true},
+      right:{...matchingSeries,source_title:matchingSeries.title,source:'mangafire',url:'https://mangafire.test/painter',cover_evidence_used:true},
+    }
+    const operation={id:181,action:'rejected',status:'queued',representative_id:81,decision_ids:[81],proposal_ids:[81],series_ids:[series.id,matchingSeries.id],job_id:281,error_code:'',error_message:'',created_at:'2026-08-05T12:00:00Z',updated_at:'2026-08-05T12:00:00Z',completed_at:null}
+    let completed=false
+    vi.stubGlobal('fetch',vi.fn((input:string|URL|Request,init?:RequestInit)=>{
+      const url=String(input)
+      if(url.includes('/api/v2/operations'))return response({job_counts:{},health:{series:2,chapters:1,active_artifacts:0,missing_projections:0},sources:[],workers:[],permits:{}})
+      if(url.includes('/api/v2/providers'))return response({items:['asura','mangafire']})
+      if(url.includes('/api/v2/matches/')&&init?.method==='POST'){
+        completed=true
+        return response({operation,created:true})
+      }
+      if(url.includes('/api/v2/matches'))return response({items:completed?[]:[match],next_cursor:null,total:completed?0:1})
+      return response({items:[],next_cursor:null})
+    }))
+
+    renderApp('/matches')
+    await userEvent.click((await screen.findAllByRole('button',{name:'Keep separate'})).find(button=>!button.hasAttribute('disabled'))!)
+    await screen.findByText('Splitting…')
+    expect(EventSourceMock.instances.at(-1)).toBeDefined()
+    await waitFor(()=>expect(screen.getByText('No matches need review')).toBeInTheDocument(),{timeout:4_000})
+    const matchReads=(fetch as ReturnType<typeof vi.fn>).mock.calls.filter(([input,init])=>
+      String(input).includes('/api/v2/matches?')&&(!init||!(init as RequestInit).method),
+    )
+    expect(matchReads.length).toBeGreaterThan(1)
+    expect((matchReads.at(-1)?.[1] as RequestInit).cache).toBe('no-store')
+  })
+
   it('deduplicates match pairs and previews only the explicit batch selection',async()=>{
     const match={
       id:51,decision_ids:[51],confidence:.91,evidence:[],blocked_reasons:[],

@@ -1,7 +1,8 @@
 import type {ActivityEvent, Job, JobGroup, Match, MatchOperation, MergeCandidate, MergePreview, Operations, Page, Series, UpdateSeries, WorkloadCycle} from './types'
 
 async function request<T>(url:string, init?:RequestInit):Promise<T>{
-  const response=await fetch(url,{...init,headers:{'Content-Type':'application/json',...(init?.headers||{})}})
+  const method=(init?.method||'GET').toUpperCase()
+  const response=await fetch(url,{...init,cache:method==='GET'?'no-store':init?.cache,headers:{'Content-Type':'application/json',...(init?.headers||{})}})
   if(!response.ok){const body=await response.json().catch(()=>({detail:response.statusText}));throw new Error(body.detail||'Request failed')}
   return response.json()
 }

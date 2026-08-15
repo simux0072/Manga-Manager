@@ -7,6 +7,7 @@ import {api} from './api'
 import type {Match, MatchOperation, MatchSide, MergeCandidate, MergePreview, Page, Series} from './types'
 
 const fallbackProviders = ['asura', 'mangadex', 'mangafire', 'kingofshojo']
+const activeOperationRefreshMs = 2_000
 const operationNoticeKey = (operation: Pick<MatchOperation, 'series_ids'>) =>
   `match:${[...operation.series_ids].sort((left, right) => left - right).join(':')}`
 type BatchNotice = {
@@ -250,11 +251,16 @@ function SuggestedMatches() {
   const visibleIds = items.map(match => match.id).join(',')
   const knownOperations = useMemo(() => {
     const result = new Map<number, MatchOperation>()
-    items.forEach(match => { if (match.operation) result.set(match.operation.id, match.operation) })
     Object.values(operations).forEach(operation => result.set(operation.id, operation))
+    // A server refresh is authoritative when Safari missed the corresponding SSE event.
+    items.forEach(match => { if (match.operation) result.set(match.operation.id, match.operation) })
     return [...result.values()].sort((left, right) => right.id - left.id)
   }, [items, operations])
   const activeOperations = knownOperations.filter(operation => operation.status === 'queued' || operation.status === 'running')
+  const visibleActiveOperationIds = activeOperations
+    .filter(operation => items.some(match => operationRemoves(operation, match)))
+    .map(operation => operation.id)
+    .join(',')
   const operationFor = (match: Match) => activeOperations.find(operation =>
     operation.series_ids.some(id => id === match.left.id || id === match.right.id))
   const failedOperationFor = (match: Match) => knownOperations.find(operation =>
@@ -287,6 +293,13 @@ function SuggestedMatches() {
     window.addEventListener('manga-job-event', receive)
     return () => window.removeEventListener('manga-job-event', receive)
   }, [order])
+  useEffect(() => {
+    if (!visibleActiveOperationIds) return
+    const timer = window.setInterval(() => {
+      void client.invalidateQueries({queryKey: ['matches']})
+    }, activeOperationRefreshMs)
+    return () => window.clearInterval(timer)
+  }, [client, visibleActiveOperationIds])
   useEffect(() => () => {
     noticeTimers.current.forEach(state => window.clearTimeout(state.timer))
   }, [])
