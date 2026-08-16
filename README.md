@@ -159,4 +159,3 @@ rebuilds only unsupported payload versions; leased work receives one deferred re
 Provider repair also converts strongly evidenced duplicate source IDs into alternate listings. New
 pulls apply the same title, chapter-overlap, and external-ID checks under a provider/title transaction
 lock, preventing concurrent refresh workers from recreating duplicate canonical manga.
-Test
