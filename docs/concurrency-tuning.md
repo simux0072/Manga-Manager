@@ -9,6 +9,11 @@ provider-global request scheduler still paces every origin and CDN request.
 Workers in one process reuse provider adapters and their HTTP connection pools. The clients support
 concurrent requests, MangaFire serializes its mutable VRF/token refresh state, and the one-pull
 provider permit keeps listing diagnostics single-writer while per-title refreshes run concurrently.
+On memory-constrained backfill deployments, `V2_ENABLE_COVER_PROCESSING=false` defers native cover
+fingerprinting during refreshes and prevents automatic cover-backfill claims, while
+`V2_ENABLE_LIBRARY_REPAIR=false` leaves bulk CBZ metadata rewrites queued. Provider metadata and
+chapter downloads continue normally; restore both defaults after the initial backlog and run the
+deferred maintenance under observation.
 
 A source pull reads the provider's update-ordered feed and persists its frontier. Asura is scoped to
 the `Latest Updates` section (not the preceding trending shelf), MangaDex uses its official English

@@ -230,6 +230,34 @@ async def test_source_pull_keeps_database_closed_during_http_and_ingests_idempot
 
 
 @pytest.mark.asyncio
+async def test_source_refresh_can_defer_cover_processing(
+    sessions: TrackingSessionFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    called = False
+
+    async def record_cover_call(_service, _source_series_id: int) -> None:
+        nonlocal called
+        called = True
+        return None
+
+    monkeypatch.setattr(
+        "manga_manager.application.source_pull.CoverEvidenceService.refresh_for_source_series",
+        record_cover_call,
+    )
+    handler = SourceRefreshHandler(
+        session_factory=sessions,
+        adapter_factory=lambda _source: FakeAdapter(sessions),
+        process_covers=False,
+    )
+
+    await handler(claimed_refresh_context(sessions))
+
+    assert called is False
+    with sessions() as session:
+        assert session.scalar(select(func.count()).select_from(CatalogSourceSeries)) == 1
+
+
+@pytest.mark.asyncio
 async def test_source_pull_reads_persisted_frontier(sessions: TrackingSessionFactory) -> None:
     with sessions() as session, session.begin():
         session.add(

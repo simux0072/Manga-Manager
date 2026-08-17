@@ -122,15 +122,19 @@ class WorkerService:
         if self.pools is not None:
             network_pools = network_pools.intersection(self.pools)
 
+        maintenance_kinds = {JobKind.MAINTENANCE}
+        if self.settings.enable_library_repair:
+            maintenance_kinds.add(JobKind.LIBRARY_REPAIR)
         requested = [
             ("kavita", {JobKind.KAVITA_SYNC}),
-            # Catalog rescoring and repair share a permit-limited pool even though
-            # every worker slot is eligible to claim either kind.
-            ("maintenance", {JobKind.LIBRARY_REPAIR, JobKind.MAINTENANCE}),
+            # Low-memory workers can leave library repairs queued while retaining
+            # lightweight maintenance and provider health work.
+            ("maintenance", maintenance_kinds),
             ("health", {JobKind.MAINTENANCE}),
-            ("cover_backfill", {JobKind.COVER_BACKFILL}),
             ("catalog_mutation", {JobKind.MATCH_OPERATION}),
         ]
+        if self.settings.enable_cover_processing:
+            requested.append(("cover_backfill", {JobKind.COVER_BACKFILL}))
         shared_pools = set(network_pools)
         shared_kinds = set(network_kinds)
         for pool, kinds in requested:

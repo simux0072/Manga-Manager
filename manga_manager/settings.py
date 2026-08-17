@@ -50,6 +50,10 @@ class V2Settings(BaseSettings):
     enable_mangadex: bool = True
     enable_mangafire: bool = True
     enable_kingofshojo: bool = True
+    # Low-memory deployments can defer native cover analysis and bulk archive
+    # rewriting while continuing normal provider refreshes and downloads.
+    enable_cover_processing: bool = True
+    enable_library_repair: bool = True
     asura_poll_minutes: int = Field(default=30, ge=5)
     mangadex_poll_minutes: int = Field(default=30, ge=5)
     mangafire_poll_minutes: int = Field(default=60, ge=5)

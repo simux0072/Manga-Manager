@@ -908,6 +908,7 @@ async def run_worker(settings: V2Settings, engine) -> int:
         session_factory=sessions,
         adapter_factory=adapters.get,
         close_adapter=False,
+        process_covers=settings.enable_cover_processing,
     )
     storage = create_storage(settings)
     chapter_download = ChapterDownloadHandler(

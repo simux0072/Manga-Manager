@@ -377,12 +377,14 @@ class SourceRefreshHandler:
         catalog: CatalogRepository | None = None,
         queue: JobQueue | None = None,
         close_adapter: bool = True,
+        process_covers: bool = True,
     ) -> None:
         self.session_factory = session_factory
         self.adapter_factory = adapter_factory
         self.catalog = catalog or CatalogRepository()
         self.queue = queue or JobQueue()
         self.close_adapter = close_adapter
+        self.process_covers = process_covers
 
     async def __call__(self, context: JobContext) -> None:
         payload = context.lease.payload
@@ -494,13 +496,20 @@ class SourceRefreshHandler:
                 plans = DownloadPlanCoordinator(self.queue)
                 plans.reconcile(session, source_series.series_id)
                 plans.enqueue_preferred_upgrades(session, [source_series.series_id])
-        await CoverEvidenceService(self.session_factory).refresh_for_source_series(source_series_id)
+        if self.process_covers:
+            await CoverEvidenceService(self.session_factory).refresh_for_source_series(
+                source_series_id
+            )
         with self.session_factory() as progress_session, progress_session.begin():
             JobQueue().progress(
                 progress_session,
                 job_id=context.lease.id,
                 owner=context.lease.owner,
-                message="catalog and cover evidence refreshed",
+                message=(
+                    "catalog and cover evidence refreshed"
+                    if self.process_covers
+                    else "catalog refreshed; cover processing deferred"
+                ),
                 details={"phase": "cover", "processed": 3, "total": 3, "unit": "phases"},
             )
 

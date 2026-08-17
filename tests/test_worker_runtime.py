@@ -217,6 +217,35 @@ def test_maintenance_worker_claims_repairs_and_catalog_rescores(
     assert specs[0].kinds == {JobKind.LIBRARY_REPAIR, JobKind.MAINTENANCE}
 
 
+def test_low_memory_worker_defers_cover_processing_and_library_repair(
+    sessions: TrackingSessionFactory,
+) -> None:
+    async def handler(_context) -> None:
+        return None
+
+    service = WorkerService(
+        session_factory=sessions,
+        handlers={
+            JobKind.SOURCE_PULL: handler,
+            JobKind.LIBRARY_REPAIR: handler,
+            JobKind.MAINTENANCE: handler,
+            JobKind.COVER_BACKFILL: handler,
+        },
+        settings=V2Settings(
+            enable_cover_processing=False,
+            enable_library_repair=False,
+        ),
+    )
+
+    specs = service._pool_specs()
+    assert len(specs) == service.settings.worker_concurrency
+    assert all("cover_backfill" not in spec.claim_pools for spec in specs)
+    assert all(JobKind.COVER_BACKFILL not in spec.kinds for spec in specs)
+    assert all(JobKind.LIBRARY_REPAIR not in spec.kinds for spec in specs)
+    assert all("maintenance" in spec.claim_pools for spec in specs)
+    assert all(JobKind.MAINTENANCE in spec.kinds for spec in specs)
+
+
 def test_catalog_mutation_pool_uses_three_shared_slots(
     sessions: TrackingSessionFactory,
 ) -> None:

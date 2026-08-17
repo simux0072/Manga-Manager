@@ -156,8 +156,10 @@ class SourcePollScheduler:
             # priority job whose final retry became terminal without a later successful sibling.
             if self._due("download_reconcile", current, timedelta(minutes=1)):
                 download_plans.reconcile_active(session, limit=50)
-            repair_planner = LibraryRepairPlanner(self.queue)
-            if self._due("library_repair", current, timedelta(minutes=10)):
+            if self.settings.enable_library_repair and self._due(
+                "library_repair", current, timedelta(minutes=10)
+            ):
+                repair_planner = LibraryRepairPlanner(self.queue)
                 canonicalized, cancelled = repair_planner.reconcile_active_jobs(session)
                 if canonicalized or cancelled:
                     logger.info(
@@ -166,7 +168,9 @@ class SourcePollScheduler:
                         cancelled,
                     )
                 repair_planner.enqueue_pending(session, limit=25)
-            if self._due("cover_backfill", current, timedelta(minutes=5)):
+            if self.settings.enable_cover_processing and self._due(
+                "cover_backfill", current, timedelta(minutes=5)
+            ):
                 count += CoverBackfillPlanner(self.queue).enqueue_pending(session, limit=10)
             if self._due("match_rescore", current, timedelta(minutes=1)):
                 match_rescore = MatchRescorePlanner(self.queue)
