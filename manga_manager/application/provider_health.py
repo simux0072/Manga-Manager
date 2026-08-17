@@ -21,6 +21,7 @@ TRANSIENT_HTTP_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504}) | (
     CLOUDFLARE_ORIGIN_ERROR_STATUSES
 )
 _STATUS_IN_ERROR = re.compile(r"(?:error\s+['\"]|Status/)(52[0-7])\b", re.IGNORECASE)
+_FORBIDDEN_IN_ERROR = re.compile(r"(?:error\s+['\"]|Status/)403\b", re.IGNORECASE)
 
 
 def utcnow() -> datetime:
@@ -37,6 +38,10 @@ def is_cloudflare_origin_error(status: int) -> bool:
 
 def contains_cloudflare_origin_error(message: str) -> bool:
     return _STATUS_IN_ERROR.search(message) is not None
+
+
+def contains_http_forbidden(message: str) -> bool:
+    return _FORBIDDEN_IN_ERROR.search(message) is not None
 
 
 def provider_cooldown_until(

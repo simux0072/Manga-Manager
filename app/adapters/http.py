@@ -221,10 +221,20 @@ class HttpSourceClient:
         *,
         traffic_class: str | None = None,
     ) -> None:
-        if response.status_code == 429:
-            observed_class = traffic_class or traffic_class_for_url(
-                self.provider_origin_url, str(response.request.url)
+        observed_class = traffic_class or traffic_class_for_url(
+            self.provider_origin_url, str(response.request.url)
+        )
+        if is_cloudflare_browser_challenge(response):
+            # A managed challenge is a provider-wide access failure, not evidence that
+            # the requested series or chapter is invalid. Treat it like a shared rate
+            # limit so every handler opens the provider circuit breaker instead of
+            # quarantining records or spending job attempts.
+            raise SourceRateLimited(
+                f"Cloudflare browser challenge presented by {self.base_url}",
+                source=self.source,
+                traffic_class=observed_class,
             )
+        if response.status_code == 429:
             raise SourceRateLimited(
                 f"rate limited by {self.base_url}",
                 retry_after=retry_after_from_headers(response.headers),
@@ -415,6 +425,13 @@ def is_partial_body_error(exc: BaseException) -> bool:
     return (
         "peer closed connection without sending complete message body" in text
         or "incomplete message body" in text
+    )
+
+
+def is_cloudflare_browser_challenge(response: httpx.Response) -> bool:
+    return (
+        response.status_code == 403
+        and response.headers.get("cf-mitigated", "").strip().lower() == "challenge"
     )
 
 

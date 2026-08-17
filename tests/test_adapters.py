@@ -1383,6 +1383,52 @@ async def test_http_client_raises_rate_limit_with_retry_after():
     assert exc_info.value.retry_after is not None
 
 
+async def test_http_client_treats_cloudflare_challenge_as_shared_provider_limit():
+    async def handler(request):
+        return httpx.Response(
+            403,
+            headers={
+                "cf-mitigated": "challenge",
+                "content-type": "text/html; charset=UTF-8",
+            },
+            content=b"<title>Just a moment...</title>",
+            request=request,
+        )
+
+    client = HttpSourceClient(
+        "https://mangafire.to",
+        source="mangafire",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(SourceRateLimited) as exc_info:
+            await client.get_soup("/")
+    finally:
+        await client.aclose()
+
+    assert str(exc_info.value) == (
+        "Cloudflare browser challenge presented by https://mangafire.to"
+    )
+    assert exc_info.value.source == "mangafire"
+    assert exc_info.value.traffic_class == "origin"
+
+
+async def test_http_client_does_not_misclassify_plain_forbidden_as_cloudflare_challenge():
+    async def handler(request):
+        return httpx.Response(403, content=b"forbidden", request=request)
+
+    client = HttpSourceClient(
+        "https://mangafire.to",
+        source="mangafire",
+        transport=httpx.MockTransport(handler),
+    )
+    try:
+        with pytest.raises(httpx.HTTPStatusError):
+            await client.get_soup("/")
+    finally:
+        await client.aclose()
+
+
 async def test_http_client_retries_idempotent_transport_failures(monkeypatch):
     attempts = 0
     waits: list[float] = []

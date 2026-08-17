@@ -14,12 +14,16 @@ from manga_manager.application.cover_backfill import CoverBackfillPlanner
 from manga_manager.application.kavita_sync import KavitaSyncPlanner
 from manga_manager.application.library_repair import LibraryRepairPlanner
 from manga_manager.application.match_rescore import MatchRescorePlanner
-from manga_manager.application.provider_health import contains_cloudflare_origin_error
+from manga_manager.application.provider_health import (
+    contains_cloudflare_origin_error,
+    contains_http_forbidden,
+)
 from manga_manager.application.job_retention import JobRetention
 from manga_manager.domain.jobs import JobKind, MaintenancePayload, SourcePullPayload
 from manga_manager.infrastructure.db_models import (
     CatalogChapter,
     CatalogChapterRelease,
+    CatalogObservation,
     CatalogSourceState,
     ChapterDownloadIntent,
     ProviderPolicy,
@@ -147,6 +151,7 @@ class SourcePollScheduler:
         with self.session_factory() as session, session.begin():
             self.storage_capacity.refresh(session)
             count += self._recover_misclassified_provider_outages(session, current)
+            count += self._recover_misclassified_provider_challenges(session, current)
             count += self._recover_mangafire_token_failures(session, current)
             download_plans = DownloadPlanCoordinator(self.queue)
             if self._due("download_bootstrap", current, timedelta(hours=6)):
@@ -285,6 +290,79 @@ class SourcePollScheduler:
             failed.error_message = (
                 f"Automatically requeued as job #{replacement.id} after a temporary "
                 "provider-origin outage."
+            )
+            failed.updated_at = current
+            recovered += 1
+        return recovered
+
+    def _recover_misclassified_provider_challenges(
+        self,
+        session: Session,
+        current: datetime,
+        *,
+        limit: int = 50,
+    ) -> int:
+        """Requeue refreshes terminally failed during the observed Cloudflare challenges."""
+        later = aliased(WorkJob)
+        rows = session.scalars(
+            select(WorkJob)
+            .where(
+                WorkJob.kind == JobKind.SOURCE_REFRESH.value,
+                WorkJob.source.in_(("mangafire", "kingofshojo")),
+                WorkJob.status == "failed",
+                WorkJob.error_code == "source_item_invalid",
+                WorkJob.error_message.contains("403 Forbidden"),
+                ~select(later.id)
+                .where(
+                    later.kind == WorkJob.kind,
+                    later.dedupe_key == WorkJob.dedupe_key,
+                    later.id > WorkJob.id,
+                    later.status == "succeeded",
+                )
+                .exists(),
+            )
+            .order_by(WorkJob.id)
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        ).all()
+        recovered = 0
+        for failed in rows:
+            if not contains_http_forbidden(failed.error_message):
+                continue
+            replacement, created = self.queue.enqueue(
+                session,
+                kind=JobKind.SOURCE_REFRESH,
+                dedupe_key=failed.dedupe_key,
+                payload=failed.payload,
+                priority=failed.priority,
+                max_attempts=max(failed.max_attempts, 4),
+                available_at=current,
+                source=failed.source,
+                series_key=failed.series_key,
+                pool=failed.pool,
+                workflow_key=failed.workflow_key,
+                group_key=failed.group_key,
+            )
+            if not created:
+                continue
+            source_id = str((failed.payload or {}).get("source_id") or "")
+            if source_id:
+                observations = session.scalars(
+                    select(CatalogObservation).where(
+                        CatalogObservation.source == failed.source,
+                        CatalogObservation.observation_type == "source_refresh_failure",
+                        CatalogObservation.source_key == source_id,
+                        CatalogObservation.state == "quarantined",
+                    )
+                ).all()
+                for observation in observations:
+                    if contains_http_forbidden(observation.reason):
+                        observation.state = "rejected"
+                        observation.resolved_at = current
+            failed.error_code = "provider_challenge_requeued"
+            failed.error_message = (
+                f"Automatically requeued as job #{replacement.id} after a provider-wide "
+                "Cloudflare browser challenge was identified."
             )
             failed.updated_at = current
             recovered += 1

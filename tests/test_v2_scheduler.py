@@ -9,6 +9,7 @@ from manga_manager.domain.jobs import JobKind, SourceRefreshPayload
 from manga_manager.infrastructure.db_models import (
     CatalogChapter,
     CatalogChapterRelease,
+    CatalogObservation,
     CatalogSeries,
     CatalogSourceState,
     CatalogSourceSeries,
@@ -201,6 +202,67 @@ def test_scheduler_requeues_refreshes_misclassified_during_cloudflare_outage() -
         assert jobs[0].error_code == "provider_outage_requeued"
         assert jobs[1].status == "queued"
         assert jobs[1].dedupe_key == jobs[0].dedupe_key
+
+
+def test_scheduler_recovers_refreshes_misclassified_during_provider_challenge() -> None:
+    engine = create_engine("sqlite:///:memory:")
+    JobBase.metadata.create_all(engine)
+    sessions = sessionmaker(engine, expire_on_commit=False)
+    with Session(engine) as session:
+        from manga_manager.infrastructure.job_queue import JobQueue
+
+        failed, _created = JobQueue().enqueue(
+            session,
+            kind=JobKind.SOURCE_REFRESH,
+            dedupe_key="refresh:mangafire:challenge-example",
+            payload=SourceRefreshPayload(
+                source="mangafire",
+                source_id="challenge-example",
+                title="Challenge Example",
+                url="https://mangafire.to/title/challenge-example",
+            ),
+        )
+        failed.status = "failed"
+        failed.error_code = "source_item_invalid"
+        failed.error_message = (
+            "Client error '403 Forbidden' for url "
+            "'https://mangafire.to/title/challenge-example'"
+        )
+        session.add(
+            CatalogObservation(
+                source="mangafire",
+                observation_type="source_refresh_failure",
+                source_key="challenge-example",
+                state="quarantined",
+                reason=failed.error_message,
+                payload_json=failed.payload,
+            )
+        )
+        session.commit()
+
+    scheduler = SourcePollScheduler(
+        engine=engine,
+        session_factory=sessions,
+        settings=V2Settings(
+            database_url="postgresql+psycopg://unused",
+            enable_asura=False,
+            enable_mangadex=False,
+            enable_mangafire=False,
+            enable_kingofshojo=False,
+        ),
+    )
+
+    assert scheduler.enqueue_due(now=NOW) == 1
+    assert scheduler.enqueue_due(now=NOW) == 0
+    with Session(engine) as session:
+        jobs = session.scalars(select(WorkJob).order_by(WorkJob.id)).all()
+        observation = session.scalar(select(CatalogObservation))
+    assert len(jobs) == 2
+    assert jobs[0].error_code == "provider_challenge_requeued"
+    assert jobs[1].status == "queued"
+    assert jobs[1].dedupe_key == jobs[0].dedupe_key
+    assert observation is not None and observation.state == "rejected"
+    assert observation.resolved_at == NOW.replace(tzinfo=None)
 
 
 def test_scheduler_requeues_terminal_mangafire_token_403() -> None:
