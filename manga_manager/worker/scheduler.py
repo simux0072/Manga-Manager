@@ -302,8 +302,7 @@ class SourcePollScheduler:
         *,
         limit: int = 50,
     ) -> int:
-        """Requeue refreshes terminally failed during the observed Cloudflare challenges."""
-        later = aliased(WorkJob)
+        """Repair refreshes terminally failed during the observed Cloudflare challenges."""
         rows = session.scalars(
             select(WorkJob)
             .where(
@@ -312,14 +311,6 @@ class SourcePollScheduler:
                 WorkJob.status == "failed",
                 WorkJob.error_code == "source_item_invalid",
                 WorkJob.error_message.contains("403 Forbidden"),
-                ~select(later.id)
-                .where(
-                    later.kind == WorkJob.kind,
-                    later.dedupe_key == WorkJob.dedupe_key,
-                    later.id > WorkJob.id,
-                    later.status == "succeeded",
-                )
-                .exists(),
             )
             .order_by(WorkJob.id)
             .limit(limit)
@@ -329,22 +320,35 @@ class SourcePollScheduler:
         for failed in rows:
             if not contains_http_forbidden(failed.error_message):
                 continue
-            replacement, created = self.queue.enqueue(
-                session,
-                kind=JobKind.SOURCE_REFRESH,
-                dedupe_key=failed.dedupe_key,
-                payload=failed.payload,
-                priority=failed.priority,
-                max_attempts=max(failed.max_attempts, 4),
-                available_at=current,
-                source=failed.source,
-                series_key=failed.series_key,
-                pool=failed.pool,
-                workflow_key=failed.workflow_key,
-                group_key=failed.group_key,
+            later_succeeded = session.scalar(
+                select(WorkJob.id)
+                .where(
+                    WorkJob.kind == failed.kind,
+                    WorkJob.dedupe_key == failed.dedupe_key,
+                    WorkJob.id > failed.id,
+                    WorkJob.status == "succeeded",
+                )
+                .limit(1)
             )
-            if not created:
-                continue
+            replacement = None
+            if later_succeeded is None:
+                replacement, created = self.queue.enqueue(
+                    session,
+                    kind=JobKind.SOURCE_REFRESH,
+                    dedupe_key=failed.dedupe_key,
+                    payload=failed.payload,
+                    priority=failed.priority,
+                    max_attempts=max(failed.max_attempts, 4),
+                    available_at=current,
+                    source=failed.source,
+                    series_key=failed.series_key,
+                    pool=failed.pool,
+                    workflow_key=failed.workflow_key,
+                    group_key=failed.group_key,
+                )
+                if not created:
+                    continue
+                recovered += 1
             source_id = str((failed.payload or {}).get("source_id") or "")
             if source_id:
                 observations = session.scalars(
@@ -359,13 +363,19 @@ class SourcePollScheduler:
                     if contains_http_forbidden(observation.reason):
                         observation.state = "rejected"
                         observation.resolved_at = current
-            failed.error_code = "provider_challenge_requeued"
-            failed.error_message = (
-                f"Automatically requeued as job #{replacement.id} after a provider-wide "
-                "Cloudflare browser challenge was identified."
-            )
+            if replacement is None:
+                failed.error_code = "provider_challenge_superseded"
+                failed.error_message = (
+                    f"Resolved by later successful job #{later_succeeded}; the earlier failure "
+                    "was a provider-wide Cloudflare browser challenge."
+                )
+            else:
+                failed.error_code = "provider_challenge_requeued"
+                failed.error_message = (
+                    f"Automatically requeued as job #{replacement.id} after a provider-wide "
+                    "Cloudflare browser challenge was identified."
+                )
             failed.updated_at = current
-            recovered += 1
         return recovered
 
     def _recover_mangafire_token_failures(

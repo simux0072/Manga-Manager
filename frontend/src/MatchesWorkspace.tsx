@@ -536,7 +536,7 @@ function Side({side}: {side: MatchSide}) {
 
 function Cover({series}: {series: Pick<Series, 'title' | 'cover_url'>}) {
   const [failed, setFailed] = useState(false)
-  return <div className="cover">{series.cover_url && !failed ? <img src={series.cover_url} alt={`Cover for ${series.title}`} loading="lazy" onError={() => setFailed(true)} /> : <div className="cover-placeholder"><BookOpen /><span>Cover unavailable</span></div>}</div>
+  return <div className="cover">{series.cover_url && !failed ? <img src={series.cover_url} alt={`Cover for ${series.title}`} loading="lazy" referrerPolicy="no-referrer" onError={() => setFailed(true)} /> : <div className="cover-placeholder"><BookOpen /><span>Cover unavailable</span></div>}</div>
 }
 
 function ConfirmModal({title, detail, busy, error, close, confirm, disabled = false}: {title: string; detail: string; busy: boolean; error?: string; close: () => void; confirm: () => void; disabled?: boolean}) {

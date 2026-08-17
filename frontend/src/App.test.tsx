@@ -85,6 +85,12 @@ describe('media library frontend',()=>{
     expect(operationRequests()).toBe(before+1)
   })
 
+  it('does not send the application referrer when loading provider covers',async()=>{
+    renderApp()
+    const cover=await screen.findByRole('img',{name:`Cover for ${series.title}`})
+    expect(cover).toHaveAttribute('referrerpolicy','no-referrer')
+  })
+
   it('searches while typing and applies multiple sources immediately',async()=>{
     renderApp()
     expect(await screen.findByText(series.title)).toBeInTheDocument()
